@@ -7,6 +7,7 @@
   var MESSAGE_PAGE_SIZE = 180;
   var CHAT_ITEM_FALLBACK_HEIGHT = 65;
   var MAX_ATTACHMENT_PREVIEW = 120;
+  var ATTACHMENT_CLEANUP_PAGE_SIZE = 30;
   var chatResizeTimer = null;
 
   var state = {
@@ -30,6 +31,9 @@
     attachmentFiles: [],
     attachmentByBasename: new Map(),
     attachmentByToken: new Map(),
+    attachmentCleanupPage: 1,
+    attachmentCleanupSearch: "",
+    attachmentsMarkedForRemoval: new Set(),
     selfId: ""
   };
 
@@ -64,6 +68,18 @@
     el.exportJsonButton = document.getElementById("exportJsonButton");
     el.exportAttachmentsButton = document.getElementById("exportAttachmentsButton");
     el.attachmentPreview = document.getElementById("attachmentPreview");
+    el.attachmentSearch = document.getElementById("attachmentSearch");
+    el.markedAttachmentCount = document.getElementById("markedAttachmentCount");
+    el.markedAttachmentSize = document.getElementById("markedAttachmentSize");
+    el.attachmentCleanupList = document.getElementById("attachmentCleanupList");
+    el.attachmentPrevButton = document.getElementById("attachmentPrevButton");
+    el.attachmentNextButton = document.getElementById("attachmentNextButton");
+    el.attachmentPageInfo = document.getElementById("attachmentPageInfo");
+    el.markFilteredAttachmentsButton = document.getElementById("markFilteredAttachmentsButton");
+    el.keepAllAttachmentsButton = document.getElementById("keepAllAttachmentsButton");
+    el.clearAttachmentSelectionButton = document.getElementById("clearAttachmentSelectionButton");
+    el.exportCleanupPlanButton = document.getElementById("exportCleanupPlanButton");
+    el.exportCleanupTextButton = document.getElementById("exportCleanupTextButton");
 
     el.folderInput.addEventListener("change", function (event) {
       loadSource(event.target.files, "folder");
@@ -98,6 +114,50 @@
     el.exportHtmlButton.addEventListener("click", exportCurrentHtml);
     el.exportJsonButton.addEventListener("click", exportCurrentJson);
     el.exportAttachmentsButton.addEventListener("click", exportAttachmentCsv);
+    el.attachmentSearch.addEventListener("input", function (event) {
+      state.attachmentCleanupSearch = event.target.value.trim().toLowerCase();
+      state.attachmentCleanupPage = 1;
+      renderAttachmentCleanup();
+    });
+    el.attachmentPrevButton.addEventListener("click", function () {
+      if (state.attachmentCleanupPage > 1) {
+        state.attachmentCleanupPage -= 1;
+        renderAttachmentCleanup();
+      }
+    });
+    el.attachmentNextButton.addEventListener("click", function () {
+      var totalPages = getAttachmentCleanupTotalPages();
+      if (state.attachmentCleanupPage < totalPages) {
+        state.attachmentCleanupPage += 1;
+        renderAttachmentCleanup();
+      }
+    });
+    el.keepAllAttachmentsButton.addEventListener("click", function () {
+      state.attachmentsMarkedForRemoval.clear();
+      renderAttachmentCleanup();
+    });
+    el.markFilteredAttachmentsButton.addEventListener("click", function () {
+      getFilteredAttachmentFiles().forEach(function (file) {
+        state.attachmentsMarkedForRemoval.add(relativePath(file));
+      });
+      renderAttachmentCleanup();
+    });
+    el.clearAttachmentSelectionButton.addEventListener("click", function () {
+      getFilteredAttachmentFiles().forEach(function (file) {
+        state.attachmentsMarkedForRemoval.delete(relativePath(file));
+      });
+      renderAttachmentCleanup();
+    });
+    el.attachmentCleanupList.addEventListener("change", function (event) {
+      var checkbox = event.target.closest("input[data-attachment-path]");
+      if (!checkbox) return;
+      var path = checkbox.getAttribute("data-attachment-path");
+      if (checkbox.checked) state.attachmentsMarkedForRemoval.add(path);
+      else state.attachmentsMarkedForRemoval.delete(path);
+      renderAttachmentCleanup();
+    });
+    el.exportCleanupPlanButton.addEventListener("click", exportAttachmentCleanupPlan);
+    el.exportCleanupTextButton.addEventListener("click", exportAttachmentCleanupInstructions);
     window.addEventListener("resize", scheduleChatLayoutRefresh);
     updateSourceModeUi();
 
@@ -152,6 +212,10 @@
       state.sourceSize = state.files.reduce(function (sum, file) { return sum + file.size; }, 0);
       state.fileByPath = new Map(state.files.map(function (file) { return [relativePath(file), file]; }));
       state.sourceRoot = sourceMode === "database" ? relativePath(state.files[0]) : inferRoot(state.files);
+      state.attachmentCleanupPage = 1;
+      state.attachmentCleanupSearch = "";
+      state.attachmentsMarkedForRemoval = new Set();
+      if (el.attachmentSearch) el.attachmentSearch.value = "";
       state.attachmentFiles = sourceMode === "folder" ? state.files.filter(function (file) {
         var path = relativePath(file);
         return /\/Message Attachments\//.test(path) || /\/Message Thumbnails\//.test(path);
@@ -179,6 +243,7 @@
       loadChats();
       setProgress(92);
       renderAttachmentPreview();
+      renderAttachmentCleanup();
       updateStats();
       el.workspace.classList.remove("hidden");
       setRuntime("已載入", false);
@@ -542,6 +607,151 @@
     el.attachmentPreview.innerHTML = '<table class="attachment-table"><thead><tr><th>來源路徑</th><th>大小</th><th>MIME</th></tr></thead><tbody>' + rows + '</tbody></table>' + more;
   }
 
+  function getFilteredAttachmentFiles() {
+    var search = state.attachmentCleanupSearch;
+    return state.attachmentFiles.filter(function (file) {
+      if (!search) return true;
+      var path = relativePath(file).toLowerCase();
+      return path.indexOf(search) !== -1;
+    });
+  }
+
+  function getAttachmentCleanupTotalPages() {
+    return Math.max(1, Math.ceil(getFilteredAttachmentFiles().length / ATTACHMENT_CLEANUP_PAGE_SIZE));
+  }
+
+  function archiveRelativePath(file) {
+    var path = relativePath(file);
+    var root = state.sourceMode === "folder" ? state.sourceRoot : "";
+    if (root && path.indexOf(root + "/") === 0) return path.slice(root.length + 1);
+    return path;
+  }
+
+  function attachmentCategory(path) {
+    return /\/Message Thumbnails\//.test(path) ? "縮圖" : "原始附件";
+  }
+
+  function renderAttachmentCleanup() {
+    var databaseOnly = state.sourceMode === "database";
+    var hasFiles = !databaseOnly && state.attachmentFiles.length > 0;
+    var filtered = getFilteredAttachmentFiles();
+    var totalPages = getAttachmentCleanupTotalPages();
+    state.attachmentCleanupPage = Math.min(state.attachmentCleanupPage, totalPages);
+    var start = (state.attachmentCleanupPage - 1) * ATTACHMENT_CLEANUP_PAGE_SIZE;
+    var pageFiles = filtered.slice(start, start + ATTACHMENT_CLEANUP_PAGE_SIZE);
+
+    if (databaseOnly) {
+      el.attachmentCleanupList.innerHTML = '<div class="empty-state">只讀訊息模式沒有載入附件檔案；請切換為完整 LINE 備份後使用附件瘦身。</div>';
+    } else if (!hasFiles) {
+      el.attachmentCleanupList.innerHTML = '<div class="empty-state">沒有可供瘦身的附件或縮圖。</div>';
+    } else if (!filtered.length) {
+      el.attachmentCleanupList.innerHTML = '<div class="empty-state">找不到符合搜尋條件的附件。</div>';
+    } else {
+      var rows = pageFiles.map(function (file) {
+        var path = relativePath(file);
+        var archivePath = archiveRelativePath(file);
+        var checked = state.attachmentsMarkedForRemoval.has(path) ? " checked" : "";
+        return '<label class="attachment-cleanup-row"><input type="checkbox" data-attachment-path="' + escapeHtml(path) + '"' + checked + '><span class="attachment-cleanup-main"><span class="file-name">' + escapeHtml(archivePath) + '</span><small>' + escapeHtml(attachmentCategory(archivePath) + " · " + (file.type || "未知")) + '</small></span><span class="attachment-cleanup-size">' + escapeHtml(formatBytes(file.size)) + '</span></label>';
+      }).join("");
+      el.attachmentCleanupList.innerHTML = rows;
+    }
+
+    var markedFiles = getMarkedAttachmentFiles();
+    var markedSize = markedFiles.reduce(function (sum, file) { return sum + (Number(file.size) || 0); }, 0);
+    el.markedAttachmentCount.textContent = formatNumber(markedFiles.length);
+    el.markedAttachmentSize.textContent = formatBytes(markedSize);
+    el.attachmentPageInfo.textContent = hasFiles ? "第 " + state.attachmentCleanupPage + " / " + totalPages + " 頁" : "第 1 頁";
+    el.attachmentPrevButton.disabled = !hasFiles || state.attachmentCleanupPage <= 1;
+    el.attachmentNextButton.disabled = !hasFiles || state.attachmentCleanupPage >= totalPages;
+    el.markFilteredAttachmentsButton.disabled = !hasFiles || filtered.length === 0;
+    el.keepAllAttachmentsButton.disabled = !hasFiles || markedFiles.length === 0;
+    el.clearAttachmentSelectionButton.disabled = !hasFiles || markedFiles.length === 0;
+    el.exportCleanupPlanButton.disabled = !hasFiles;
+    el.exportCleanupTextButton.disabled = !hasFiles;
+  }
+
+  function getMarkedAttachmentFiles() {
+    return state.attachmentFiles.filter(function (file) {
+      return state.attachmentsMarkedForRemoval.has(relativePath(file));
+    });
+  }
+
+  function buildAttachmentCleanupPlan() {
+    var markedFiles = getMarkedAttachmentFiles();
+    var markedSize = markedFiles.reduce(function (sum, file) { return sum + (Number(file.size) || 0); }, 0);
+    var lineFile = state.sourceMode === "folder" ? findFileEnding("/Messages/Line.sqlite") : state.files[0];
+    return {
+      schemaVersion: "0.1",
+      planType: "line-attachment-cleanup",
+      generatedAt: new Date().toISOString(),
+      source: {
+        mode: state.sourceMode,
+        selectedRoot: state.sourceRoot,
+        totalFiles: state.files.length,
+        totalBytes: state.sourceSize,
+        lineSqlitePath: lineFile ? archiveRelativePath(lineFile) : "",
+        lineSqliteLastModified: lineFile && lineFile.lastModified ? new Date(lineFile.lastModified).toISOString() : null
+      },
+      policy: {
+        originalFilesAreUntouched: true,
+        keepAllFilesNotListed: true,
+        estimatedReleaseBytes: markedSize,
+        estimatedRemainingBytes: Math.max(0, state.sourceSize - markedSize),
+        hashStatus: "未計算；此階段只輸出操作計畫"
+      },
+      markedForRemoval: markedFiles.map(function (file) {
+        return {
+          path: archiveRelativePath(file),
+          category: attachmentCategory(archiveRelativePath(file)),
+          size: Number(file.size) || 0,
+          mime: file.type || "",
+          lastModified: file.lastModified ? new Date(file.lastModified).toISOString() : null
+        };
+      }),
+      warnings: [
+        "這不是已驗證可直接還原的 .imazingapp；請在副本上執行。",
+        "請保留 Container、Messages/Line.sqlite 與所有未列出的檔案。",
+        "刪除原始附件可能使 LINE 聊天中的媒體無法開啟；刪除縮圖通常只會移除預覽圖。",
+        "瀏覽器無法保證保留或設定 macOS 檔案的 creation time；SQLite 內的訊息時間不會由本計畫改寫。"
+      ]
+    };
+  }
+
+  function exportAttachmentCleanupPlan() {
+    if (!state.attachmentFiles.length) return;
+    var plan = buildAttachmentCleanupPlan();
+    downloadText("line-attachment-cleanup-plan.json", JSON.stringify(plan, null, 2), "application/json;charset=utf-8");
+  }
+
+  function exportAttachmentCleanupInstructions() {
+    if (!state.attachmentFiles.length) return;
+    var plan = buildAttachmentCleanupPlan();
+    var lines = [
+      "LINE 附件瘦身操作說明",
+      "====================",
+      "產生時間：" + plan.generatedAt,
+      "來源根目錄：" + (plan.source.selectedRoot || "（單檔模式）"),
+      "標記移除：" + formatNumber(plan.markedForRemoval.length) + " 個檔案",
+      "預估釋放：" + formatBytes(plan.policy.estimatedReleaseBytes),
+      "",
+      "安全操作順序：",
+      "1. 保留原始 LINE.imazingapp，不要直接覆寫。",
+      "2. 複製一份工作副本，再將副本副檔名改成 .zip。",
+      "3. 使用支援原地編輯壓縮檔的工具，依下方路徑移除檔案。不要把整個封存檔解壓後重新壓縮。",
+      "4. 確認 Container、Messages/Line.sqlite 與未列出的檔案都保留。",
+      "5. 將工作副本改回 .imazingapp；在 iMazing 的 Manage Apps > Restore App Data 中先做 dry-run。",
+      "6. 只有在確認 iMazing 接受檔案後，才考慮於測試裝置還原；原始檔仍須保留。",
+      "",
+      "標記移除的檔案："
+    ];
+    if (!plan.markedForRemoval.length) lines.push("（目前沒有標記，所有檔案都應保留）");
+    plan.markedForRemoval.forEach(function (entry) {
+      lines.push("- " + entry.path + " · " + entry.category + " · " + formatBytes(entry.size));
+    });
+    lines.push("", "注意：這份清單不會改寫 SQLite，也不能承諾保留 macOS creation time；LINE 訊息時間來自 SQLite。");
+    downloadText("line-attachment-cleanup-instructions.txt", lines.join("\n"), "text/plain;charset=utf-8");
+  }
+
   function updateStats() {
     el.chatCount.textContent = formatNumber(state.chats.length);
     el.messageCount.textContent = formatNumber(state.chats.reduce(function (sum, chat) { return sum + chat.messageCount; }, 0));
@@ -634,6 +844,9 @@
     state.attachmentFiles = [];
     state.attachmentByBasename = new Map();
     state.attachmentByToken = new Map();
+    state.attachmentCleanupPage = 1;
+    state.attachmentCleanupSearch = "";
+    state.attachmentsMarkedForRemoval = new Set();
     state.sourceSize = 0;
     if (resetInput !== false && el.folderInput) el.folderInput.value = "";
     if (resetInput !== false && el.databaseInput) el.databaseInput.value = "";
@@ -644,6 +857,18 @@
     if (el.chatNextButton) el.chatNextButton.disabled = true;
     if (el.messageList) el.messageList.innerHTML = '<div class="empty-state">尚未選取聊天室。</div>';
     if (el.attachmentPreview) el.attachmentPreview.innerHTML = "";
+    if (el.attachmentSearch) el.attachmentSearch.value = "";
+    if (el.attachmentCleanupList) el.attachmentCleanupList.innerHTML = "";
+    if (el.attachmentPageInfo) el.attachmentPageInfo.textContent = "第 1 頁";
+    if (el.attachmentPrevButton) el.attachmentPrevButton.disabled = true;
+    if (el.attachmentNextButton) el.attachmentNextButton.disabled = true;
+    if (el.markFilteredAttachmentsButton) el.markFilteredAttachmentsButton.disabled = true;
+    if (el.keepAllAttachmentsButton) el.keepAllAttachmentsButton.disabled = true;
+    if (el.clearAttachmentSelectionButton) el.clearAttachmentSelectionButton.disabled = true;
+    if (el.exportCleanupPlanButton) el.exportCleanupPlanButton.disabled = true;
+    if (el.exportCleanupTextButton) el.exportCleanupTextButton.disabled = true;
+    if (el.markedAttachmentCount) el.markedAttachmentCount.textContent = "0";
+    if (el.markedAttachmentSize) el.markedAttachmentSize.textContent = "0 B";
     if (el.exportHtmlButton) el.exportHtmlButton.disabled = true;
     if (el.exportJsonButton) el.exportJsonButton.disabled = true;
     if (el.exportAttachmentsButton) el.exportAttachmentsButton.disabled = true;

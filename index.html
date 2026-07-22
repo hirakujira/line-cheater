@@ -126,6 +126,45 @@
           <div id="attachmentPreview" class="attachment-preview"></div>
         </section>
 
+        <section class="panel cleanup-panel">
+          <div class="panel-heading compact">
+            <div>
+              <p class="section-kicker">5 / 附件瘦身</p>
+              <h2>標記不需要的附件</h2>
+              <p class="muted">勾選後只會建立瘦身操作計畫；原始備份不會被刪除或修改。</p>
+            </div>
+            <div class="button-row cleanup-actions">
+              <button id="markFilteredAttachmentsButton" class="button button-quiet" type="button" disabled>標記目前搜尋結果</button>
+              <button id="keepAllAttachmentsButton" class="button button-quiet" type="button" disabled>全部保留</button>
+              <button id="clearAttachmentSelectionButton" class="button button-quiet" type="button" disabled>清除勾選</button>
+            </div>
+          </div>
+          <div class="cleanup-warning">
+            <strong>還原前請保留原始檔</strong>
+            <span>此頁面目前輸出的是人工操作計畫，不是已驗證可直接還原的 iMazing 封裝。請先複製原始 <code>.imazingapp</code>，再依計畫在 ZIP 編輯工具中處理。</span>
+          </div>
+          <div class="cleanup-toolbar">
+            <label class="search-box cleanup-search">
+              <span class="sr-only">搜尋附件</span>
+              <input id="attachmentSearch" type="search" placeholder="搜尋附件路徑或檔名">
+            </label>
+            <div class="cleanup-summary" aria-live="polite">
+              <span>已標記 <strong id="markedAttachmentCount">0</strong> 個</span>
+              <span>預估釋放 <strong id="markedAttachmentSize">0 B</strong></span>
+            </div>
+          </div>
+          <div id="attachmentCleanupList" class="attachment-cleanup-list"></div>
+          <nav class="chat-pagination attachment-pagination" aria-label="附件瘦身清單分頁">
+            <button id="attachmentPrevButton" class="button button-secondary" type="button">上一頁</button>
+            <span id="attachmentPageInfo" class="page-info">第 1 頁</span>
+            <button id="attachmentNextButton" class="button button-secondary" type="button">下一頁</button>
+          </nav>
+          <div class="button-row cleanup-export-row">
+            <button id="exportCleanupPlanButton" class="button button-primary" type="button" disabled>匯出瘦身操作計畫</button>
+            <button id="exportCleanupTextButton" class="button button-secondary" type="button" disabled>匯出操作說明</button>
+          </div>
+        </section>
+
       </section>
     </main>
 
