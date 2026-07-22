@@ -10,6 +10,8 @@
 
 ## 使用方式
 
+LINE iOS App Container 備份檔案可透過 iMazing 備份軟體取得；本工具不會直接操作 iMazing，只讀取你選取的備份檔案。
+
 1. 開啟 GitHub Pages 網址。
 2. 選擇載入方式：
    - 完整 LINE 備份：選取整個 LINE 備份資料夾，可使用附件索引與下載連結。

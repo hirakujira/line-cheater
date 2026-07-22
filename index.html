@@ -20,7 +20,7 @@
 
       <section class="privacy-note" aria-label="資料隱私">
         <strong>資料留在你的裝置</strong>
-        <span>請選取 LINE 備份資料夾。所有解析都在目前瀏覽器分頁內進行；關閉或重新整理頁面後，資料不會被保留。</span>
+        <span>LINE 備份檔案可透過 iMazing 備份軟體取得；所有解析都在目前瀏覽器分頁內進行，關閉或重新整理頁面後資料不會被保留。</span>
       </section>
 
       <section class="panel source-panel">
@@ -59,7 +59,7 @@
             <span class="picker-detail path-hint">檔案位置：<code>Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_&lt;account-id&gt;/Messages/Line.sqlite</code><br>其中 <code>P_&lt;account-id&gt;</code> 是備份中實際存在的 P_ 開頭資料夾；不需要載入其他檔案。</span>
             <input id="databaseInput" type="file" accept=".sqlite,application/vnd.sqlite3,application/octet-stream">
           </label>
-          <p class="helper-text">只讀訊息模式不會載入附件，因此附件預覽與附件下載連結會停用。若備份另有同名 WAL／SHM 檔案，請改用完整備份模式以確保資料較完整。</p>
+          <p class="helper-text">備份檔案可透過 iMazing 備份軟體取得。只讀訊息模式不會載入附件；若備份另有同名 WAL／SHM 檔案，請改用完整備份模式以確保資料較完整。</p>
         </div>
         <div id="loadStatus" class="status-area" role="status" aria-live="polite">尚未選取備份資料夾。</div>
         <div class="progress-track" aria-hidden="true"><span id="progressBar"></span></div>
