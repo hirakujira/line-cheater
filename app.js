@@ -29,7 +29,9 @@
     currentOffset: 0,
     attachmentFiles: [],
     attachmentByBasename: new Map(),
+    attachmentByMessageId: new Map(),
     attachmentByToken: new Map(),
+    objectUrls: new Set(),
     selfId: ""
   };
 
@@ -436,9 +438,9 @@
     if (!state.currentChat) return;
     var rows = safeQuery(
       "SELECT m.Z_PK AS messagePk, m.ZID AS messageId, m.ZTIMESTAMP AS timestamp, " +
-      "m.ZSENDER AS senderPk, m.ZCONTENTTYPE AS contentType, m.ZTEXT AS text, " +
+      "m.ZSENDER AS senderPk, m.ZSENDSTATUS AS sendStatus, m.ZCONTENTTYPE AS contentType, m.ZTEXT AS text, " +
       "m.ZMESSAGETYPE AS messageType, m.ZLATITUDE AS latitude, m.ZLONGITUDE AS longitude, " +
-      "m.ZCONTENTMETADATA AS contentMetadata " +
+      "m.ZCONTENTMETADATA AS contentMetadata, m.ZTHUMBNAIL AS thumbnail " +
       "FROM ZMESSAGE m WHERE m.ZCHAT = $chatPk " +
       "ORDER BY COALESCE(m.ZTIMESTAMP, 0) ASC, m.Z_PK ASC LIMIT $limit OFFSET $offset",
       { $chatPk: state.currentChat.pk, $limit: MESSAGE_PAGE_SIZE, $offset: state.currentOffset }
@@ -451,29 +453,53 @@
   }
 
   function mapMessage(row) {
-    var sender = state.users.get("pk:" + numberOrNull(row.senderPk));
+    var hasSender = row.senderPk !== null && row.senderPk !== undefined && row.senderPk !== "";
+    var sender = hasSender ? state.users.get("pk:" + numberOrNull(row.senderPk)) : null;
     var text = stringOrEmpty(row.text);
-    var kind = messageKind(row.contentType, row.messageType, text);
+    var call = extractCallInfo(row.contentType, row.contentMetadata, text, row.latitude, row.longitude);
+    var kind = call ? "call" : messageKind(row.contentType, row.messageType, text);
+    var messageId = stringOrEmpty(row.messageId);
+    var sendStatus = numberOrNull(row.sendStatus);
+    var isSystem = isSystemMessage(row.contentType, messageId, hasSender, sendStatus, call);
+    var isSelf = Boolean(
+      (sender && state.selfId && sender.id === state.selfId) ||
+      (!hasSender && !isSystem && (sendStatus === 1 || stringOrEmpty(row.messageType).toUpperCase() === "S"))
+    );
+    var attachmentHints = extractAttachmentHints(row.contentMetadata, messageId);
+    var linkPreviews = extractLinkPreviews(row.contentMetadata, text, row.contentType);
     return {
       pk: numberOrNull(row.messagePk),
-      id: stringOrEmpty(row.messageId),
+      id: messageId,
       timestampRaw: row.timestamp,
       timestamp: normalizeTimestamp(row.timestamp),
       senderId: sender ? sender.id : "",
-      sender: sender ? sender.name : "未知使用者",
-      isSelf: Boolean(sender && state.selfId && sender.id === state.selfId),
+      sender: isSelf ? "我" : (isSystem ? "系統" : (sender ? sender.name : "未知使用者")),
+      isSelf: isSelf,
+      isSystem: isSystem,
+      sendStatus: sendStatus,
       contentType: row.contentType,
       messageType: stringOrEmpty(row.messageType),
       kind: kind,
+      call: call,
       text: text,
       latitude: numberOrNull(row.latitude),
       longitude: numberOrNull(row.longitude),
-      attachmentHints: extractAttachmentHints(row.contentMetadata, stringOrEmpty(row.messageId)),
-      attachments: resolveAttachments(row.contentMetadata, stringOrEmpty(row.messageId))
+      thumbnail: toUint8Array(row.thumbnail),
+      linkPreviews: linkPreviews,
+      attachmentHints: attachmentHints,
+      attachments: resolveAttachments(row.contentMetadata, messageId, attachmentHints)
     };
   }
 
+  function isSystemMessage(contentType, messageId, hasSender, sendStatus, call) {
+    var code = Number(contentType);
+    if (call && call.isGroup) return true;
+    if (code === 7 || code === 18 || code === 96 || code === 111) return true;
+    return !hasSender && sendStatus === 0 && !messageId;
+  }
+
   function renderMessages() {
+    revokeObjectUrls();
     el.messageList.innerHTML = "";
     if (!state.currentMessages.length) {
       el.messageList.innerHTML = '<div class="empty-state">這個聊天室沒有可顯示的訊息。</div>';
@@ -483,7 +509,7 @@
     var fragment = document.createDocumentFragment();
     state.currentMessages.forEach(function (message) {
       var row = document.createElement("article");
-      row.className = "message-row" + (message.isSelf ? " self" : "");
+      row.className = "message-row" + (message.isSystem ? " system" : (message.isSelf ? " self" : ""));
       var card = document.createElement("div");
       card.className = "message-card";
       var meta = document.createElement("div");
@@ -497,10 +523,15 @@
       meta.appendChild(sender);
       meta.appendChild(date);
       card.appendChild(meta);
-      if (message.text) {
+      if (message.call) {
+        var call = document.createElement("p");
+        call.className = "message-call" + (isUnansweredCall(message.call) ? " unanswered" : "");
+        call.textContent = "☎︎ " + formatCallLabel(message.call, message.isSelf);
+        card.appendChild(call);
+      } else if (message.text) {
         var body = document.createElement("p");
         body.className = "message-text";
-        body.textContent = message.text;
+        appendLinkedText(body, message.text);
         card.appendChild(body);
       } else {
         var kind = document.createElement("p");
@@ -508,12 +539,14 @@
         kind.textContent = "[" + message.kind + "]";
         card.appendChild(kind);
       }
-      if (message.latitude !== null && message.longitude !== null) {
+      if (hasValidLocation(message)) {
         var coordinates = document.createElement("p");
         coordinates.className = "message-coordinates";
         coordinates.textContent = "位置：" + message.latitude + ", " + message.longitude;
         card.appendChild(coordinates);
       }
+      appendLinkPreviews(card, message.linkPreviews);
+      appendImagePreviews(card, message);
       appendAttachmentLinks(card, message.attachments);
       row.appendChild(card);
       fragment.appendChild(row);
@@ -573,7 +606,7 @@
   function loadAllMessagesForExport() {
     var rows = safeQuery(
       "SELECT m.Z_PK AS messagePk, m.ZID AS messageId, m.ZTIMESTAMP AS timestamp, " +
-      "m.ZSENDER AS senderPk, m.ZCONTENTTYPE AS contentType, m.ZTEXT AS text, " +
+      "m.ZSENDER AS senderPk, m.ZSENDSTATUS AS sendStatus, m.ZCONTENTTYPE AS contentType, m.ZTEXT AS text, " +
       "m.ZMESSAGETYPE AS messageType, m.ZLATITUDE AS latitude, m.ZLONGITUDE AS longitude, " +
       "m.ZCONTENTMETADATA AS contentMetadata " +
       "FROM ZMESSAGE m WHERE m.ZCHAT = $chatPk ORDER BY COALESCE(m.ZTIMESTAMP, 0) ASC, m.Z_PK ASC",
@@ -584,16 +617,19 @@
 
   function buildChatHtml(chat, messages) {
     var body = messages.map(function (message) {
-      var content = message.text ? '<p class="message-text">' + escapeHtml(message.text) + '</p>' : '<p class="message-kind">[' + escapeHtml(message.kind) + ']</p>';
-      if (message.latitude !== null && message.longitude !== null) {
+      var content = message.call
+        ? '<p class="message-call' + (isUnansweredCall(message.call) ? " unanswered" : "") + '">☎︎ ' + escapeHtml(formatCallLabel(message.call, message.isSelf)) + '</p>'
+        : (message.text ? '<p class="message-text">' + linkifyMessageHtml(message.text) + '</p>' : '<p class="message-kind">[' + escapeHtml(message.kind) + ']</p>');
+      if (hasValidLocation(message)) {
         content += '<p class="coordinates">位置：' + escapeHtml(message.latitude + ", " + message.longitude) + '</p>';
       }
+      content += buildLinkPreviewHtml(message.linkPreviews);
       if (message.attachments && message.attachments.length) {
         content += '<ul class="attachments">' + message.attachments.map(function (attachment) {
           return '<li>' + escapeHtml(attachment.name) + ' <span>(' + escapeHtml(formatBytes(attachment.size)) + ')</span></li>';
         }).join("") + '</ul>';
       }
-      return '<article class="message ' + (message.isSelf ? "self" : "") + '"><header><strong>' + escapeHtml(message.sender) + '</strong><time>' + escapeHtml(formatDate(message.timestamp, true)) + '</time></header>' + content + '</article>';
+      return '<article class="message ' + (message.isSystem ? "system" : (message.isSelf ? "self" : "")) + '"><header><strong>' + escapeHtml(message.sender) + '</strong><time>' + escapeHtml(formatDate(message.timestamp, true)) + '</time></header>' + content + '</article>';
     }).join("\n");
     var note = state.sourceMode === "database"
       ? "這份封存來自 Line.sqlite 只讀訊息模式；未載入附件檔案。"
@@ -602,7 +638,7 @@
   }
 
   function exportCss() {
-    return "body{margin:0;padding:24px;background:#f3f5f7;color:#1f2937;font:16px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}main{max-width:860px;margin:auto}h1{letter-spacing:-.03em}.meta,.note{color:#6b7280}.note{padding:10px 12px;border-radius:10px;background:#fff}.message{max-width:78%;margin:12px 0;padding:10px 12px;border:1px solid #e5e7eb;border-radius:12px;background:#fff}.message.self{margin-left:auto;border-color:#99f6e4;background:#f0fdfa}.message header{display:flex;gap:12px;justify-content:space-between;color:#6b7280;font-size:.78rem}.message-text{white-space:pre-wrap;overflow-wrap:anywhere}.message-kind{color:#92400e}.coordinates{color:#6b7280;font-size:.8rem}.attachments{margin:8px 0 0;padding-left:20px;color:#0f766e}.attachments span{color:#6b7280}";
+    return "body{margin:0;padding:24px;background:#f3f5f7;color:#1f2937;font:16px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}main{max-width:860px;margin:auto}h1{letter-spacing:-.03em}.meta,.note{color:#6b7280}.note{padding:10px 12px;border-radius:10px;background:#fff}.message{max-width:78%;margin:12px 0;padding:10px 12px;border:1px solid #e5e7eb;border-radius:12px;background:#fff}.message.self{margin-left:auto;border-color:#99f6e4;background:#f0fdfa}.message.system{margin-left:auto;margin-right:auto;border-style:dashed;color:#6b7280;background:#f8fafc}.message header{display:flex;gap:12px;justify-content:space-between;color:#6b7280;font-size:.78rem}.message-text{white-space:pre-wrap;overflow-wrap:anywhere}.message-text a{color:#0f766e;text-decoration:underline}.message-call{margin:0;font-weight:700;color:#0f766e}.message-call.unanswered{color:#b45309}.message-kind{color:#92400e}.coordinates{color:#6b7280;font-size:.8rem}.link-previews{display:grid;gap:8px;margin-top:9px}.link-preview{display:grid;grid-template-columns:minmax(0,1fr) 132px;overflow:hidden;border:1px solid #dbe4ea;border-radius:10px;color:inherit;text-decoration:none;background:#f8fafc}.link-preview.no-image{grid-template-columns:minmax(0,1fr)}.link-preview-content{min-width:0;padding:9px 10px}.link-preview-domain{display:block;color:#64748b;font-size:.72rem;text-transform:uppercase}.link-preview-title{display:block;margin-top:2px;font-weight:750}.link-preview-summary{display:-webkit-box;overflow:hidden;margin-top:3px;color:#64748b;font-size:.78rem;-webkit-box-orient:vertical;-webkit-line-clamp:2}.link-preview img{width:132px;height:100%;min-height:96px;object-fit:cover;background:#e2e8f0}.attachments{margin:8px 0 0;padding-left:20px;color:#0f766e}.attachments span{color:#6b7280}";
   }
 
   function exportAttachmentCsv() {
@@ -633,7 +669,10 @@
     state.currentOffset = 0;
     state.attachmentFiles = [];
     state.attachmentByBasename = new Map();
+    state.attachmentByMessageId = new Map();
     state.attachmentByToken = new Map();
+    revokeObjectUrls();
+    state.selfId = "";
     state.sourceSize = 0;
     if (resetInput !== false && el.folderInput) el.folderInput.value = "";
     if (resetInput !== false && el.databaseInput) el.databaseInput.value = "";
@@ -669,12 +708,18 @@
 
   function buildAttachmentIndex() {
     state.attachmentByBasename = new Map();
+    state.attachmentByMessageId = new Map();
     state.attachmentByToken = new Map();
     state.attachmentFiles.forEach(function (file) {
       var path = relativePath(file);
       var basename = normalizeFileName(fileNameOf(path));
       if (basename) addToIndex(state.attachmentByBasename, basename, file);
-      extractInternalTokens(path).forEach(function (token) {
+      var messageIdMatch = basename.match(/^(\d{8,})(?:[_.-]|$)/);
+      if (messageIdMatch) addToIndex(state.attachmentByMessageId, messageIdMatch[1], file);
+      // Directory names contain the chat MID. Indexing the whole path would
+      // make every message in that chat look related to every attachment.
+      // Token matching is only useful when the token is part of the file name.
+      extractInternalTokens(basename).forEach(function (token) {
         addToIndex(state.attachmentByToken, token, file);
       });
     });
@@ -737,9 +782,487 @@
     return Array.from(new Set(values));
   }
 
-  function resolveAttachments(blob, messageId) {
-    var hints = extractAttachmentHints(blob, messageId);
+  function extractBinaryPlistObjectStrings(blob) {
+    var bytes = toUint8Array(blob);
+    if (!bytes || bytes.length < 40) return [];
+    var header = "";
+    for (var headerIndex = 0; headerIndex < 8; headerIndex += 1) header += String.fromCharCode(bytes[headerIndex]);
+    if (header !== "bplist00") return [];
+
+    var trailerOffset = bytes.length - 32;
+    var offsetSize = bytes[trailerOffset + 6];
+    var objectCount = readBigEndianNumber(bytes, trailerOffset + 8, 8);
+    var offsetTableOffset = readBigEndianNumber(bytes, trailerOffset + 24, 8);
+    if (!offsetSize || !objectCount || objectCount > 100000 || offsetTableOffset >= bytes.length) return [];
+
+    var strings = [];
+    for (var objectIndex = 0; objectIndex < objectCount; objectIndex += 1) {
+      var tableEntry = offsetTableOffset + objectIndex * offsetSize;
+      if (tableEntry + offsetSize > trailerOffset) break;
+      var objectOffset = readBigEndianNumber(bytes, tableEntry, offsetSize);
+      if (objectOffset < 8 || objectOffset >= offsetTableOffset) continue;
+      var marker = bytes[objectOffset];
+      var objectType = marker >> 4;
+      if (objectType !== 5 && objectType !== 6 && objectType !== 7) continue;
+      var lengthInfo = binaryPlistLength(bytes, objectOffset, marker & 15);
+      if (!lengthInfo || lengthInfo.length < 1 || lengthInfo.length > 4096) continue;
+      try {
+        var byteLength = objectType === 6 ? lengthInfo.length * 2 : lengthInfo.length;
+        if (lengthInfo.dataOffset + byteLength > bytes.length) continue;
+        var encoding = objectType === 6 ? "utf-16be" : "utf-8";
+        strings.push(new TextDecoder(encoding).decode(bytes.slice(lengthInfo.dataOffset, lengthInfo.dataOffset + byteLength)));
+      } catch (error) { /* Ignore malformed optional metadata strings. */ }
+    }
+    return strings;
+  }
+
+  function binaryPlistLength(bytes, objectOffset, compactLength) {
+    if (compactLength < 15) return { length: compactLength, dataOffset: objectOffset + 1 };
+    var lengthMarkerOffset = objectOffset + 1;
+    if (lengthMarkerOffset >= bytes.length || bytes[lengthMarkerOffset] >> 4 !== 1) return null;
+    var integerSize = Math.pow(2, bytes[lengthMarkerOffset] & 15);
+    if (integerSize > 8 || lengthMarkerOffset + 1 + integerSize > bytes.length) return null;
+    return {
+      length: readBigEndianNumber(bytes, lengthMarkerOffset + 1, integerSize),
+      dataOffset: lengthMarkerOffset + 1 + integerSize
+    };
+  }
+
+  function readBigEndianNumber(bytes, offset, length) {
+    var value = 0;
+    for (var index = 0; index < length; index += 1) value = value * 256 + bytes[offset + index];
+    return value;
+  }
+
+  function parseBinaryPropertyList(blob) {
+    var bytes = toUint8Array(blob);
+    if (!bytes || bytes.length < 40) return null;
+    var header = "";
+    for (var headerIndex = 0; headerIndex < 8; headerIndex += 1) header += String.fromCharCode(bytes[headerIndex]);
+    if (header !== "bplist00") return null;
+
+    var trailerOffset = bytes.length - 32;
+    var offsetSize = bytes[trailerOffset + 6];
+    var objectRefSize = bytes[trailerOffset + 7];
+    var objectCount = readBigEndianNumber(bytes, trailerOffset + 8, 8);
+    var topObject = readBigEndianNumber(bytes, trailerOffset + 16, 8);
+    var offsetTableOffset = readBigEndianNumber(bytes, trailerOffset + 24, 8);
+    if (!offsetSize || !objectRefSize || !objectCount || objectCount > 100000 || topObject >= objectCount || offsetTableOffset >= trailerOffset) return null;
+
+    var offsets = [];
+    for (var offsetIndex = 0; offsetIndex < objectCount; offsetIndex += 1) {
+      var tableEntry = offsetTableOffset + offsetIndex * offsetSize;
+      if (tableEntry + offsetSize > trailerOffset) return null;
+      offsets.push(readBigEndianNumber(bytes, tableEntry, offsetSize));
+    }
+
+    var cache = new Array(objectCount);
+    var parsed = new Array(objectCount).fill(false);
+
+    function parseObject(objectIndex) {
+      if (objectIndex < 0 || objectIndex >= objectCount) return null;
+      if (parsed[objectIndex]) return cache[objectIndex];
+      var objectOffset = offsets[objectIndex];
+      if (objectOffset < 8 || objectOffset >= offsetTableOffset) return null;
+      var marker = bytes[objectOffset];
+      var objectType = marker >> 4;
+      var compactLength = marker & 15;
+      var lengthInfo;
+      var byteLength;
+      var value;
+      var cursor;
+      var itemIndex;
+
+      if (objectType === 0) {
+        value = compactLength === 9 ? true : (compactLength === 8 ? false : null);
+      } else if (objectType === 1) {
+        byteLength = Math.pow(2, compactLength);
+        value = byteLength <= 8 && objectOffset + 1 + byteLength <= bytes.length
+          ? readBigEndianNumber(bytes, objectOffset + 1, byteLength)
+          : null;
+      } else if (objectType === 2) {
+        byteLength = Math.pow(2, compactLength);
+        try {
+          var dataView = new DataView(bytes.buffer, bytes.byteOffset + objectOffset + 1, byteLength);
+          value = byteLength === 4 ? dataView.getFloat32(0, false) : (byteLength === 8 ? dataView.getFloat64(0, false) : null);
+        } catch (error) { value = null; }
+      } else if (objectType === 3 && compactLength === 3) {
+        try {
+          value = new Date((new DataView(bytes.buffer, bytes.byteOffset + objectOffset + 1, 8).getFloat64(0, false) + 978307200) * 1000);
+        } catch (error) { value = null; }
+      } else if (objectType === 4 || objectType === 5 || objectType === 6 || objectType === 7) {
+        lengthInfo = binaryPlistLength(bytes, objectOffset, compactLength);
+        if (!lengthInfo) return null;
+        byteLength = objectType === 6 ? lengthInfo.length * 2 : lengthInfo.length;
+        if (lengthInfo.dataOffset + byteLength > bytes.length) return null;
+        if (objectType === 4) {
+          value = bytes.slice(lengthInfo.dataOffset, lengthInfo.dataOffset + byteLength);
+        } else {
+          try {
+            value = new TextDecoder(objectType === 6 ? "utf-16be" : "utf-8").decode(bytes.slice(lengthInfo.dataOffset, lengthInfo.dataOffset + byteLength));
+          } catch (error) { value = ""; }
+        }
+      } else if (objectType === 8) {
+        byteLength = compactLength + 1;
+        value = objectOffset + 1 + byteLength <= bytes.length
+          ? { __plistUid: readBigEndianNumber(bytes, objectOffset + 1, byteLength) }
+          : null;
+      } else if (objectType === 10 || objectType === 11 || objectType === 12) {
+        lengthInfo = binaryPlistLength(bytes, objectOffset, compactLength);
+        if (!lengthInfo || lengthInfo.dataOffset + lengthInfo.length * objectRefSize > bytes.length) return null;
+        value = [];
+        parsed[objectIndex] = true;
+        cache[objectIndex] = value;
+        cursor = lengthInfo.dataOffset;
+        for (itemIndex = 0; itemIndex < lengthInfo.length; itemIndex += 1) {
+          value.push(parseObject(readBigEndianNumber(bytes, cursor + itemIndex * objectRefSize, objectRefSize)));
+        }
+        return value;
+      } else if (objectType === 13) {
+        lengthInfo = binaryPlistLength(bytes, objectOffset, compactLength);
+        if (!lengthInfo || lengthInfo.dataOffset + lengthInfo.length * objectRefSize * 2 > bytes.length) return null;
+        value = {};
+        parsed[objectIndex] = true;
+        cache[objectIndex] = value;
+        cursor = lengthInfo.dataOffset;
+        for (itemIndex = 0; itemIndex < lengthInfo.length; itemIndex += 1) {
+          var keyRef = readBigEndianNumber(bytes, cursor + itemIndex * objectRefSize, objectRefSize);
+          var valueRef = readBigEndianNumber(bytes, cursor + (lengthInfo.length + itemIndex) * objectRefSize, objectRefSize);
+          var key = parseObject(keyRef);
+          if (typeof key === "string") value[key] = parseObject(valueRef);
+        }
+        return value;
+      } else {
+        value = null;
+      }
+
+      parsed[objectIndex] = true;
+      cache[objectIndex] = value;
+      return value;
+    }
+
+    return parseObject(topObject);
+  }
+
+  function decodeKeyedArchive(blob) {
+    var archive = parseBinaryPropertyList(blob);
+    if (!archive || !Array.isArray(archive.$objects) || !archive.$top) return null;
+    var objects = archive.$objects;
+    var resolvedCache = new Map();
+
+    function resolve(value, depth) {
+      if (depth > 60 || value === null || value === undefined || value === "$null") return null;
+      if (value && typeof value === "object" && Number.isInteger(value.__plistUid)) {
+        var objectIndex = value.__plistUid;
+        if (objectIndex < 0 || objectIndex >= objects.length) return null;
+        if (resolvedCache.has(objectIndex)) return resolvedCache.get(objectIndex);
+        var resolvedObject = resolve(objects[objectIndex], depth + 1);
+        resolvedCache.set(objectIndex, resolvedObject);
+        return resolvedObject;
+      }
+      if (Array.isArray(value)) return value.map(function (item) { return resolve(item, depth + 1); });
+      if (value instanceof Uint8Array || value instanceof Date || typeof value !== "object") return value;
+
+      if (Array.isArray(value["NS.keys"]) && Array.isArray(value["NS.objects"])) {
+        var dictionary = {};
+        var keys = resolve(value["NS.keys"], depth + 1) || [];
+        var values = resolve(value["NS.objects"], depth + 1) || [];
+        keys.forEach(function (key, index) {
+          if (typeof key === "string") dictionary[key] = values[index];
+        });
+        return dictionary;
+      }
+      if (Array.isArray(value["NS.objects"])) return resolve(value["NS.objects"], depth + 1);
+
+      var object = {};
+      Object.keys(value).forEach(function (key) {
+        if (key !== "$class") object[key] = resolve(value[key], depth + 1);
+      });
+      return object;
+    }
+
+    return resolve(archive.$top.root, 0);
+  }
+
+  function extractCallInfo(contentType, blob, text, latitude, longitude) {
+    if (Number(contentType) !== 6) return null;
+    var strings = extractBinaryPlistObjectStrings(blob);
+    var knownResults = ["NO_RESPONSE", "CANCELED", "REJECTED", "NORMAL", "BUSY"];
+    var result = "UNKNOWN";
+    for (var resultIndex = 0; resultIndex < knownResults.length; resultIndex += 1) {
+      if (strings.indexOf(knownResults[resultIndex]) !== -1) {
+        result = knownResults[resultIndex];
+        break;
+      }
+    }
+
+    var isGroup = strings.some(function (value) {
+      return value.indexOf("GroupCall") !== -1 || value === "GC_CHAT_MID" || value === "GC_EVT_TYPE";
+    });
+    var media = strings.indexOf("V") !== -1 || strings.indexOf("VIDEO") !== -1 ? "video" : "audio";
+    var durations = strings.filter(function (value) { return /^\d{1,10}$/.test(value); }).map(Number).filter(function (value) {
+      return value >= 1000 && value <= 86400000;
+    });
+    var durationMs = durations.length ? Math.max.apply(Math, durations) : 0;
+    var legacyText = stringOrEmpty(text).match(/Call History\s*:\s*(\d+)\s*millisecs,\s*Result:\s*(\d+)/i);
+    if (legacyText) {
+      durationMs = Number(legacyText[1]) || 0;
+      if (result === "UNKNOWN") result = durationMs > 0 ? "NORMAL" : "NO_RESPONSE";
+    } else if (!durationMs) {
+      var legacyDuration = numberOrNull(latitude);
+      if (legacyDuration !== null && legacyDuration >= 1000) durationMs = legacyDuration;
+    }
+    if (result === "UNKNOWN" && durationMs > 0) result = "NORMAL";
+
+    return {
+      media: media,
+      result: result,
+      durationMs: durationMs,
+      isGroup: isGroup,
+      legacyCode: legacyText ? Number(legacyText[2]) : numberOrNull(longitude)
+    };
+  }
+
+  function formatCallLabel(call, isSelf) {
+    var medium = call.media === "video" ? "視訊" : "語音";
+    if (call.isGroup) {
+      return "群組" + medium + "通話" + (call.durationMs ? " · " + formatCallDuration(call.durationMs) : "");
+    }
+    if (call.result === "NORMAL") {
+      return medium + "通話" + (call.durationMs ? " · " + formatCallDuration(call.durationMs) : "");
+    }
+    if (call.result === "NO_RESPONSE") return isSelf ? "對方未接" + medium + "通話" : "未接" + (medium === "視訊" ? "視訊來電" : "來電");
+    if (call.result === "CANCELED") return isSelf ? "已取消" + medium + "通話" : "未接" + (medium === "視訊" ? "視訊來電" : "來電");
+    if (call.result === "BUSY") return isSelf ? "對方忙線中" : "忙線中";
+    if (call.result === "REJECTED") return isSelf ? "對方拒絕" + medium + "通話" : "已拒絕" + (medium === "視訊" ? "視訊來電" : "來電");
+    return medium + "通話";
+  }
+
+  function formatCallDuration(milliseconds) {
+    var seconds = Math.max(0, Math.round(Number(milliseconds) / 1000));
+    var minutes = Math.floor(seconds / 60);
+    var remainder = seconds % 60;
+    if (!minutes) return remainder + " 秒";
+    return minutes + " 分 " + remainder + " 秒";
+  }
+
+  function isUnansweredCall(call) {
+    return call && call.result !== "NORMAL" && call.result !== "UNKNOWN";
+  }
+
+  function safeHttpUrl(value) {
+    try {
+      var parsed = new URL(String(value || "").trim());
+      return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.href : "";
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function trimUrlMatch(value) {
+    var trimmed = String(value || "");
+    while (/[.,!?;:，。！？；：、》】」』]$/.test(trimmed)) trimmed = trimmed.slice(0, -1);
+    [["(", ")"], ["[", "]"], ["{", "}"]].forEach(function (pair) {
+      while (trimmed.endsWith(pair[1]) && trimmed.split(pair[0]).length < trimmed.split(pair[1]).length) {
+        trimmed = trimmed.slice(0, -1);
+      }
+    });
+    return trimmed;
+  }
+
+  function findHttpUrls(text) {
+    var source = stringOrEmpty(text);
+    var pattern = /https?:\/\/[^\s<>"']+/gi;
+    var matches = [];
+    var seen = new Set();
+    var match;
+    while ((match = pattern.exec(source)) !== null) {
+      var raw = trimUrlMatch(match[0]);
+      var href = safeHttpUrl(raw);
+      if (!href) continue;
+      var key = href.replace(/#.*$/, "");
+      matches.push({ href: href, text: raw, start: match.index, end: match.index + raw.length, duplicate: seen.has(key) });
+      seen.add(key);
+    }
+    return matches;
+  }
+
+  function previewDomain(url, fallback) {
+    try { return new URL(url).hostname.replace(/^www\./i, "") || stringOrEmpty(fallback); }
+    catch (error) { return stringOrEmpty(fallback); }
+  }
+
+  function youtubeVideoId(url) {
+    try {
+      var parsed = new URL(url);
+      var host = parsed.hostname.replace(/^www\./i, "").toLowerCase();
+      var id = "";
+      if (host === "youtu.be") id = parsed.pathname.split("/").filter(Boolean)[0] || "";
+      else if (host === "youtube.com" || host === "m.youtube.com" || host === "youtube-nocookie.com") {
+        if (parsed.pathname === "/watch") id = parsed.searchParams.get("v") || "";
+        else if (/^\/(?:shorts|live|embed)\//.test(parsed.pathname)) id = parsed.pathname.split("/")[2] || "";
+      }
+      return /^[A-Za-z0-9_-]{6,20}$/.test(id) ? id : "";
+    } catch (error) {
+      return "";
+    }
+  }
+
+  function normalizeLinkPreviewImage(value, url) {
+    var candidate = stringOrEmpty(value).trim();
+    if (candidate.indexOf("//") === 0) candidate = "https:" + candidate;
+    else if (candidate.charAt(0) === "/") candidate = "https://obs.line-scdn.net" + candidate;
+    var safeCandidate = safeHttpUrl(candidate);
+    if (safeCandidate) return safeCandidate;
+    var videoId = youtubeVideoId(url);
+    return videoId ? "https://i.ytimg.com/vi/" + videoId + "/hqdefault.jpg" : "";
+  }
+
+  function createLinkPreview(url, model) {
+    var href = safeHttpUrl(url);
+    if (!href) return null;
+    var data = model && typeof model === "object" ? model : {};
+    var domain = firstNonEmpty(data.domain, previewDomain(href), "連結");
+    var videoId = youtubeVideoId(href);
+    return {
+      url: href,
+      domain: domain,
+      title: firstNonEmpty(data.Title, videoId ? "YouTube 影片" : domain),
+      summary: firstNonEmpty(data.Summary, href),
+      image: normalizeLinkPreviewImage(data.ThumbnailURLString, href),
+      isVideo: Boolean(data.isVideo || videoId)
+    };
+  }
+
+  function extractLinkPreviews(blob, text, contentType) {
+    var urlMatches = findHttpUrls(text);
+    if (!urlMatches.length && Number(contentType) !== 107) return [];
+    var previews = [];
+    var seen = new Set();
+    var archive = decodeKeyedArchive(blob);
+    var models = archive && archive.NLURLScrapModelsKey;
+    if (models && !Array.isArray(models)) models = [models];
+    (models || []).forEach(function (model) {
+      var url = model && firstNonEmpty(model.URLString, model.redirectedURLString);
+      var preview = createLinkPreview(url, model);
+      if (!preview) return;
+      var key = preview.url.replace(/#.*$/, "");
+      if (!seen.has(key)) previews.push(preview);
+      seen.add(key);
+    });
+    urlMatches.forEach(function (match) {
+      var key = match.href.replace(/#.*$/, "");
+      if (seen.has(key) || match.duplicate) return;
+      var preview = createLinkPreview(match.href, null);
+      if (preview) previews.push(preview);
+      seen.add(key);
+    });
+    return previews.slice(0, 4);
+  }
+
+  function appendLinkedText(container, text) {
+    var source = stringOrEmpty(text);
+    var matches = findHttpUrls(source);
+    var cursor = 0;
+    matches.forEach(function (match) {
+      if (match.start > cursor) container.appendChild(document.createTextNode(source.slice(cursor, match.start)));
+      var link = document.createElement("a");
+      link.href = match.href;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.referrerPolicy = "no-referrer";
+      link.textContent = source.slice(match.start, match.end);
+      container.appendChild(link);
+      cursor = match.end;
+    });
+    if (cursor < source.length) container.appendChild(document.createTextNode(source.slice(cursor)));
+  }
+
+  function appendLinkPreviews(card, previews) {
+    if (!previews || !previews.length) return;
+    var list = document.createElement("div");
+    list.className = "link-previews";
+    previews.forEach(function (previewData) {
+      var preview = document.createElement("a");
+      preview.className = "link-preview" + (previewData.image ? "" : " no-image");
+      preview.href = previewData.url;
+      preview.target = "_blank";
+      preview.rel = "noopener noreferrer";
+      preview.referrerPolicy = "no-referrer";
+
+      var content = document.createElement("span");
+      content.className = "link-preview-content";
+      var domain = document.createElement("span");
+      domain.className = "link-preview-domain";
+      domain.textContent = previewData.domain;
+      var title = document.createElement("strong");
+      title.className = "link-preview-title";
+      title.textContent = previewData.title;
+      var summary = document.createElement("span");
+      summary.className = "link-preview-summary";
+      summary.textContent = previewData.summary;
+      content.appendChild(domain);
+      content.appendChild(title);
+      content.appendChild(summary);
+      preview.appendChild(content);
+
+      if (previewData.image) {
+        var image = document.createElement("img");
+        image.src = previewData.image;
+        image.alt = "";
+        image.loading = "lazy";
+        image.decoding = "async";
+        image.referrerPolicy = "no-referrer";
+        image.addEventListener("error", function () {
+          preview.classList.add("no-image");
+          image.remove();
+        });
+        preview.appendChild(image);
+      }
+      list.appendChild(preview);
+    });
+    card.appendChild(list);
+  }
+
+  function linkifyMessageHtml(text) {
+    var source = stringOrEmpty(text);
+    var matches = findHttpUrls(source);
+    var parts = [];
+    var cursor = 0;
+    matches.forEach(function (match) {
+      if (match.start > cursor) parts.push(escapeHtml(source.slice(cursor, match.start)));
+      parts.push('<a href="' + escapeHtml(match.href) + '" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">' + escapeHtml(source.slice(match.start, match.end)) + '</a>');
+      cursor = match.end;
+    });
+    if (cursor < source.length) parts.push(escapeHtml(source.slice(cursor)));
+    return parts.join("");
+  }
+
+  function buildLinkPreviewHtml(previews) {
+    if (!previews || !previews.length) return "";
+    return '<div class="link-previews">' + previews.map(function (preview) {
+      var image = preview.image
+        ? '<img src="' + escapeHtml(preview.image) + '" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">'
+        : "";
+      return '<a class="link-preview' + (preview.image ? "" : " no-image") + '" href="' + escapeHtml(preview.url) + '" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer"><span class="link-preview-content"><span class="link-preview-domain">' + escapeHtml(preview.domain) + '</span><strong class="link-preview-title">' + escapeHtml(preview.title) + '</strong><span class="link-preview-summary">' + escapeHtml(preview.summary) + '</span></span>' + image + '</a>';
+    }).join("") + '</div>';
+  }
+
+  function resolveAttachments(blob, messageId, extractedHints) {
+    var hints = extractedHints || extractAttachmentHints(blob, messageId);
     var candidates = [];
+    var messageIdFiles = state.attachmentByMessageId.get(messageId) || [];
+    var chatScopedFiles = messageIdFiles.filter(function (file) {
+      return state.currentChat && relativePath(file).indexOf("/" + state.currentChat.id + "/") !== -1;
+    });
+    var directFiles = chatScopedFiles.length ? chatScopedFiles : messageIdFiles;
+    var directStatus = chatScopedFiles.length || directFiles.length === 1 ? "exact" : "ambiguous";
+    directFiles.forEach(function (file) {
+      // A LINE image commonly has both a Message Thumbnails file and a full
+      // Message Attachments file with the same message ID. Multiple variants
+      // inside the selected chat are still an exact match, not an ambiguity.
+      candidates.push({file: file, status: directStatus, hint: messageId});
+    });
     hints.forEach(function (hint) {
       var files = state.attachmentByBasename.get(normalizeFileName(hint)) || [];
       files.forEach(function (file) {
@@ -778,7 +1301,7 @@
       var item = document.createElement("li");
       if (file) {
         var link = document.createElement("a");
-        link.href = URL.createObjectURL(file);
+        link.href = createObjectUrl(file);
         link.download = file.name;
         link.textContent = file.name + " (" + formatBytes(file.size) + ")";
         link.title = attachment.linkStatus === "ambiguous" ? "檔名重複，這是可能的附件" : "下載原始附件";
@@ -796,6 +1319,120 @@
     card.appendChild(list);
   }
 
+  function appendImagePreviews(card, message) {
+    var exactAttachments = (message.attachments || []).filter(function (attachment) {
+      return attachment.linkStatus === "exact";
+    });
+    var originalImages = exactAttachments.filter(isImageAttachment);
+    var thumbnailImages = exactAttachments.filter(isThumbnailAttachment);
+    // Prefer the original browser-readable image. Older backups often retain
+    // only Message Thumbnails/*.thumb, which are still ordinary image bytes.
+    var images = (originalImages.length ? originalImages : thumbnailImages).slice(0, 4);
+    var media = null;
+
+    images.forEach(function (attachment) {
+      var file = state.fileByPath.get(attachment.path);
+      if (!file) return;
+      if (!media) {
+        media = document.createElement("div");
+        media.className = "message-media";
+      }
+      media.appendChild(createImagePreview(
+        createObjectUrl(file),
+        attachment.name,
+        isThumbnailAttachment(attachment) ? "備份中的縮圖" : "開啟原始圖片"
+      ));
+    });
+
+    if ((!media || !media.childNodes.length) && isImageContentType(message.contentType) && message.thumbnail && message.thumbnail.length) {
+      var mime = detectImageMime(message.thumbnail);
+      if (mime) {
+        media = document.createElement("div");
+        media.className = "message-media";
+        media.appendChild(createImagePreview(
+          createObjectUrl(new Blob([message.thumbnail], { type: mime })),
+          "訊息圖片縮圖",
+          "備份資料庫內的縮圖"
+        ));
+      }
+    }
+
+    if (media && media.childNodes.length) card.appendChild(media);
+  }
+
+  function createImagePreview(url, alt, captionText) {
+    var figure = document.createElement("figure");
+    figure.className = "message-image";
+    var link = document.createElement("a");
+    link.href = url;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.title = captionText;
+    var image = document.createElement("img");
+    image.src = url;
+    image.alt = alt || "LINE 圖片";
+    // The message panel is its own scroll container. Some browsers never
+    // activate native lazy loading for images deeper in that container.
+    image.loading = "eager";
+    image.decoding = "async";
+    image.addEventListener("error", function () {
+      figure.classList.add("preview-error");
+      image.alt = "這個圖片格式無法由瀏覽器直接顯示";
+    });
+    link.appendChild(image);
+    figure.appendChild(link);
+    var caption = document.createElement("figcaption");
+    caption.textContent = captionText;
+    figure.appendChild(caption);
+    return figure;
+  }
+
+  function isImageAttachment(attachment) {
+    return /^image\/(?:jpe?g|png|gif|webp|bmp|avif)$/i.test(attachment.mime || "") || /\.(?:jpe?g|png|gif|webp|bmp|avif)$/i.test(attachment.name || "");
+  }
+
+  function isThumbnailAttachment(attachment) {
+    return /\.thumb$/i.test(attachment.name || "") || /\/Message Thumbnails\//.test(attachment.path || "");
+  }
+
+  function isImageContentType(contentType) {
+    var code = Number(contentType);
+    return code === 1 || code === 16 || code === 112;
+  }
+
+  function isLocationContentType(contentType) {
+    return Number(contentType) === 100;
+  }
+
+  function hasValidLocation(message) {
+    if (!message || message.call || !isLocationContentType(message.contentType)) return false;
+    var latitude = Number(message.latitude);
+    var longitude = Number(message.longitude);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return false;
+    if (Math.abs(latitude) < 0.000001 && Math.abs(longitude) < 0.000001) return false;
+    return latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180;
+  }
+
+  function detectImageMime(bytes) {
+    if (!bytes || bytes.length < 4) return "";
+    if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+    if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) return "image/gif";
+    if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+    return "";
+  }
+
+  function createObjectUrl(blob) {
+    var url = URL.createObjectURL(blob);
+    state.objectUrls.add(url);
+    return url;
+  }
+
+  function revokeObjectUrls() {
+    state.objectUrls.forEach(function (url) { URL.revokeObjectURL(url); });
+    state.objectUrls.clear();
+  }
+
   function sanitizeMessageForExport(message) {
     return {
       pk: message.pk,
@@ -805,12 +1442,16 @@
       senderId: message.senderId,
       sender: message.sender,
       isSelf: message.isSelf,
+      isSystem: message.isSystem,
+      sendStatus: message.sendStatus,
       contentType: message.contentType,
       messageType: message.messageType,
       kind: message.kind,
+      call: message.call,
       text: message.text,
       latitude: message.latitude,
       longitude: message.longitude,
+      linkPreviews: message.linkPreviews,
       attachmentHints: message.attachmentHints,
       attachments: message.attachments
     };
@@ -834,7 +1475,7 @@
   function messageKind(contentType, messageType, text) {
     if (text) return "text";
     var code = Number(contentType);
-    var known = { 1: "image", 2: "video", 3: "audio", 4: "file", 5: "sticker", 6: "location", 7: "system", 9: "contact", 12: "poll", 13: "call", 14: "file", 16: "image", 17: "video", 18: "audio", 96: "system", 100: "sticker", 101: "sticker", 107: "file", 111: "system", 112: "unknown" };
+    var known = { 1: "image", 2: "video", 3: "audio", 4: "file", 5: "sticker", 6: "call", 7: "system", 9: "contact", 12: "poll", 13: "call", 14: "file", 16: "image", 17: "video", 18: "system", 96: "system", 100: "location", 101: "sticker", 107: "link", 111: "system", 112: "image" };
     return known[code] || (messageType || "unknown");
   }
 
@@ -908,7 +1549,11 @@
   }
 
   function stringOrEmpty(value) { return value === null || value === undefined ? "" : String(value); }
-  function numberOrNull(value) { var number = Number(value); return Number.isFinite(number) ? number : null; }
+  function numberOrNull(value) {
+    if (value === null || value === undefined || value === "") return null;
+    var number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
   function firstNonEmpty() {
     for (var i = 0; i < arguments.length; i += 1) if (arguments[i] !== null && arguments[i] !== undefined && String(arguments[i]).trim()) return String(arguments[i]);
     return "";
