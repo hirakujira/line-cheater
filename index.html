@@ -162,7 +162,9 @@
           <div class="button-row cleanup-export-row">
             <button id="exportCleanupPlanButton" class="button button-primary" type="button" disabled>匯出瘦身操作計畫</button>
             <button id="exportCleanupTextButton" class="button button-secondary" type="button" disabled>匯出操作說明</button>
+            <button id="buildImazingCandidateButton" class="button button-secondary" type="button" disabled>建立 .imazingapp 候選封裝</button>
           </div>
+          <p id="cleanupPackageStatus" class="helper-text" role="status">候選封裝會保留未標記的 Container／Payload 檔案，但尚未經 iMazing 實機驗證。</p>
         </section>
 
       </section>
@@ -175,6 +177,8 @@
 
     <!-- sql.js is used only for local, read-only SQLite parsing. -->
     <script src="https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/sql-wasm.js"></script>
+    <!-- fflate provides streaming ZIP output for the local candidate package. -->
+    <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
     <script src="app.js"></script>
   </body>
 </html>

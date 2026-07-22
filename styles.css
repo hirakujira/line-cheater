@@ -86,6 +86,7 @@ h2 { margin-bottom: 4px; font-size: 1.25rem; line-height: 1.2; }
 .muted, .helper-text { color: var(--muted); }
 .muted { margin: 6px 0 0; font-size: 0.9rem; }
 .helper-text { margin: 10px 0 0; font-size: 0.86rem; }
+.helper-text.error { color: #b91c1c; }
 
 .status-pill {
   display: inline-flex;

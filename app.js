@@ -1,4 +1,4 @@
-/* global initSqlJs */
+/* global initSqlJs, fflate */
 
 (function () {
   "use strict";
@@ -8,7 +8,9 @@
   var CHAT_ITEM_FALLBACK_HEIGHT = 65;
   var MAX_ATTACHMENT_PREVIEW = 120;
   var ATTACHMENT_CLEANUP_PAGE_SIZE = 30;
+  var MAX_BLOB_CANDIDATE_BYTES = 256 * 1024 * 1024;
   var chatResizeTimer = null;
+  var packageInProgress = false;
 
   var state = {
     files: [],
@@ -82,6 +84,8 @@
     el.clearAttachmentSelectionButton = document.getElementById("clearAttachmentSelectionButton");
     el.exportCleanupPlanButton = document.getElementById("exportCleanupPlanButton");
     el.exportCleanupTextButton = document.getElementById("exportCleanupTextButton");
+    el.buildImazingCandidateButton = document.getElementById("buildImazingCandidateButton");
+    el.cleanupPackageStatus = document.getElementById("cleanupPackageStatus");
 
     el.folderInput.addEventListener("change", function (event) {
       loadSource(event.target.files, "folder");
@@ -160,6 +164,7 @@
     });
     el.exportCleanupPlanButton.addEventListener("click", exportAttachmentCleanupPlan);
     el.exportCleanupTextButton.addEventListener("click", exportAttachmentCleanupInstructions);
+    el.buildImazingCandidateButton.addEventListener("click", buildImazingCandidatePackage);
     window.addEventListener("resize", scheduleChatLayoutRefresh);
     updateSourceModeUi();
 
@@ -664,6 +669,12 @@
     return /\/Message Thumbnails\//.test(path) ? "縮圖" : "原始附件";
   }
 
+  function setCleanupPackageStatus(text, isError) {
+    if (!el.cleanupPackageStatus) return;
+    el.cleanupPackageStatus.textContent = text;
+    el.cleanupPackageStatus.classList.toggle("error", Boolean(isError));
+  }
+
   function renderAttachmentCleanup() {
     var databaseOnly = state.sourceMode === "database";
     var hasFiles = !databaseOnly && state.attachmentFiles.length > 0;
@@ -701,6 +712,7 @@
     el.clearAttachmentSelectionButton.disabled = !hasFiles || markedFiles.length === 0;
     el.exportCleanupPlanButton.disabled = !hasFiles;
     el.exportCleanupTextButton.disabled = !hasFiles;
+    el.buildImazingCandidateButton.disabled = !hasFiles || packageInProgress;
   }
 
   function getMarkedAttachmentFiles() {
@@ -783,6 +795,161 @@
     });
     lines.push("", "注意：這份清單不會改寫 SQLite，也不能承諾保留 macOS creation time；LINE 訊息時間來自 SQLite。");
     downloadText("line-attachment-cleanup-instructions.txt", lines.join("\n"), "text/plain;charset=utf-8");
+  }
+
+  function getCandidateBackupFiles() {
+    return state.files.filter(function (file) {
+      var path = archiveRelativePath(file);
+      return path === ".lock" || path === "iTunesArtwork" || path === "iTunesMetadata.plist" || path.indexOf("Container/") === 0 || path.indexOf("Payload/") === 0;
+    });
+  }
+
+  function safeArchivePath(path) {
+    return String(path || "").replace(/\\/g, "/").split("/").filter(function (part) {
+      return part && part !== "." && part !== "..";
+    }).join("/");
+  }
+
+  function candidateFilename() {
+    return "LINE-slimmed-" + new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z") + ".imazingapp.candidate";
+  }
+
+  async function openCandidateOutput(filename) {
+    if (typeof window.showSaveFilePicker === "function") {
+      var handle = await window.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: "iMazing 候選封裝", accept: { "application/octet-stream": [".imazingapp.candidate", ".imazingapp"] } }]
+      });
+      return { writable: await handle.createWritable(), chunks: [], bytes: 0, pending: Promise.resolve(), error: null, closed: false };
+    }
+    return { writable: null, chunks: [], bytes: 0, pending: Promise.resolve(), error: null, closed: false };
+  }
+
+  function queueCandidateChunk(output, chunk) {
+    if (!chunk || !chunk.length) return;
+    output.bytes += chunk.length;
+    if (output.writable) {
+      output.pending = output.pending.then(function () { return output.writable.write(chunk); });
+    } else {
+      output.chunks.push(chunk);
+    }
+  }
+
+  async function flushCandidateOutput(output) {
+    await output.pending;
+    if (output.error) throw output.error;
+  }
+
+  function updateCandidateProgress(processedBytes, totalBytes, processedFiles, totalFiles) {
+    var percent = totalBytes ? Math.round(processedBytes / totalBytes * 100) : 100;
+    setCleanupPackageStatus("正在建立候選封裝… " + percent + "%（" + formatNumber(processedFiles) + " / " + formatNumber(totalFiles) + " 個檔案）", false);
+  }
+
+  async function writeCandidateZip(files, output) {
+    var zipApi = window.fflate;
+    if (!zipApi || typeof zipApi.Zip !== "function" || typeof zipApi.ZipPassThrough !== "function") {
+      throw new Error("無法載入 ZIP 封裝引擎；請確認網路連線後重新整理頁面。");
+    }
+    var totalBytes = files.reduce(function (sum, file) { return sum + (Number(file.size) || 0); }, 0);
+    var processedBytes = 0;
+    var processedFiles = 0;
+    var zip = new zipApi.Zip(function (error, chunk) {
+      if (error) {
+        output.error = error;
+        return;
+      }
+      queueCandidateChunk(output, chunk);
+    });
+
+    for (var index = 0; index < files.length; index += 1) {
+      var file = files[index];
+      var archivePath = safeArchivePath(archiveRelativePath(file));
+      if (!archivePath) continue;
+      var entry = new zipApi.ZipPassThrough(archivePath);
+      if (file.lastModified) entry.mtime = new Date(file.lastModified);
+      zip.add(entry);
+      if (typeof file.stream === "function") {
+        var reader = file.stream().getReader();
+        try {
+          while (true) {
+            var result = await reader.read();
+            if (result.done) break;
+            entry.push(result.value, false);
+            await flushCandidateOutput(output);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      } else {
+        entry.push(new Uint8Array(await file.arrayBuffer()), false);
+        await flushCandidateOutput(output);
+      }
+      entry.push(new Uint8Array(0), true);
+      await flushCandidateOutput(output);
+      processedBytes += Number(file.size) || 0;
+      processedFiles += 1;
+      updateCandidateProgress(processedBytes, totalBytes, processedFiles, files.length);
+    }
+    zip.end();
+    await flushCandidateOutput(output);
+    if (output.writable && !output.closed) {
+      await output.writable.close();
+      output.closed = true;
+    }
+    return output;
+  }
+
+  async function buildImazingCandidatePackage() {
+    if (packageInProgress || state.sourceMode !== "folder" || !state.attachmentFiles.length) return;
+    var allCandidateFiles = getCandidateBackupFiles();
+    var markedPaths = new Set(getMarkedAttachmentFiles().map(function (file) { return relativePath(file); }));
+    var packageFiles = allCandidateFiles.filter(function (file) { return !markedPaths.has(relativePath(file)); });
+    var packageInputBytes = packageFiles.reduce(function (sum, file) { return sum + (Number(file.size) || 0); }, 0);
+    var canStreamToFile = typeof window.showSaveFilePicker === "function";
+    var hasContainer = packageFiles.some(function (file) { return archiveRelativePath(file).indexOf("Container/") === 0; });
+    var lineFile = findFileEnding("/Messages/Line.sqlite");
+    var hasLineSqlite = Boolean(lineFile && packageFiles.indexOf(lineFile) !== -1);
+    var hasLock = packageFiles.some(function (file) { return archiveRelativePath(file) === ".lock"; });
+    if (!hasContainer) {
+      setCleanupPackageStatus("無法建立候選封裝：選取的資料夾沒有 Container/；請選取包含 Container 與 Payload 的完整 iMazing 備份資料夾。", true);
+      return;
+    }
+    if (!hasLineSqlite) {
+      setCleanupPackageStatus("無法建立候選封裝：Messages/Line.sqlite 不在保留檔案中。", true);
+      return;
+    }
+    if (!canStreamToFile && packageInputBytes > MAX_BLOB_CANDIDATE_BYTES) {
+      setCleanupPackageStatus("目前瀏覽器不支援直接寫入大型檔案；候選封裝預估超過 256 MB，請改用支援 File System Access API 的 Chrome／Edge 桌面版，以避免 Blob 下載造成記憶體峰值。", true);
+      return;
+    }
+
+    packageInProgress = true;
+    renderAttachmentCleanup();
+    setCleanupPackageStatus("準備建立候選封裝…", false);
+    var output = null;
+    try {
+      var filename = candidateFilename();
+      output = await openCandidateOutput(filename);
+      await writeCandidateZip(packageFiles, output);
+      if (!output.writable) {
+        downloadBlob(filename, new Blob(output.chunks, { type: "application/octet-stream" }));
+      }
+      var warnings = [];
+      if (!hasLock) warnings.push("來源沒有 .lock，無法視為正式 iMazing 封裝");
+      if (!packageFiles.some(function (file) { return archiveRelativePath(file).indexOf("Payload/") === 0; })) warnings.push("來源沒有 Payload/，請以 iMazing dry-run 驗證");
+      warnings.push("此候選封裝由瀏覽器重新建立，尚未通過 iMazing 實機還原");
+      setCleanupPackageStatus("候選封裝已建立：" + formatBytes(output.bytes) + "，保留 " + formatNumber(packageFiles.length) + " 個檔案。" + (warnings.length ? " 警告：" + warnings.join("；") + "。" : ""), Boolean(warnings.length));
+    } catch (error) {
+      if (output && output.writable && !output.closed) {
+        try { await output.writable.abort(); } catch (abortError) { console.warn(abortError); }
+      }
+      if (error && error.name === "AbortError") setCleanupPackageStatus("已取消候選封裝輸出。", false);
+      else setCleanupPackageStatus("候選封裝失敗：" + (error && error.message ? error.message : String(error)), true);
+      console.error(error);
+    } finally {
+      packageInProgress = false;
+      renderAttachmentCleanup();
+    }
   }
 
   function updateStats() {
@@ -906,6 +1073,9 @@
     if (el.clearAttachmentSelectionButton) el.clearAttachmentSelectionButton.disabled = true;
     if (el.exportCleanupPlanButton) el.exportCleanupPlanButton.disabled = true;
     if (el.exportCleanupTextButton) el.exportCleanupTextButton.disabled = true;
+    if (el.buildImazingCandidateButton) el.buildImazingCandidateButton.disabled = true;
+    packageInProgress = false;
+    setCleanupPackageStatus("候選封裝會保留未標記的 Container／Payload 檔案，但尚未經 iMazing 實機驗證。", false);
     if (el.markedAttachmentCount) el.markedAttachmentCount.textContent = "0";
     if (el.markedAttachmentSize) el.markedAttachmentSize.textContent = "0 B";
     if (el.exportHtmlButton) el.exportHtmlButton.disabled = true;

@@ -19,9 +19,9 @@ LINE iOS App Container 備份檔案可透過 iMazing 備份軟體取得；本工
 3. 在瀏覽器內搜尋聊天室、閱讀訊息，或匯出 HTML／JSON／附件清單。
 4. 完整備份模式的「附件瘦身」可搜尋、分頁並勾選不要的附件，匯出 JSON 操作計畫與純文字操作說明。原始備份與 `Messages/Line.sqlite` 不會被修改。
 
-附件瘦身目前是供人工執行的安全清單，不是已驗證可直接還原的 `.imazingapp`。請先複製原始 `.imazingapp`，再用支援原地編輯壓縮檔的工具處理副本；保留 `Container`、`Messages/Line.sqlite` 與所有未列出的檔案。完成後可在 iMazing 的 Manage Apps → Restore App Data 先做 dry-run，再考慮於測試裝置還原。參考：[Hiraku Dev 的 LINE 瘦身說明](https://hiraku.dev/2025/09/7802/)、[iMazing App Data 備份與還原說明](https://imazing.com/guides/how-to-export-backup-and-transfer-ios-apps-data-and-settings)。
+附件瘦身可使用「建立 `.imazingapp` 候選封裝」產生新的 `.imazingapp.candidate` ZIP。它會保留未標記的 `Container`／`Payload` 檔案與根目錄必要檔案，並以串流方式逐檔輸出；支援 File System Access API 時會直接寫入使用者指定的檔案，不支援時只允許較小的 Blob 下載，避免大型備份造成記憶體峰值。這個候選檔不是已驗證可直接還原的正式 `.imazingapp`，也不會修改原始備份。請先複製原始 `.imazingapp`，完成後將副檔名改回 `.imazingapp`，再在 iMazing 的 Manage Apps → Restore App Data 先做 dry-run，最後才於測試裝置驗證。參考：[Hiraku Dev 的 LINE 瘦身說明](https://hiraku.dev/2025/09/7802/)、[iMazing App Data 備份與還原說明](https://imazing.com/guides/how-to-export-backup-and-transfer-ios-apps-data-and-settings)。
 5. 完整備份模式會在訊息中直接預覽可配對的圖片；若原圖不在備份內，閱讀器會改用 `Message Thumbnails` 或 SQLite 內保存的縮圖。訊息中的網址可以直接點擊，閱讀器也會使用 LINE 保存的連結 metadata 重建標題、摘要與預覽圖片；沒有 metadata 時仍會顯示網域與網址。通話紀錄會依 metadata 顯示語音／視訊通話、通話時間、未接、取消、忙線或拒接狀態。
 
 若備份另有 `Line.sqlite-wal`／`Line.sqlite-shm`，建議使用完整備份模式，以降低遺漏最近資料的風險。
 
-資料只會在目前瀏覽器分頁內解析，不會上傳到這個網站的伺服器。sql.js 由 jsDelivr 載入，因此首次使用需要網路連線；連結預覽圖片若來自 LINE CDN 或原網站，瀏覽器顯示圖片時也會向該圖片網址發出請求。
+資料只會在目前瀏覽器分頁內解析，不會上傳到這個網站的伺服器。sql.js 與候選封裝使用的 fflate 由 jsDelivr 載入，因此首次使用需要網路連線；連結預覽圖片若來自 LINE CDN 或原網站，瀏覽器顯示圖片時也會向該圖片網址發出請求。
