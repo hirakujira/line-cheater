@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="在瀏覽器本機閱讀、搜尋與匯出 iOS LINE 聊天備份">
+    <title>LINE 備份閱讀器</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="hero">
+        <p class="eyebrow">本機解析 · 支援 GitHub Pages</p>
+        <h1>LINE 備份閱讀器</h1>
+        <p class="hero-copy">
+          在瀏覽器中讀取 iOS LINE App Container 備份，搜尋聊天室、閱讀訊息並整理附件。<br>
+          資料只在目前分頁處理，不會上傳到伺服器。
+        </p>
+      </header>
+
+      <section class="privacy-note" aria-label="資料隱私">
+        <strong>資料留在你的裝置</strong>
+        <span>請選取 LINE 備份資料夾。所有解析都在目前瀏覽器分頁內進行；關閉或重新整理頁面後，資料不會被保留。</span>
+      </section>
+
+      <section class="panel source-panel">
+        <div class="panel-heading">
+          <div>
+            <p class="section-kicker">1 / 載入來源</p>
+            <h2>選擇 LINE 資料來源</h2>
+          </div>
+          <span id="runtimeBadge" class="status-pill">等待選取</span>
+        </div>
+
+        <fieldset class="source-modes">
+          <legend>載入方式</legend>
+          <label class="mode-option">
+            <input type="radio" name="sourceMode" value="folder" checked>
+            <span><strong>完整 LINE 備份</strong><small>可閱讀訊息，也會建立附件索引與下載連結。</small></span>
+          </label>
+          <label class="mode-option">
+            <input type="radio" name="sourceMode" value="database">
+            <span><strong>只讀訊息</strong><small class="path-hint">從備份根目錄找出並選取：<code>Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_&lt;account-id&gt;/Messages/Line.sqlite</code>其中 <code>P_&lt;account-id&gt;</code> 是備份中實際存在的 P_ 開頭資料夾。</small></span>
+          </label>
+        </fieldset>
+
+        <div id="folderSourcePicker">
+          <label class="folder-picker">
+            <span class="picker-title">選取 LINE 備份資料夾</span>
+            <span class="picker-detail">請選取包含 Container 與 Payload 的完整 line 資料夾</span>
+            <input id="folderInput" type="file" webkitdirectory directory multiple>
+          </label>
+          <p class="helper-text">支援 Chrome、Edge 與 Safari 等可選取資料夾的瀏覽器。來源檔案只會被讀取，不會移動或修改。</p>
+        </div>
+
+        <div id="databaseSourcePicker" class="hidden">
+          <label class="folder-picker file-picker">
+            <span class="picker-title">選取 Line.sqlite</span>
+            <span class="picker-detail path-hint">檔案位置：<code>Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_&lt;account-id&gt;/Messages/Line.sqlite</code><br>其中 <code>P_&lt;account-id&gt;</code> 是備份中實際存在的 P_ 開頭資料夾；不需要載入其他檔案。</span>
+            <input id="databaseInput" type="file" accept=".sqlite,application/vnd.sqlite3,application/octet-stream">
+          </label>
+          <p class="helper-text">只讀訊息模式不會載入附件，因此附件預覽與附件下載連結會停用。若備份另有同名 WAL／SHM 檔案，請改用完整備份模式以確保資料較完整。</p>
+        </div>
+        <div id="loadStatus" class="status-area" role="status" aria-live="polite">尚未選取備份資料夾。</div>
+        <div class="progress-track" aria-hidden="true"><span id="progressBar"></span></div>
+      </section>
+
+      <section id="workspace" class="workspace hidden">
+        <div class="stats-grid" aria-label="資料統計">
+          <article class="stat-card"><span>聊天室</span><strong id="chatCount">—</strong></article>
+          <article class="stat-card"><span>訊息</span><strong id="messageCount">—</strong></article>
+          <article class="stat-card"><span>附件檔案</span><strong id="attachmentCount">—</strong></article>
+          <article class="stat-card"><span>來源大小</span><strong id="sourceSize">—</strong></article>
+        </div>
+
+        <div class="content-grid">
+          <aside class="panel chat-panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="section-kicker">2 / 瀏覽聊天室</p>
+                <h2>聊天室</h2>
+              </div>
+              <button id="clearButton" class="button button-quiet" type="button">清除資料</button>
+            </div>
+            <label class="search-box">
+              <span class="sr-only">搜尋聊天室</span>
+              <input id="chatSearch" type="search" placeholder="搜尋聊天室名稱或 ID">
+            </label>
+            <div id="chatList" class="chat-list" role="listbox" aria-label="聊天室列表"></div>
+            <nav class="chat-pagination" aria-label="聊天室分頁">
+              <button id="chatPrevButton" class="button button-secondary" type="button">上一頁</button>
+              <span id="chatPageInfo" class="page-info">第 1 頁</span>
+              <button id="chatNextButton" class="button button-secondary" type="button">下一頁</button>
+            </nav>
+          </aside>
+
+          <section class="panel messages-panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="section-kicker">3 / 閱讀與匯出</p>
+                <h2 id="selectedChatTitle">選取聊天室</h2>
+                <p id="selectedChatMeta" class="muted">請從左側選取聊天室開始。</p>
+              </div>
+              <div class="button-row">
+                <button id="exportHtmlButton" class="button button-primary" type="button" disabled>匯出 HTML 封存</button>
+                <button id="exportJsonButton" class="button button-secondary" type="button" disabled>匯出 JSON 資料</button>
+              </div>
+            </div>
+            <div id="messageStatus" class="message-status"></div>
+            <div id="messageList" class="message-list" aria-live="polite">
+              <div class="empty-state">尚未選取聊天室。</div>
+            </div>
+            <button id="loadMoreButton" class="button button-secondary load-more hidden" type="button">載入更多訊息</button>
+          </section>
+        </div>
+
+        <section class="panel attachment-panel">
+          <div class="panel-heading compact">
+            <div>
+              <p class="section-kicker">4 / 附件檔案</p>
+              <h2>附件索引</h2>
+              <p class="muted">依訊息 metadata 建立附件關聯；無法完全確認時，會標示為可能附件供你核對。</p>
+            </div>
+            <button id="exportAttachmentsButton" class="button button-secondary" type="button" disabled>匯出附件清單</button>
+          </div>
+          <div id="attachmentPreview" class="attachment-preview"></div>
+        </section>
+
+      </section>
+    </main>
+
+    <footer class="app-footer">
+      <span>LINE 備份閱讀器 · 僅在本機處理</span>
+      <span>來源檔案只讀，不會被修改</span>
+    </footer>
+
+    <!-- sql.js is used only for local, read-only SQLite parsing. -->
+    <script src="https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/sql-wasm.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>
