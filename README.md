@@ -1,6 +1,6 @@
 # LINE 備份閱讀器｜GitHub Pages 部署包
 
-這個資料夾是可直接上傳到 GitHub Pages 的純前端版本。
+這個資料夾包含可直接上傳到 GitHub Pages 的純前端版本，以及供本機使用的 CLI。GitHub Pages 只會發布 HTML／CSS／JavaScript，不會執行 `cli/`。
 
 ## 上傳方式
 
@@ -56,10 +56,10 @@ LINE iOS App Container 備份檔案可透過 iMazing 備份軟體取得；本工
 
 ### 3. 本機 CLI（開發中）
 
-CLI 不包含在 GitHub Pages 部署包，位於主專案 `/Users/zeuik/Desktop/line`，目前提供安全探測、staging 與 SQLite schema 檢查：
+CLI 位於 repository 的 `cli/`，需要在本機執行；目前提供安全探測、staging、SQLite schema 檢查，以及 `.imazingapp` 候選封裝測試：
 
 ```bash
-cd /Users/zeuik/Desktop/line
+cd /path/to/line-github-pages
 
 # 掃描來源，不讀取訊息內容
 python3 -m cli.line_migrator inspect \
@@ -75,6 +75,13 @@ python3 -m cli.line_migrator snapshot \
 python3 -m cli.line_migrator parse \
   --snapshot /path/to/line-work/snapshot \
   --out /path/to/line-work/schema-output
+
+# 在副本上移除指定縮圖，產生候選封裝並驗證 ZIP／核心檔案雜湊
+python3 -m cli.line_migrator slim-test \
+  --source /path/to/LINE.imazingapp \
+  --out /path/to/line-work/LINE-slim.imazingapp.candidate \
+  --entry 'Container/.../Message Thumbnails/<thumbnail-file>' \
+  --report /path/to/line-work/slim-test-report.json
 ```
 
 CLI 安全限制：
@@ -82,7 +89,10 @@ CLI 安全限制：
 - `--out` 不得放在來源資料夾本身或其子目錄。
 - `snapshot` 只複製 `.lock`、`iTunesArtwork`、`iTunesMetadata.plist`、`Container/` 與 `Payload/`。
 - SQLite 使用唯讀 URI；目前不會執行 `INSERT`、`UPDATE`、`DELETE` 或 `VACUUM`。
-- CLI 尚未提供正式 `.imazingapp` 修改、WhatsApp 匯入或 Telegram 匯入。
+- `slim-test` 永遠先複製來源，輸出必須是新的 `.imazingapp.candidate`，不會覆寫原始檔。
+- `slim-test` 預設只允許移除 `Message Thumbnails`；移除 `Message Attachments` 原檔必須明確加上 `--allow-original-attachments`。
+- CLI 會用 macOS 的 `zip`／`unzip` 以 `LC_ALL=C` 讀取原始 ZIP entry，驗證來源未變更、指定 entry 確實移除、核心 entry SHA-256 未變更與 ZIP CRC 通過。
+- 候選封裝尚未代表 iMazing dry-run 或測試 iPhone 還原成功；正式使用前仍須在副本上逐階段驗證。
 
 ### 4. 隱私與網路
 

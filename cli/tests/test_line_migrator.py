@@ -1,8 +1,10 @@
 import json
 from pathlib import Path
 import sqlite3
+import shutil
 import tempfile
 import unittest
+import zipfile
 
 from cli import line_migrator
 
@@ -72,6 +74,16 @@ class LineMigratorTests(unittest.TestCase):
             "Container/P_<account-id>/Messages/Line.sqlite",
         )
 
+    def test_report_masks_account_folder_in_dictionary_keys(self):
+        report = {
+            "preserved_core_sha256": {
+                "Container/P_abc123/Messages/Line.sqlite": "hash",
+            },
+        }
+        payload = line_migrator.public_report(report)
+        self.assertIn("Container/P_<account-id>/Messages/Line.sqlite", payload["preserved_core_sha256"])
+        self.assertNotIn("P_abc123", json.dumps(payload))
+
     def test_sqlite_uri_is_read_only(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = self.make_fixture(Path(temporary))
@@ -82,6 +94,51 @@ class LineMigratorTests(unittest.TestCase):
                 connection.execute("CREATE TABLE SHOULD_NOT_BE_WRITTEN (id INTEGER)")
             connection.close()
             self.assertFalse((database_path.parent / "SHOULD_NOT_BE_WRITTEN").exists())
+
+    def test_slim_test_removes_requested_thumbnail_and_preserves_core(self):
+        if shutil.which("zip") is None or shutil.which("unzip") is None:
+            self.skipTest("需要 macOS Info-ZIP zip/unzip")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "LINE.imazingapp"
+            thumbnail = (
+                "Container/AppGroups/group.com.linecorp.line/"
+                "Library/Application Support/PrivateStore/P_test/"
+                "Message Thumbnails/test.thumb"
+            )
+            attachment = thumbnail.replace("Message Thumbnails/test.thumb", "Message Attachments/original.jpg")
+            line_sqlite = "Container/AppGroups/group.com.linecorp.line/Messages/Line.sqlite"
+            with zipfile.ZipFile(source, "w", compression=zipfile.ZIP_STORED) as archive:
+                archive.writestr(".lock", b"lock")
+                archive.writestr("Payload/LINE.app/Info.plist", b"plist")
+                archive.writestr(line_sqlite, b"sqlite")
+                archive.writestr(thumbnail, b"thumbnail")
+                archive.writestr(attachment, b"original")
+
+            source_hash = line_migrator.sha256_file(source)
+            output = root / "LINE-slim.imazingapp.candidate"
+            result = line_migrator.slim_test_archive(source, output, [thumbnail])
+
+            self.assertEqual(result["status"], "passed")
+            self.assertTrue(result["source_unchanged"])
+            self.assertEqual(result["entry_count_before"] - result["entry_count_after"], 1)
+            self.assertEqual(line_migrator.sha256_file(source), source_hash)
+            with zipfile.ZipFile(output) as archive:
+                self.assertNotIn(thumbnail, archive.namelist())
+                self.assertIn(attachment, archive.namelist())
+                self.assertIn(line_sqlite, archive.namelist())
+
+    def test_slim_test_rejects_original_attachment_by_default(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "LINE.imazingapp"
+            source.write_bytes(b"not a zip")
+            with self.assertRaises(line_migrator.CliError):
+                line_migrator.slim_test_archive(
+                    source,
+                    root / "LINE-slim.imazingapp.candidate",
+                    ["Container/P_test/Message Attachments/original.jpg"],
+                )
 
 
 def shutil_copytree(source: Path, destination: Path) -> Path:

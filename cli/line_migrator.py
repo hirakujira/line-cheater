@@ -5,17 +5,19 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 from typing import Any, Iterable
 
 
-CLI_VERSION = "0.1.0-cli.0"
+CLI_VERSION = "0.1.0-cli.1"
 BACKUP_ROOT_FILES = {".lock", "iTunesArtwork", "iTunesMetadata.plist"}
 BACKUP_ROOT_DIRECTORIES = {"Container", "Payload"}
 
@@ -87,6 +89,7 @@ def scan_source(source: Path) -> dict[str, Any]:
 
     paths = [record["path"] for record in records]
     path_set = set(paths)
+
     line_sqlite = next(
         (path for path in paths if Path(path).parts[-2:] == ("Messages", "Line.sqlite")),
         None,
@@ -180,7 +183,10 @@ def mask_account_ids(value: Any) -> Any:
     if isinstance(value, list):
         return [mask_account_ids(item) for item in value]
     if isinstance(value, dict):
-        return {key: mask_account_ids(item) for key, item in value.items()}
+        return {
+            mask_account_ids(key) if isinstance(key, str) else key: mask_account_ids(item)
+            for key, item in value.items()
+        }
     return copy.deepcopy(value)
 
 
@@ -329,6 +335,230 @@ def copy_backup_members(source: Path, destination: Path, records: list[dict[str,
         shutil.copy2(source_file, destination_file)
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def command_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    # Some original iMazing ZIP entries are not valid UTF-8. Keep the external
+    # ZIP tools in byte-oriented locale mode and never parse their output as text.
+    environment["LC_ALL"] = "C"
+    return environment
+
+
+def require_command(name: str) -> str:
+    command = shutil.which(name)
+    if command is None:
+        raise CliError(f"找不到必要的系統工具 `{name}`；macOS 需要安裝 Info-ZIP。")
+    return command
+
+
+def list_zip_entries(archive: Path) -> list[bytes]:
+    unzip = require_command("unzip")
+    result = subprocess.run(
+        [unzip, "-Z1", str(archive)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=command_environment(),
+        check=False,
+    )
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise CliError(f"無法讀取 ZIP entry 清單：{archive}；{error}")
+    return result.stdout.splitlines()
+
+
+def test_zip_integrity(archive: Path) -> None:
+    unzip = require_command("unzip")
+    result = subprocess.run(
+        [unzip, "-t", str(archive)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=command_environment(),
+        check=False,
+    )
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise CliError(f"ZIP CRC／結構驗證失敗：{archive}；{error}")
+
+
+def display_zip_entry(entry: bytes) -> str:
+    return entry.decode("utf-8", errors="replace")
+
+
+def normalize_zip_entry(value: str) -> bytes:
+    if not value or "\x00" in value:
+        raise CliError("--entry 不得為空或包含 NUL 字元。")
+    if value.startswith("/") or "\\" in value:
+        raise CliError("--entry 必須是 ZIP 內的相對路徑，使用 `/` 且不可從根目錄開始。")
+    parts = value.split("/")
+    if any(part in ("", ".", "..") for part in parts) or value.endswith("/"):
+        raise CliError("--entry 必須是單一檔案的正規相對路徑。")
+    return os.fsencode(value)
+
+
+def validate_slim_entry(entry: bytes, allow_original_attachments: bool) -> None:
+    if entry == b".lock" or entry.endswith((b"/Line.sqlite", b"/Line.sqlite-wal", b"/Line.sqlite-shm")):
+        raise CliError("安全瘦身測試禁止移除 `.lock` 或 Line.sqlite／WAL／SHM。")
+    if entry in {b"iTunesArtwork", b"iTunesMetadata.plist"}:
+        raise CliError("安全瘦身測試禁止移除 iMazing 備份根目錄 metadata。")
+    path = b"/" + entry + b"/"
+    if b"/Message Thumbnails/" in path:
+        return
+    if b"/Message Attachments/" in path and allow_original_attachments:
+        return
+    if b"/Message Attachments/" in path:
+        raise CliError("原始 Message Attachments 預設禁止刪除；若已完成人工確認，才可加上 --allow-original-attachments。")
+    raise CliError("安全瘦身測試預設只允許 Message Thumbnails；請勿把資料庫或其他 ZIP entry 當成附件刪除。")
+
+
+def unzip_entry_sha256(archive: Path, entry: bytes) -> str:
+    unzip = require_command("unzip")
+    process = subprocess.Popen(
+        [unzip, "-p", str(archive), entry],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=command_environment(),
+    )
+    assert process.stdout is not None
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: process.stdout.read(1024 * 1024), b""):
+        digest.update(chunk)
+    process.stdout.close()
+    stderr = process.stderr.read() if process.stderr is not None else b""
+    if process.stderr is not None:
+        process.stderr.close()
+    return_code = process.wait()
+    if return_code != 0:
+        error = stderr.decode("utf-8", errors="replace").strip()
+        raise CliError(f"無法讀取 ZIP entry 內容：{display_zip_entry(entry)}；{error}")
+    return digest.hexdigest()
+
+
+def ensure_candidate_destination(source: Path, output: Path) -> None:
+    if not source.is_file():
+        raise CliError(f"--source 必須是存在的 `.imazingapp` 檔案：{source}")
+    if source.suffix != ".imazingapp":
+        raise CliError(f"--source 必須以 `.imazingapp` 結尾：{source}")
+    if output == source:
+        raise CliError("候選輸出不得覆寫原始 `.imazingapp`。")
+    if output.exists():
+        raise CliError(f"候選輸出已存在，為避免覆寫請指定新路徑：{output}")
+    if not output.name.endswith(".imazingapp.candidate"):
+        raise CliError("安全測試輸出必須以 `.imazingapp.candidate` 結尾。")
+
+
+def slim_test_archive(
+    source: Path,
+    output: Path,
+    requested_entries: list[str],
+    allow_original_attachments: bool = False,
+) -> dict[str, Any]:
+    source = source.expanduser().resolve()
+    output = output.expanduser().resolve()
+    ensure_candidate_destination(source, output)
+    entries = [normalize_zip_entry(value) for value in requested_entries]
+    if len(entries) != len(set(entries)):
+        raise CliError("--entry 不可重複。")
+
+    for entry in entries:
+        validate_slim_entry(entry, allow_original_attachments)
+
+    test_zip_integrity(source)
+    before_entries = list_zip_entries(source)
+    before_set = set(before_entries)
+    missing = [entry for entry in entries if entry not in before_set]
+    if missing:
+        names = ", ".join(display_zip_entry(entry) for entry in missing)
+        raise CliError(f"來源 ZIP 找不到指定 entry：{names}")
+
+    line_sqlite_entry = next(
+        (entry for entry in before_entries if entry.endswith(b"/Messages/Line.sqlite")),
+        None,
+    )
+    required_entries = [b".lock", b"Payload/LINE.app/Info.plist"]
+    required_entries.append(line_sqlite_entry or b"")
+    missing_core = [entry for entry in required_entries if entry and entry not in before_set]
+    if missing_core:
+        names = ", ".join(display_zip_entry(entry) for entry in missing_core)
+        raise CliError(f"來源 ZIP 缺少必要核心 entry，停止測試：{names}")
+
+    source_sha_before = sha256_file(source)
+    preserved_before = {
+        display_zip_entry(entry): unzip_entry_sha256(source, entry)
+        for entry in required_entries
+        if entry
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    created_output = False
+    try:
+        shutil.copy2(source, output)
+        created_output = True
+        zip_command = require_command("zip")
+        result = subprocess.run(
+            [zip_command, "-d", str(output), *entries],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=command_environment(),
+            check=False,
+        )
+        if result.returncode != 0:
+            error = result.stderr.decode("utf-8", errors="replace").strip()
+            raise CliError(f"ZIP entry 移除失敗；{error}")
+        test_zip_integrity(output)
+        after_entries = list_zip_entries(output)
+        after_set = set(after_entries)
+        removed_entries = before_set - after_set
+        unexpected_removed = removed_entries - set(entries)
+        if unexpected_removed:
+            names = ", ".join(display_zip_entry(entry) for entry in sorted(unexpected_removed))
+            raise CliError(f"候選封裝出現未要求的 entry 移除：{names}")
+        still_present = [entry for entry in entries if entry in after_set]
+        if still_present:
+            names = ", ".join(display_zip_entry(entry) for entry in still_present)
+            raise CliError(f"指定 entry 未成功移除：{names}")
+
+        preserved_after = {
+            display_zip_entry(entry): unzip_entry_sha256(output, entry)
+            for entry in required_entries
+            if entry
+        }
+        if preserved_before != preserved_after:
+            raise CliError("候選封裝的核心 entry SHA-256 與來源不同，停止交付。")
+        source_sha_after = sha256_file(source)
+        if source_sha_before != source_sha_after:
+            raise CliError("原始 `.imazingapp` 在測試期間發生變更，停止交付。")
+        return {
+            "test_type": "imazingapp-slim-test",
+            "status": "passed",
+            "source": str(source),
+            "output": str(output),
+            "source_sha256_before": source_sha_before,
+            "source_sha256_after": source_sha_after,
+            "source_unchanged": True,
+            "candidate_sha256": sha256_file(output),
+            "entry_count_before": len(before_entries),
+            "entry_count_after": len(after_entries),
+            "requested_entries": [display_zip_entry(entry) for entry in entries],
+            "removed_entries": [display_zip_entry(entry) for entry in sorted(removed_entries)],
+            "preserved_core_sha256": preserved_after,
+            "zip_integrity": "passed",
+            "imazing_restore": "not-tested",
+            "warnings": [
+                "這是候選 ZIP 封裝測試，不代表 iMazing dry-run 或實體裝置還原已通過。",
+            ],
+        }
+    except Exception:
+        if created_output:
+            output.unlink(missing_ok=True)
+        raise
+
+
 def command_inspect(args: argparse.Namespace) -> int:
     source = resolved_directory(args.source, "--source")
     report = scan_source(source)
@@ -394,6 +624,24 @@ def command_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_slim_test(args: argparse.Namespace) -> int:
+    result = slim_test_archive(
+        Path(args.source),
+        Path(args.out),
+        args.entry,
+        allow_original_attachments=args.allow_original_attachments,
+    )
+    payload = public_report(result)
+    if args.report:
+        report_path = Path(args.report).expanduser().resolve()
+        if report_path.exists():
+            raise CliError(f"測試報告已存在，為避免覆寫請指定新路徑：{report_path}")
+        write_json(report_path, payload)
+        payload["report"] = str(report_path)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="line-migrator",
@@ -416,6 +664,30 @@ def build_parser() -> argparse.ArgumentParser:
     parse_parser.add_argument("--snapshot", required=True, help="已建立的 staging 資料夾。")
     parse_parser.add_argument("--out", required=True, help="不存在或為空的輸出資料夾。")
     parse_parser.set_defaults(function=command_parse)
+
+    slim_parser = subparsers.add_parser(
+        "slim-test",
+        help="在 `.imazingapp` 副本上移除指定附件並驗證 ZIP 完整性。",
+    )
+    slim_parser.add_argument("--source", required=True, help="原始 `.imazingapp` 檔案；只讀取，不會覆寫。")
+    slim_parser.add_argument(
+        "--out",
+        required=True,
+        help="不存在的新 `.imazingapp.candidate` 輸出檔案。",
+    )
+    slim_parser.add_argument(
+        "--entry",
+        action="append",
+        required=True,
+        help="要從候選副本移除的 ZIP entry；預設只允許 Message Thumbnails，可重複指定。",
+    )
+    slim_parser.add_argument(
+        "--allow-original-attachments",
+        action="store_true",
+        help="明確允許移除 Message Attachments 原檔；請先確認備份與還原策略。",
+    )
+    slim_parser.add_argument("--report", help="另寫入 JSON 測試報告；檔案必須不存在。")
+    slim_parser.set_defaults(function=command_slim_test)
 
     return parser
 
