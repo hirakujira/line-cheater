@@ -1,4 +1,4 @@
-/* global initSqlJs, fflate */
+/* global initSqlJs */
 
 (function () {
   "use strict";
@@ -6,12 +6,17 @@
   var SQL_WASM_CDN = "https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/";
   var MESSAGE_PAGE_SIZE = 180;
   var CHAT_ITEM_FALLBACK_HEIGHT = 65;
-  var MAX_ATTACHMENT_PREVIEW = 120;
-  var ATTACHMENT_CLEANUP_PAGE_SIZE = 30;
+  var ATTACHMENT_CLEANUP_PAGE_SIZE = 24;
   var MAX_BLOB_CANDIDATE_BYTES = 256 * 1024 * 1024;
   var MAX_IN_MEMORY_SQLITE_BYTES = 1024 * 1024 * 1024;
+  var ZIP_READ_CHUNK_BYTES = 512 * 1024;
+  var ZIP_EVENT_LOOP_YIELD_INTERVAL = 16;
+  var ZIP_CLASSIC_MAX_U16 = 0xfffe;
+  var ZIP_CLASSIC_MAX_U32 = 0xfffffffe;
+  var ZIP_CRC_TABLE = createZipCrcTable();
   var chatResizeTimer = null;
   var packageInProgress = false;
+  var imageModalTrigger = null;
 
   var state = {
     files: [],
@@ -25,34 +30,46 @@
     indexParticipants: [],
     indexMode: false,
     database: null,
+    squareDatabase: null,
+    lineDatabasePath: "",
     sqlReady: false,
     capabilities: null,
     health: null,
     chats: [],
     chatPage: 1,
     users: new Map(),
+    squareUsers: new Map(),
     groupsById: new Map(),
     groupsByPk: new Map(),
     unifiedGroupsById: new Map(),
+    squareGroupsById: new Map(),
     groupNamesByChatPk: new Map(),
+    chatsByKey: new Map(),
+    chatsBySourcePk: new Map(),
     currentChat: null,
     currentMessages: [],
     currentOffset: 0,
     currentAfterTimestamp: 0,
     currentAfterPk: 0,
+    currentCursors: { line: { timestamp: 0, pk: 0 }, square: { timestamp: 0, pk: 0 } },
     attachmentFiles: [],
     attachmentByBasename: new Map(),
     attachmentByMessageId: new Map(),
     attachmentByToken: new Map(),
     attachmentContextByPath: new Map(),
-    attachmentPreviewUrls: new Map(),
+    attachmentReviewItems: [],
+    attachmentReviewByPath: new Map(),
+    attachmentCleanupGroups: [],
+    selectedAttachmentCleanupGroup: "",
     attachmentCleanupPage: 1,
     attachmentCleanupSearch: "",
+    attachmentKindFilter: "all",
     attachmentCategoryFilter: "all",
     attachmentSort: "recent",
     attachmentsMarkedForRemoval: new Set(),
     attachmentDuplicateGroups: [],
     objectUrls: new Set(),
+    cleanupPreviewUrls: new Set(),
     selfId: ""
   };
 
@@ -69,6 +86,7 @@
     el.runtimeBadge = document.getElementById("runtimeBadge");
     el.loadStatus = document.getElementById("loadStatus");
     el.progressBar = document.getElementById("progressBar");
+    el.appShell = document.querySelector("main.app-shell");
     el.workspace = document.getElementById("workspace");
     el.diffPanel = document.getElementById("diffPanel");
     el.chatCount = document.getElementById("chatCount");
@@ -89,21 +107,18 @@
     el.loadMoreButton = document.getElementById("loadMoreButton");
     el.exportHtmlButton = document.getElementById("exportHtmlButton");
     el.exportJsonButton = document.getElementById("exportJsonButton");
-    el.exportAttachmentsButton = document.getElementById("exportAttachmentsButton");
-    el.attachmentPreview = document.getElementById("attachmentPreview");
     el.attachmentSearch = document.getElementById("attachmentSearch");
+    el.attachmentKindFilter = document.getElementById("attachmentKindFilter");
     el.attachmentCategoryFilter = document.getElementById("attachmentCategoryFilter");
     el.attachmentSort = document.getElementById("attachmentSort");
     el.attachmentCategorySummary = document.getElementById("attachmentCategorySummary");
     el.markedAttachmentCount = document.getElementById("markedAttachmentCount");
     el.markedAttachmentSize = document.getElementById("markedAttachmentSize");
+    el.cleanupResultInfo = document.getElementById("cleanupResultInfo");
     el.attachmentCleanupList = document.getElementById("attachmentCleanupList");
     el.attachmentPrevButton = document.getElementById("attachmentPrevButton");
     el.attachmentNextButton = document.getElementById("attachmentNextButton");
     el.attachmentPageInfo = document.getElementById("attachmentPageInfo");
-    el.markFilteredAttachmentsButton = document.getElementById("markFilteredAttachmentsButton");
-    el.keepAllAttachmentsButton = document.getElementById("keepAllAttachmentsButton");
-    el.clearAttachmentSelectionButton = document.getElementById("clearAttachmentSelectionButton");
     el.exportCleanupPlanButton = document.getElementById("exportCleanupPlanButton");
     el.exportCleanupTextButton = document.getElementById("exportCleanupTextButton");
     el.buildImazingCandidateButton = document.getElementById("buildImazingCandidateButton");
@@ -133,6 +148,23 @@
     el.runDiffButton = document.getElementById("runDiffButton");
     el.diffStatus = document.getElementById("diffStatus");
     el.diffResults = document.getElementById("diffResults");
+    el.loadModal = document.getElementById("loadModal");
+    el.loadModalCard = el.loadModal && el.loadModal.querySelector(".package-modal-card");
+    el.loadModalMessage = document.getElementById("loadModalMessage");
+    el.loadModalProgress = document.getElementById("loadModalProgress");
+    el.loadModalProgressLabel = document.getElementById("loadModalProgressLabel");
+    el.packageModal = document.getElementById("packageModal");
+    el.packageModalCard = el.packageModal && el.packageModal.querySelector(".package-modal-card");
+    el.packageModalTitle = document.getElementById("packageModalTitle");
+    el.packageModalMessage = document.getElementById("packageModalMessage");
+    el.packageModalProgress = document.getElementById("packageModalProgress");
+    el.packageModalProgressLabel = document.getElementById("packageModalProgressLabel");
+    el.packageModalClose = document.getElementById("packageModalClose");
+    el.imageModal = document.getElementById("imageModal");
+    el.imageModalCard = el.imageModal && el.imageModal.querySelector(".image-modal-card");
+    el.imageModalImage = document.getElementById("imageModalImage");
+    el.imageModalCaption = document.getElementById("imageModalCaption");
+    el.imageModalClose = document.getElementById("imageModalClose");
 
     el.folderInput.addEventListener("change", function (event) {
       loadSource(event.target.files, "folder");
@@ -169,14 +201,19 @@
     el.loadMoreButton.addEventListener("click", loadMoreMessages);
     el.exportHtmlButton.addEventListener("click", exportCurrentHtml);
     el.exportJsonButton.addEventListener("click", exportCurrentJson);
-    el.exportAttachmentsButton.addEventListener("click", exportAttachmentCsv);
     el.attachmentSearch.addEventListener("input", function (event) {
       state.attachmentCleanupSearch = event.target.value.trim().toLowerCase();
       state.attachmentCleanupPage = 1;
       renderAttachmentCleanup();
     });
+    el.attachmentKindFilter.addEventListener("change", function (event) {
+      state.attachmentKindFilter = event.target.value || "all";
+      state.attachmentCleanupPage = 1;
+      renderAttachmentCleanup();
+    });
     el.attachmentCategoryFilter.addEventListener("change", function (event) {
       state.attachmentCategoryFilter = event.target.value || "all";
+      state.selectedAttachmentCleanupGroup = "";
       state.attachmentCleanupPage = 1;
       renderAttachmentCleanup();
     });
@@ -189,6 +226,7 @@
       var button = event.target.closest("button[data-attachment-category]");
       if (!button) return;
       state.attachmentCategoryFilter = button.getAttribute("data-attachment-category") || "all";
+      state.selectedAttachmentCleanupGroup = "";
       state.attachmentCleanupPage = 1;
       el.attachmentCategoryFilter.value = state.attachmentCategoryFilter;
       renderAttachmentCleanup();
@@ -206,28 +244,55 @@
         renderAttachmentCleanup();
       }
     });
-    el.keepAllAttachmentsButton.addEventListener("click", function () {
-      state.attachmentsMarkedForRemoval.clear();
-      renderAttachmentCleanup();
-    });
-    el.markFilteredAttachmentsButton.addEventListener("click", function () {
-      getFilteredAttachmentFiles().forEach(function (file) {
-        state.attachmentsMarkedForRemoval.add(relativePath(file));
-      });
-      renderAttachmentCleanup();
-    });
-    el.clearAttachmentSelectionButton.addEventListener("click", function () {
-      getFilteredAttachmentFiles().forEach(function (file) {
-        state.attachmentsMarkedForRemoval.delete(relativePath(file));
-      });
-      renderAttachmentCleanup();
-    });
     el.attachmentCleanupList.addEventListener("change", function (event) {
       var checkbox = event.target.closest("input[data-attachment-path]");
       if (!checkbox) return;
       var path = checkbox.getAttribute("data-attachment-path");
       if (checkbox.checked) state.attachmentsMarkedForRemoval.add(path);
       else state.attachmentsMarkedForRemoval.delete(path);
+      if (state.attachmentKindFilter === "marked") renderAttachmentCleanup();
+      else updateCleanupSummary();
+    });
+    el.attachmentCleanupList.addEventListener("click", function (event) {
+      var openGroupButton = event.target.closest("button[data-cleanup-open-group]");
+      if (openGroupButton) {
+        state.selectedAttachmentCleanupGroup = decodeURIComponent(openGroupButton.getAttribute("data-cleanup-open-group") || "");
+        state.attachmentCleanupPage = 1;
+        renderAttachmentCleanup();
+        return;
+      }
+      var backButton = event.target.closest("button[data-cleanup-back]");
+      if (backButton) {
+        state.selectedAttachmentCleanupGroup = "";
+        state.attachmentCleanupPage = 1;
+        renderAttachmentCleanup();
+        return;
+      }
+      var actionButton = event.target.closest("button[data-cleanup-group-action]");
+      if (!actionButton) return;
+      var groupKey = decodeURIComponent(actionButton.getAttribute("data-cleanup-group") || "");
+      var group = state.attachmentCleanupGroups.find(function (item) {
+        return item.key === groupKey;
+      });
+      if (!group) return;
+      var action = actionButton.getAttribute("data-cleanup-group-action");
+      var shouldMarkAll = action === "remove" && !isCleanupGroupFullyMarked(group);
+      var shouldRestoreOriginals = action === "keep-thumbnail" && isCleanupGroupKeepingThumbnails(group);
+      group.reviews.forEach(function (review) {
+        review.files.forEach(function (descriptor) {
+          if (action === "keep-thumbnail") {
+            if (descriptor.kind === "original") {
+              if (shouldRestoreOriginals) state.attachmentsMarkedForRemoval.delete(descriptor.path);
+              else state.attachmentsMarkedForRemoval.add(descriptor.path);
+            } else if (!shouldRestoreOriginals) {
+              state.attachmentsMarkedForRemoval.delete(descriptor.path);
+            }
+            return;
+          }
+          if (shouldMarkAll) state.attachmentsMarkedForRemoval.add(descriptor.path);
+          else state.attachmentsMarkedForRemoval.delete(descriptor.path);
+        });
+      });
       renderAttachmentCleanup();
     });
     el.exportCleanupPlanButton.addEventListener("click", exportAttachmentCleanupPlan);
@@ -249,6 +314,14 @@
       markDuplicateAlternatives(Number(button.getAttribute("data-duplicate-group")));
     });
     el.runDiffButton.addEventListener("click", runBrowserDiff);
+    el.packageModalClose.addEventListener("click", closePackageModal);
+    el.imageModalClose.addEventListener("click", closeImageModal);
+    el.imageModal.addEventListener("click", function (event) {
+      if (event.target === el.imageModal || event.target.classList.contains("image-modal-backdrop")) closeImageModal();
+    });
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape") closeImageModal();
+    });
     window.addEventListener("resize", scheduleChatLayoutRefresh);
     updateSourceModeUi();
 
@@ -266,10 +339,58 @@
   function setStatus(text, isError) {
     el.loadStatus.textContent = text;
     el.loadStatus.classList.toggle("error", Boolean(isError));
+    if (el.loadModal && !el.loadModal.classList.contains("hidden")) {
+      el.loadModalMessage.textContent = text;
+    }
   }
 
   function setProgress(value) {
-    el.progressBar.style.width = Math.max(0, Math.min(100, value)) + "%";
+    var progress = Math.max(0, Math.min(100, value));
+    el.progressBar.style.width = progress + "%";
+    if (el.loadModal && !el.loadModal.classList.contains("hidden")) {
+      el.loadModalProgress.style.width = progress + "%";
+      el.loadModalProgress.setAttribute("aria-valuenow", String(progress));
+      el.loadModalProgressLabel.textContent = Math.round(progress) + "%";
+    }
+  }
+
+  function waitForUiPaint() {
+    return new Promise(function (resolve) {
+      window.requestAnimationFrame(function () {
+        window.setTimeout(resolve, 0);
+      });
+    });
+  }
+
+  function showLoadModal() {
+    if (!el.loadModal) return;
+    el.loadModal.classList.remove("hidden");
+    el.loadModal.setAttribute("aria-hidden", "false");
+    el.loadModalMessage.textContent = "正在準備選取的檔案，請勿關閉此頁面。";
+    el.loadModalProgress.style.width = "0%";
+    el.loadModalProgress.setAttribute("aria-valuenow", "0");
+    el.loadModalProgressLabel.textContent = "0%";
+    document.body.classList.add("load-modal-open");
+    if (el.appShell) {
+      el.appShell.inert = true;
+      el.appShell.setAttribute("aria-busy", "true");
+    }
+    if (el.diffPanel) el.diffPanel.inert = true;
+    window.requestAnimationFrame(function () {
+      if (el.loadModalCard) el.loadModalCard.focus();
+    });
+  }
+
+  function closeLoadModal() {
+    if (!el.loadModal) return;
+    el.loadModal.classList.add("hidden");
+    el.loadModal.setAttribute("aria-hidden", "true");
+    document.body.classList.remove("load-modal-open");
+    if (el.appShell) {
+      el.appShell.inert = false;
+      el.appShell.removeAttribute("aria-busy");
+    }
+    if (el.diffPanel) el.diffPanel.inert = false;
   }
 
   function switchSourceMode(mode) {
@@ -302,23 +423,36 @@
       return;
     }
 
+    showLoadModal();
     try {
+      setRuntime("準備讀取…", false);
+      setStatus("正在準備選取的檔案…", false);
+      setProgress(1);
+      await waitForUiPaint();
       setRuntime("讀取中…", false);
+      setStatus("正在建立檔案索引…", false);
       setProgress(5);
       state.files = Array.from(fileList);
       state.sourceSize = state.files.reduce(function (sum, file) { return sum + file.size; }, 0);
       state.fileByPath = new Map(state.files.map(function (file) { return [relativePath(file), file]; }));
       state.sourceRoot = sourceMode === "database" ? relativePath(state.files[0]) : inferRoot(state.files);
+      setStatus("正在確認來源結構…", false);
+      setProgress(10);
+      await waitForUiPaint();
       if (sourceMode === "index") {
         await loadReaderIndex();
+        closeLoadModal();
         return;
       }
       state.attachmentCleanupPage = 1;
       state.attachmentCleanupSearch = "";
+      state.attachmentKindFilter = "all";
       state.attachmentCategoryFilter = "all";
       state.attachmentSort = "recent";
+      state.selectedAttachmentCleanupGroup = "";
       state.attachmentsMarkedForRemoval = new Set();
       if (el.attachmentSearch) el.attachmentSearch.value = "";
+      if (el.attachmentKindFilter) el.attachmentKindFilter.value = "all";
       if (el.attachmentCategoryFilter) el.attachmentCategoryFilter.value = "all";
       if (el.attachmentSort) el.attachmentSort.value = "recent";
       state.attachmentFiles = sourceMode === "folder" ? state.files.filter(function (file) {
@@ -327,7 +461,7 @@
       }) : [];
       buildAttachmentIndex();
 
-      var lineFile = sourceMode === "database" ? state.files[0] : findFileEnding("/Messages/Line.sqlite");
+      var lineFile = sourceMode === "database" ? state.files[0] : findLineDatabaseFile();
       if (!lineFile) {
         throw new Error("找不到 Messages/Line.sqlite。請選取包含 Container 的完整 LINE 資料夾。");
       }
@@ -347,17 +481,19 @@
       setProgress(35);
       var SQL = await initSqlJs({ locateFile: function (file) { return SQL_WASM_CDN + file; } });
       state.database = new SQL.Database(new Uint8Array(buffer));
+      state.lineDatabasePath = relativePath(lineFile);
       state.sqlReady = true;
       setProgress(60);
 
       loadReferenceData();
       await loadUnifiedGroupReference(SQL);
+      await loadLineSquareReference(SQL);
       setProgress(78);
       loadChats();
       populateSearchFilters();
       buildAttachmentContextIndex();
+      buildAttachmentReviewIndex();
       setProgress(92);
-      renderAttachmentPreview();
       renderAttachmentCleanup();
       updateStats();
       initializeBrowserInsights();
@@ -367,16 +503,18 @@
       setStatus(
         sourceMode === "database"
           ? "訊息資料庫載入完成；只讀訊息模式不包含附件檔案。"
-          : "完整備份解析完成，資料只留在目前瀏覽器分頁。",
+          : "完整備份解析完成。",
         false
       );
       setProgress(100);
       renderChatList();
+      closeLoadModal();
     } catch (error) {
       setRuntime("載入失敗", true);
       setStatus(error && error.message ? error.message : String(error), true);
       setProgress(0);
       console.error(error);
+      closeLoadModal();
     }
   }
 
@@ -396,6 +534,7 @@
     state.chats = conversationRows.map(function (row) {
       var legacyMemberTitle = stringOrEmpty(row.titleSource) === "members";
       return {
+        key: sourcePkKey("index", numberOrNull(row.chatPk)),
         pk: numberOrNull(row.chatPk),
         id: stringOrEmpty(row.id),
         type: stringOrEmpty(row.type) || "unknown",
@@ -403,10 +542,13 @@
         titleSource: legacyMemberTitle ? "unresolved" : (stringOrEmpty(row.titleSource) || "unresolved"),
         titleEvidence: Array.isArray(row.titleEvidence) ? row.titleEvidence : [],
         messageCount: Number(row.messageCount || 0),
+        humanMessageCount: Number(row.humanMessageCount !== undefined ? row.humanMessageCount : row.messageCount || 0),
         lastMessage: stringOrEmpty(row.lastMessage),
         lastTimestamp: normalizeTimestamp(row.lastTimestamp)
       };
     });
+    state.chatsByKey = new Map(state.chats.map(function (chat) { return [chat.key, chat]; }));
+    state.chatsBySourcePk = new Map();
     populateSearchFilters();
     state.attachmentFiles = [];
     state.capabilities = manifest.capabilities || {
@@ -428,7 +570,6 @@
     renderCapabilitySummary();
     renderHealthSummary();
     renderSchemaExplorerEmpty("大型索引模式不直接開啟 SQLite Schema；請用 CLI schema 查詢原始資料庫。");
-    renderAttachmentPreview();
     renderAttachmentCleanup();
     if (el.globalSearchButton) el.globalSearchButton.disabled = false;
     if (el.searchEngineBadge) el.searchEngineBadge.textContent = "JSONL 分片掃描";
@@ -450,7 +591,7 @@
   async function loadUnifiedGroupReference(SQL) {
     state.unifiedGroupsById.clear();
     if (state.sourceMode !== "folder") return;
-    var file = findFileEnding("/Messages/UnifiedGroup.sqlite");
+    var file = findUnifiedGroupReferenceFile();
     if (!file || file.size > MAX_IN_MEMORY_SQLITE_BYTES) return;
     var companion = null;
     try {
@@ -461,7 +602,7 @@
           var row = statement.getAsObject();
           var groupId = stringOrEmpty(row.groupId);
           var name = stringOrEmpty(row.name).trim();
-          if (groupId && name) state.unifiedGroupsById.set(groupId, { id: groupId, name: name, type: numberOrNull(row.groupType), source: "unified-group", sourceDatabase: "Messages/UnifiedGroup.sqlite", sourceTable: "ZUNIFIEDGROUP", sourceColumn: "ZNAME", confidence: "exact" });
+          if (groupId && name) state.unifiedGroupsById.set(lookupId(groupId), { id: groupId, name: name, type: numberOrNull(row.groupType), source: "unified-group", sourceDatabase: "Messages/UnifiedGroup.sqlite", sourceTable: "ZUNIFIEDGROUP", sourceColumn: "ZNAME", confidence: "exact" });
         }
       } finally {
         statement.free();
@@ -470,6 +611,55 @@
       console.warn("UnifiedGroup.sqlite 讀取失敗", error);
     } finally {
       if (companion) companion.close();
+    }
+  }
+
+  async function loadLineSquareReference(SQL) {
+    state.squareGroupsById.clear();
+    state.squareUsers.clear();
+    if (state.sourceMode !== "folder") return;
+    var file = findLineSquareReferenceFile();
+    if (!file || file.size > MAX_IN_MEMORY_SQLITE_BYTES) return;
+    try {
+      state.squareDatabase = new SQL.Database(new Uint8Array(await file.arrayBuffer()));
+      var chatColumns = new Set(querySource("square", "PRAGMA table_info(ZCHAT)", {}).map(function (row) { return String(row.name || "").toUpperCase(); }));
+      var squareColumns = new Set(querySource("square", "PRAGMA table_info(ZSQUARE)", {}).map(function (row) { return String(row.name || "").toUpperCase(); }));
+      var canJoinSquare = chatColumns.has("ZSQUARE") && squareColumns.has("Z_PK");
+      var nameExpressions = [];
+      if (canJoinSquare && squareColumns.has("ZNAME")) nameExpressions.push("NULLIF(s.ZNAME, '')");
+      if (chatColumns.has("ZNAME")) nameExpressions.push("NULLIF(c.ZNAME, '')");
+      var nameExpression = nameExpressions.length > 1 ? "COALESCE(" + nameExpressions.join(", ") + ")" : (nameExpressions[0] || "NULL");
+      var statement = state.squareDatabase.prepare(
+        "SELECT c.Z_PK AS chatPk, c.ZMID AS chatId, " +
+        nameExpression + " AS name " +
+        "FROM ZCHAT c " + (canJoinSquare ? "LEFT JOIN ZSQUARE s ON s.Z_PK = c.ZSQUARE " : "") +
+        "WHERE c.ZMID IS NOT NULL"
+      );
+      try {
+        while (statement.step()) {
+          var row = statement.getAsObject();
+          var chatId = stringOrEmpty(row.chatId);
+          var name = stringOrEmpty(row.name).trim();
+          if (chatId && name) state.squareGroupsById.set(lookupId(chatId), { id: chatId, name: name, chatPk: numberOrNull(row.chatPk), source: "line-square", sourceDatabase: "Messages/LineSquare.sqlite", sourceTable: "ZCHAT/ZSQUARE", sourceColumn: "ZNAME", confidence: "exact" });
+        }
+      } finally {
+        statement.free();
+      }
+      safeQuerySource("square", "SELECT Z_PK AS memberPk, ZCHAT AS chatPk, ZDISPLAYNAME AS displayName, ZMID AS memberId FROM ZSQUAREMEMBER", {}).forEach(function (row) {
+        var member = {
+          pk: numberOrNull(row.memberPk),
+          chatPk: numberOrNull(row.chatPk),
+          id: stringOrEmpty(row.memberId),
+          name: firstNonEmpty(row.displayName, row.memberId, "未知使用者")
+        };
+        if (member.pk !== null) state.squareUsers.set(sourcePkKey("square", member.pk), member);
+      });
+    } catch (error) {
+      console.warn("LineSquare.sqlite 讀取失敗", error);
+      if (state.squareDatabase) {
+        try { state.squareDatabase.close(); } catch (closeError) { console.warn(closeError); }
+      }
+      state.squareDatabase = null;
     }
   }
 
@@ -504,16 +694,85 @@
     return file.webkitRelativePath || file.name;
   }
 
-  function findFileEnding(suffix) {
-    for (var i = 0; i < state.files.length; i += 1) {
-      if (relativePath(state.files[i]).endsWith(suffix)) return state.files[i];
-    }
-    return null;
+  function lookupId(value) {
+    return String(value || "").trim().normalize("NFKC").toLowerCase();
   }
 
-  function query(sql, params) {
-    if (!state.database) throw new Error("資料庫尚未載入。");
-    var statement = state.database.prepare(sql);
+  function findFileEnding(suffix) {
+    return state.files.find(function (file) {
+      return relativePath(file).endsWith(suffix);
+    }) || null;
+  }
+
+  function findLineDatabaseFile() {
+    var candidates = state.files.filter(function (file) {
+      return relativePath(file).endsWith("/Messages/Line.sqlite");
+    });
+    candidates.sort(function (left, right) {
+      var leftPreferred = /\/PrivateStore\/P_[^/]+\/Messages\/Line\.sqlite$/.test(relativePath(left)) ? 1 : 0;
+      var rightPreferred = /\/PrivateStore\/P_[^/]+\/Messages\/Line\.sqlite$/.test(relativePath(right)) ? 1 : 0;
+      if (leftPreferred !== rightPreferred) return rightPreferred - leftPreferred;
+      return (Number(right.size) || 0) - (Number(left.size) || 0);
+    });
+    return candidates[0] || null;
+  }
+
+  function findUnifiedGroupReferenceFile() {
+    var candidates = state.files.filter(function (file) {
+      return relativePath(file).endsWith("/Messages/UnifiedGroup.sqlite");
+    });
+    candidates.sort(function (left, right) {
+      var leftPrivate = /\/PrivateStore\/P_[^/]+\/Messages\/UnifiedGroup\.sqlite$/.test(relativePath(left)) ? 1 : 0;
+      var rightPrivate = /\/PrivateStore\/P_[^/]+\/Messages\/UnifiedGroup\.sqlite$/.test(relativePath(right)) ? 1 : 0;
+      if (leftPrivate !== rightPrivate) return rightPrivate - leftPrivate;
+      return (Number(right.size) || 0) - (Number(left.size) || 0);
+    });
+    return candidates[0] || null;
+  }
+
+  function findLineSquareReferenceFile() {
+    var candidates = state.files.filter(function (file) {
+      return relativePath(file).endsWith("/Messages/LineSquare.sqlite");
+    });
+    candidates.sort(function (left, right) {
+      var lineStore = privateStoreKey(state.lineDatabasePath);
+      var leftSameStore = lineStore && privateStoreKey(relativePath(left)) === lineStore ? 1 : 0;
+      var rightSameStore = lineStore && privateStoreKey(relativePath(right)) === lineStore ? 1 : 0;
+      if (leftSameStore !== rightSameStore) return rightSameStore - leftSameStore;
+      var leftPrivate = /\/PrivateStore\/P_[^/]+\/Messages\/LineSquare\.sqlite$/.test(relativePath(left)) ? 1 : 0;
+      var rightPrivate = /\/PrivateStore\/P_[^/]+\/Messages\/LineSquare\.sqlite$/.test(relativePath(right)) ? 1 : 0;
+      if (leftPrivate !== rightPrivate) return rightPrivate - leftPrivate;
+      return (Number(right.size) || 0) - (Number(left.size) || 0);
+    });
+    return candidates[0] || null;
+  }
+
+  function privateStoreKey(path) {
+    var match = String(path || "").match(/\/PrivateStore\/(P_[^/]+)\/Messages\//);
+    return match ? match[1] : "";
+  }
+
+  function databaseForSource(source) {
+    return source === "square" ? state.squareDatabase : state.database;
+  }
+
+  function sourceDatabaseLabel(source) {
+    return source === "square" ? "Messages/LineSquare.sqlite" : "Messages/Line.sqlite";
+  }
+
+  function sourcePkKey(source, pk) {
+    return source + ":" + String(pk);
+  }
+
+  function chatKeyForId(chatId, source, chatPk) {
+    var id = lookupId(chatId);
+    return id ? "zmid:" + id : sourcePkKey(source, chatPk);
+  }
+
+  function querySource(source, sql, params) {
+    var database = databaseForSource(source);
+    if (!database) throw new Error(sourceDatabaseLabel(source) + " 尚未載入。");
+    var statement = database.prepare(sql);
     var rows = [];
     try {
       statement.bind(params || {});
@@ -524,11 +783,25 @@
     return rows;
   }
 
+  function safeQuerySource(source, sql, params) {
+    try {
+      return querySource(source, sql, params);
+    } catch (error) {
+      console.warn("SQLite 查詢失敗", sourceDatabaseLabel(source), error);
+      return [];
+    }
+  }
+
+  function query(sql, params) {
+    return querySource("line", sql, params);
+  }
+
   function loadReferenceData() {
     state.users.clear();
     state.groupsById.clear();
     state.groupsByPk.clear();
     state.unifiedGroupsById.clear();
+    state.squareGroupsById.clear();
     state.groupNamesByChatPk.clear();
 
     safeQuery("SELECT Z_PK, ZMID, ZNAME, ZADDRESSBOOKNAME, ZCUSTOMNAME, ZSTATUSMESSAGE FROM ZUSER", {}).forEach(function (row) {
@@ -540,7 +813,7 @@
       };
       if (user.id) {
         state.users.set(user.id, user);
-        state.users.set(user.id.toLowerCase(), user);
+        state.users.set(lookupId(user.id), user);
       }
       state.users.set("pk:" + user.pk, user);
     });
@@ -552,7 +825,7 @@
         name: firstNonEmpty(row.ZNAME, row.ZID, "未命名群組"),
         createdAt: normalizeTimestamp(row.ZCREATEDTIME)
       };
-      if (group.id) state.groupsById.set(group.id, group);
+      if (group.id) state.groupsById.set(lookupId(group.id), group);
       state.groupsByPk.set("pk:" + group.pk, group);
     });
 
@@ -566,7 +839,7 @@
     safeQuery(
       "SELECT m.ZCHAT AS chatPk, m.Z_PK AS messagePk, m.ZTIMESTAMP AS timestamp, m.ZTEXT AS text " +
       "FROM ZMESSAGE m JOIN ZCHAT c ON c.Z_PK = m.ZCHAT " +
-      "WHERE c.ZTYPE IN (1, 2, 100) AND m.ZCONTENTTYPE = 18 AND m.ZTEXT IS NOT NULL " +
+      "WHERE c.ZTYPE IN (1, 2, 4, 100) AND m.ZCONTENTTYPE = 18 AND m.ZTEXT IS NOT NULL " +
       "ORDER BY m.ZCHAT ASC, COALESCE(m.ZTIMESTAMP, 0) ASC, m.Z_PK ASC",
       {}
     ).forEach(function (row) {
@@ -590,25 +863,85 @@
   }
 
   function loadChats() {
-    var rows = safeQuery(
+    var lineChats = loadSourceChatRows("line");
+    var squareChats = state.squareDatabase ? loadSourceChatRows("square") : [];
+    var merged = new Map();
+    lineChats.concat(squareChats).forEach(function (sourceChat) {
+      var key = chatKeyForId(sourceChat.id, sourceChat.source, sourceChat.pk);
+      var chat = merged.get(key);
+      if (!chat) {
+        chat = {
+          key: key,
+          pk: sourceChat.source === "line" ? sourceChat.pk : null,
+          id: sourceChat.id,
+          type: sourceChat.type,
+          title: sourceChat.title,
+          titleSource: sourceChat.titleSource,
+          titleEvidence: sourceChat.titleEvidence,
+          messageCount: 0,
+          humanMessageCount: 0,
+          lastMessage: "",
+          lastTimestamp: null,
+          sourceChats: { line: null, square: null }
+        };
+        merged.set(key, chat);
+      }
+      chat.sourceChats[sourceChat.source] = { pk: sourceChat.pk, type: sourceChat.rawType, messageCount: sourceChat.messageCount, humanMessageCount: sourceChat.humanMessageCount };
+      if (sourceChat.source === "line" || chat.pk === null) chat.pk = sourceChat.pk;
+      chat.messageCount += sourceChat.messageCount;
+      chat.humanMessageCount += sourceChat.humanMessageCount;
+      if (!chat.lastTimestamp || (sourceChat.lastTimestamp && sourceChat.lastTimestamp > chat.lastTimestamp)) {
+        chat.lastTimestamp = sourceChat.lastTimestamp;
+        chat.lastMessage = sourceChat.lastMessage;
+      }
+      if (sourceChat.source === "square" && sourceChat.titleSource === "line-square") {
+        chat.title = sourceChat.title;
+        chat.type = "community";
+        chat.titleSource = sourceChat.titleSource;
+        chat.titleEvidence = sourceChat.titleEvidence;
+      }
+    });
+    state.chats = Array.from(merged.values()).sort(function (left, right) {
+      return (right.lastTimestamp ? right.lastTimestamp.getTime() : 0) - (left.lastTimestamp ? left.lastTimestamp.getTime() : 0);
+    });
+    state.chatsByKey = new Map(state.chats.map(function (chat) { return [chat.key, chat]; }));
+    state.chatsBySourcePk = new Map();
+    state.chats.forEach(function (chat) {
+      ["line", "square"].forEach(function (source) {
+        var reference = chat.sourceChats[source];
+        if (reference && reference.pk !== null) state.chatsBySourcePk.set(sourcePkKey(source, reference.pk), chat);
+      });
+    });
+  }
+
+  function loadSourceChatRows(source) {
+    var rows = safeQuerySource(
+      source,
       "SELECT c.Z_PK AS chatPk, c.ZMID AS chatId, c.ZTYPE AS chatType, " +
       "c.ZLASTUPDATED AS lastUpdated, c.ZLASTMESSAGE AS lastMessage, " +
-      "COUNT(m.Z_PK) AS messageCount, MAX(m.ZTIMESTAMP) AS lastMessageTimestamp " +
+      "COUNT(m.Z_PK) AS messageCount, " +
+      "SUM(CASE WHEN m.Z_PK IS NOT NULL " +
+        "AND (m.ZCONTENTTYPE IS NULL OR m.ZCONTENTTYPE NOT IN (7, 18, 96, 111)) " +
+        "AND NOT ((m.ZSENDER IS NULL OR m.ZSENDER = '') AND m.ZSENDSTATUS = 0 AND (m.ZID IS NULL OR m.ZID = '')) " +
+        "THEN 1 ELSE 0 END) AS humanMessageCount, " +
+      "MAX(m.ZTIMESTAMP) AS lastMessageTimestamp " +
       "FROM ZCHAT c LEFT JOIN ZMESSAGE m ON m.ZCHAT = c.Z_PK " +
-      "GROUP BY c.Z_PK ORDER BY COALESCE(MAX(m.ZTIMESTAMP), c.ZLASTUPDATED, 0) DESC, c.Z_PK DESC",
+      "GROUP BY c.Z_PK",
       {}
     );
-
-    state.chats = rows.map(function (row) {
-      var titleInfo = resolveChatTitle(row.chatId, row.chatType, row.chatPk);
+    return rows.map(function (row) {
+      var titleInfo = resolveChatTitle(row.chatId, row.chatType, row.chatPk, source);
       return {
+        source: source,
         pk: numberOrNull(row.chatPk),
         id: stringOrEmpty(row.chatId),
+        rawType: numberOrNull(row.chatType),
         type: titleInfo.type,
         title: titleInfo.title,
         titleSource: titleInfo.source,
         titleEvidence: titleInfo.evidence || [],
         messageCount: Number(row.messageCount || 0),
+        humanMessageCount: Number(row.humanMessageCount || 0),
         lastMessage: stringOrEmpty(row.lastMessage),
         lastTimestamp: normalizeTimestamp(row.lastMessageTimestamp || row.lastUpdated)
       };
@@ -618,7 +951,7 @@
   function populateSearchFilters() {
     if (el.globalSearchChatSelect) {
       el.globalSearchChatSelect.innerHTML = '<option value="">全部聊天室</option>' + state.chats.slice().sort(function (left, right) { return left.title.localeCompare(right.title); }).map(function (chat) {
-        return '<option value="' + escapeHtml(String(chat.pk)) + '">' + escapeHtml(chat.title) + '</option>';
+        return '<option value="' + escapeHtml(chat.key) + '">' + escapeHtml(chat.title) + '</option>';
       }).join("");
     }
     if (el.globalSearchSenderSelect) {
@@ -641,31 +974,23 @@
     if (state.sourceMode === "database" || !state.attachmentFiles.length || !state.database) return;
 
     var messageIds = Array.from(new Set(state.attachmentFiles.map(attachmentMessageId).filter(Boolean)));
+    var messageRowsResult = loadMessageRowsByIds(messageIds);
     var messagesById = new Map();
-    var batchSize = 200;
-    for (var start = 0; start < messageIds.length; start += batchSize) {
-      var batch = messageIds.slice(start, start + batchSize);
-      var placeholders = batch.map(function (_value, index) { return "$attachmentId" + index; });
-      var params = {};
-      batch.forEach(function (value, index) { params["$attachmentId" + index] = value; });
-      safeQuery(
-        "SELECT m.ZID AS messageId, m.Z_PK AS messagePk, m.ZCHAT AS chatPk, " +
-        "m.ZSENDER AS senderPk, m.ZTIMESTAMP AS timestamp, m.ZSENDSTATUS AS sendStatus, " +
-        "m.ZCONTENTTYPE AS contentType, m.ZMESSAGETYPE AS messageType, m.ZTEXT AS text " +
-        "FROM ZMESSAGE m WHERE m.ZID IN (" + placeholders.join(",") + ")",
-        params
-      ).forEach(function (row) {
-        messagesById.set(stringOrEmpty(row.messageId), row);
-      });
-    }
-
-    var chatsByPk = new Map(state.chats.map(function (chat) { return [Number(chat.pk), chat]; }));
+    messageRowsResult.rows.forEach(function (row) {
+      var id = stringOrEmpty(row.messageId);
+      if (!messagesById.has(id)) messagesById.set(id, []);
+      messagesById.get(id).push(row);
+    });
     state.attachmentFiles.forEach(function (file) {
       var path = relativePath(file);
       var messageId = attachmentMessageId(file);
-      var row = messageId ? messagesById.get(messageId) : null;
-      var chat = row ? chatsByPk.get(Number(row.chatPk)) : null;
-      var sender = row ? state.users.get("pk:" + numberOrNull(row.senderPk)) : null;
+      var pathContext = attachmentPathContext(path);
+      var chat = state.chatsByKey.get(chatKeyForId(pathContext.chatId));
+      var candidates = messageId ? (messagesById.get(messageId) || []).filter(function (row) {
+        return chat && chat.sourceChats[row.source] && Number(chat.sourceChats[row.source].pk) === Number(row.chatPk);
+      }) : [];
+      var row = candidates.length === 1 ? candidates[0] : null;
+      var sender = row ? sourceSender(row.source, row.senderPk) : null;
       var text = row ? stringOrEmpty(row.text).trim() : "";
       var kind = row ? messageKind(row.contentType, row.messageType, text) : "";
       var isSelf = Boolean(
@@ -681,13 +1006,15 @@
         chatId: chat ? chat.id : "",
         chatTitle: chat ? chat.title : "SQLite 未找到對應聊天室",
         scope: scope,
-        relation: row ? "SQLite 訊息 ID 對應" : "SQLite 未引用／孤兒檔案",
+        relation: row ? "SQLite 訊息 ID 對應" : (candidates.length > 1 ? "多個 SQLite 訊息候選，未自動關聯" : "SQLite 未引用／孤兒檔案"),
         sender: sender ? sender.name : (row ? "未知使用者" : "—"),
         direction: row ? (isSelf ? "傳送" : "接收／其他") : "—",
         timestamp: row ? normalizeTimestamp(row.timestamp) : null,
         context: text || (kind ? "[" + kind + "]" : "沒有可用訊息文字"),
         kind: kind,
-        status: row ? "exact" : "unlinked"
+        status: row ? "exact" : (candidates.length > 1 ? "ambiguous" : "unlinked"),
+        source: row ? row.source : "",
+        sourceDatabase: row ? sourceDatabaseLabel(row.source) : ""
       };
       state.attachmentContextByPath.set(path, context);
     });
@@ -700,6 +1027,46 @@
     if (match) return match[1];
     match = archivePath.match(/(?:^|\/)(\d{8,})(?:[_.-]|\/|$)/);
     return match ? match[1] : "";
+  }
+
+  function sourceSender(source, senderPk) {
+    if (senderPk === null || senderPk === undefined || senderPk === "") return null;
+    return source === "square"
+      ? state.squareUsers.get(sourcePkKey("square", numberOrNull(senderPk)))
+      : state.users.get("pk:" + numberOrNull(senderPk));
+  }
+
+  function loadMessageRowsByIds(messageIds) {
+    var rows = [];
+    var ids = Array.from(messageIds);
+    try {
+      ["line", "square"].forEach(function (source) {
+        if (!databaseForSource(source)) return;
+        for (var start = 0; start < ids.length; start += 300) {
+          var chunk = ids.slice(start, start + 300);
+          var params = {};
+          var placeholders = chunk.map(function (id, index) {
+            var key = "$messageId" + index;
+            params[key] = id;
+            return key;
+          });
+          querySource(
+            source,
+            "SELECT m.ZID AS messageId, m.Z_PK AS messagePk, m.ZTIMESTAMP AS timestamp, m.ZCHAT AS chatPk, " +
+              "m.ZSENDER AS senderPk, m.ZSENDSTATUS AS sendStatus, m.ZCONTENTTYPE AS contentType, m.ZTEXT AS text " +
+              "FROM ZMESSAGE m WHERE m.ZID IN (" + placeholders.join(",") + ")",
+            params
+          ).forEach(function (row) {
+            row.source = source;
+            rows.push(row);
+          });
+        }
+      });
+      return { success: true, rows: rows };
+    } catch (error) {
+      console.warn("Cleanup attachment reference scan failed", error);
+      return { success: false, rows: [] };
+    }
   }
 
   function attachmentContext(file) {
@@ -732,11 +1099,15 @@
 
   function resolveChatTitle(chatId, chatType, chatPk) {
     var id = stringOrEmpty(chatId);
+    var idKey = lookupId(id);
     var normalizedType = Number(chatType);
-    var group = state.groupsById.get(id);
-    var unifiedGroup = state.unifiedGroupsById.get(id);
-    var user = state.users.get(id);
+    var group = state.groupsById.get(idKey);
+    var unifiedGroup = state.unifiedGroupsById.get(idKey);
+    var squareGroup = state.squareGroupsById.get(idKey);
+    var user = state.users.get(idKey);
     if (user && normalizedType === 0) return { title: user.name, type: "direct", source: "user", evidence: [{ sourceDatabase: "Messages/Line.sqlite", sourceTable: "ZUSER", sourceColumn: "ZCUSTOMNAME/ZADDRESSBOOKNAME/ZNAME", sourcePk: user.pk, confidence: "exact" }] };
+
+    if (squareGroup && normalizedType !== 0) return { title: squareGroup.name, type: "community", source: squareGroup.source, evidence: [{ sourceDatabase: squareGroup.sourceDatabase, sourceTable: squareGroup.sourceTable, sourceColumn: squareGroup.sourceColumn, sourcePk: squareGroup.chatPk, confidence: squareGroup.confidence }] };
 
     if (unifiedGroup && normalizedType !== 0) return { title: unifiedGroup.name, type: chatTypeLabel(normalizedType), source: "unified-group", evidence: [{ sourceDatabase: unifiedGroup.sourceDatabase, sourceTable: unifiedGroup.sourceTable, sourceColumn: unifiedGroup.sourceColumn, confidence: unifiedGroup.confidence }] };
 
@@ -749,12 +1120,20 @@
     return { title: id || (normalizedType === 0 ? "未命名聊天室" : "未命名群組"), type: chatTypeLabel(normalizedType), source: "unresolved", evidence: [{ sourceDatabase: "Messages/Line.sqlite", sourceTable: "ZCHAT", sourceColumn: "ZMID", sourcePk: numberOrNull(chatPk), confidence: "unresolved" }] };
   }
 
+  function chatHasMessages(chat) {
+    return Number(chat.messageCount) > 0;
+  }
+
+  function getVisibleChats(term) {
+    return state.chats.filter(function (chat) {
+      return chatHasMessages(chat) && (!term || (chat.title + " " + chat.id).toLowerCase().indexOf(term) !== -1);
+    });
+  }
+
   function renderChatList() {
     if (!el.chatList) return;
     var term = (el.chatSearch.value || "").trim().toLowerCase();
-    var visible = state.chats.filter(function (chat) {
-      return !term || (chat.title + " " + chat.id).toLowerCase().indexOf(term) !== -1;
-    });
+    var visible = getVisibleChats(term);
     var pageSize = getChatPageSize();
     var totalPages = Math.max(1, Math.ceil(visible.length / pageSize));
     state.chatPage = Math.min(Math.max(1, state.chatPage), totalPages);
@@ -769,12 +1148,12 @@
     pageItems.forEach(function (chat) {
       var button = document.createElement("button");
       button.type = "button";
-      button.className = "chat-item" + (state.currentChat && state.currentChat.pk === chat.pk ? " selected" : "");
+      button.className = "chat-item" + (state.currentChat && state.currentChat.key === chat.key ? " selected" : "");
       button.setAttribute("role", "option");
-      button.setAttribute("aria-selected", state.currentChat && state.currentChat.pk === chat.pk ? "true" : "false");
+      button.setAttribute("aria-selected", state.currentChat && state.currentChat.key === chat.key ? "true" : "false");
       button.innerHTML = '<span class="chat-item-title"></span><span class="chat-item-meta"><span></span><span></span></span>';
       button.querySelector(".chat-item-title").textContent = chat.title;
-      button.querySelector(".chat-item-meta span:first-child").textContent = formatNumber(chat.messageCount) + " 則";
+      button.querySelector(".chat-item-meta span:first-child").textContent = formatNumber(chat.humanMessageCount) + " 則";
       button.querySelector(".chat-item-meta span:last-child").textContent = formatDate(chat.lastTimestamp);
       button.addEventListener("click", function () { selectChat(chat); });
       el.chatList.appendChild(button);
@@ -784,9 +1163,7 @@
 
   function getChatTotalPages() {
     var term = (el.chatSearch && el.chatSearch.value || "").trim().toLowerCase();
-    var visibleCount = state.chats.filter(function (chat) {
-      return !term || (chat.title + " " + chat.id).toLowerCase().indexOf(term) !== -1;
-    }).length;
+    var visibleCount = getVisibleChats(term).length;
     return Math.max(1, Math.ceil(visibleCount / getChatPageSize()));
   }
 
@@ -805,7 +1182,7 @@
     if (chatResizeTimer) window.clearTimeout(chatResizeTimer);
     chatResizeTimer = window.setTimeout(function () {
       chatResizeTimer = null;
-      if (state.chats.length) renderChatList();
+      if (getVisibleChats("").length) renderChatList();
     }, 120);
   }
 
@@ -822,8 +1199,9 @@
     state.currentOffset = 0;
     state.currentAfterTimestamp = 0;
     state.currentAfterPk = 0;
+    state.currentCursors = { line: { timestamp: 0, pk: 0 }, square: { timestamp: 0, pk: 0 } };
     el.selectedChatTitle.textContent = chat.title;
-    el.selectedChatMeta.textContent = typeLabel(chat.type) + " · " + formatNumber(chat.messageCount) + " 則訊息 · 名稱來源：" + titleSourceLabel(chat.titleSource) + " · " + (chat.id || "無 ID");
+    el.selectedChatMeta.textContent = typeLabel(chat.type) + " · " + formatNumber(chat.humanMessageCount) + " 則人類訊息 · 名稱來源：" + titleSourceLabel(chat.titleSource) + " · " + (chat.id || "無 ID");
     renderChatEvidence(chat);
     el.exportHtmlButton.disabled = false;
     el.exportJsonButton.disabled = false;
@@ -910,7 +1288,29 @@
       loadIndexChatMessages(state.currentChat);
       return;
     }
-    var rows = safeQuery(
+    var batches = [];
+    ["line", "square"].forEach(function (source) {
+      var reference = state.currentChat.sourceChats && state.currentChat.sourceChats[source];
+      if (!reference || !databaseForSource(source)) return;
+      var cursor = state.currentCursors[source];
+      var rows = loadMessagePageForSource(source, reference.pk, cursor, MESSAGE_PAGE_SIZE);
+      if (rows.length) {
+        var last = rows[rows.length - 1];
+        cursor.timestamp = Number(last.timestamp) || 0;
+        cursor.pk = Number(last.messagePk) || cursor.pk;
+      }
+      batches = batches.concat(rows.map(function (row) { return mapMessage(row, source); }));
+    });
+    batches.sort(compareMessages);
+    state.currentMessages = state.currentMessages.concat(batches);
+    state.currentOffset += batches.length;
+    renderMessages();
+    el.loadMoreButton.classList.toggle("hidden", state.currentOffset >= state.currentChat.messageCount || batches.length === 0);
+  }
+
+  function loadMessagePageForSource(source, chatPk, cursor, limit) {
+    return safeQuerySource(
+      source,
       "SELECT m.Z_PK AS messagePk, m.ZID AS messageId, m.ZTIMESTAMP AS timestamp, " +
       "m.ZSENDER AS senderPk, m.ZSENDSTATUS AS sendStatus, m.ZCONTENTTYPE AS contentType, m.ZTEXT AS text, " +
       "m.ZMESSAGETYPE AS messageType, m.ZLATITUDE AS latitude, m.ZLONGITUDE AS longitude, " +
@@ -920,27 +1320,28 @@
       "(COALESCE(m.ZTIMESTAMP, 0) = $afterTimestamp AND m.Z_PK > $afterPk)) " +
       "ORDER BY COALESCE(m.ZTIMESTAMP, 0) ASC, m.Z_PK ASC LIMIT $limit",
       {
-        $chatPk: state.currentChat.pk,
-        $limit: MESSAGE_PAGE_SIZE,
-        $afterTimestamp: state.currentAfterTimestamp,
-        $afterPk: state.currentAfterPk
+        $chatPk: chatPk,
+        $limit: limit,
+        $afterTimestamp: cursor.timestamp,
+        $afterPk: cursor.pk
       }
     );
-    var mapped = rows.map(mapMessage);
-    state.currentMessages = state.currentMessages.concat(mapped);
-    state.currentOffset += mapped.length;
-    if (mapped.length) {
-      var lastMessage = mapped[mapped.length - 1];
-      state.currentAfterTimestamp = Number(lastMessage.timestampRaw) || 0;
-      state.currentAfterPk = Number(lastMessage.pk) || state.currentAfterPk;
-    }
-    renderMessages();
-    el.loadMoreButton.classList.toggle("hidden", state.currentOffset >= state.currentChat.messageCount || mapped.length === 0);
   }
 
-  function mapMessage(row) {
+  function compareMessages(left, right) {
+    var timestamp = (Number(left.timestampRaw) || 0) - (Number(right.timestampRaw) || 0);
+    if (timestamp) return timestamp;
+    var source = String(left.provenance && left.provenance.source || "").localeCompare(String(right.provenance && right.provenance.source || ""));
+    if (source) return source;
+    return Number(left.pk || 0) - Number(right.pk || 0);
+  }
+
+  function mapMessage(row, source) {
+    source = source || "line";
     var hasSender = row.senderPk !== null && row.senderPk !== undefined && row.senderPk !== "";
-    var sender = hasSender ? state.users.get("pk:" + numberOrNull(row.senderPk)) : null;
+    var sender = hasSender
+      ? (source === "square" ? state.squareUsers.get(sourcePkKey("square", numberOrNull(row.senderPk))) : state.users.get("pk:" + numberOrNull(row.senderPk)))
+      : null;
     var text = stringOrEmpty(row.text);
     var call = extractCallInfo(row.contentType, row.contentMetadata, text, row.latitude, row.longitude);
     var kind = call ? "call" : messageKind(row.contentType, row.messageType, text);
@@ -976,11 +1377,13 @@
       attachments: resolveAttachments(row.contentMetadata, messageId, attachmentHints),
       provenance: {
         sourceMode: state.sourceMode,
-        sourceDatabase: state.sourceMode === "database" ? "Messages/Line.sqlite" : "Messages/Line.sqlite",
+        source: source,
+        sourceDatabase: sourceDatabaseLabel(source),
         sourceTable: "ZMESSAGE",
         sourcePk: numberOrNull(row.messagePk),
         sourceId: messageId,
         chatPk: numberOrNull(row.chatPk),
+        messageKey: sourcePkKey(source, numberOrNull(row.messagePk)),
         confidence: "exact"
       }
     };
@@ -1050,68 +1453,317 @@
     el.messageStatus.textContent = "已顯示 " + formatNumber(state.currentMessages.length) + " / " + formatNumber(state.currentChat.messageCount) + " 則訊息";
   }
 
-  function renderAttachmentPreview() {
-    if (state.sourceMode === "database") {
-      el.exportAttachmentsButton.disabled = true;
-      el.attachmentPreview.innerHTML = '<div class="empty-state">目前是只讀訊息模式；如需附件索引與下載連結，請切換為完整 LINE 備份。</div>';
-      return;
+  function attachmentPathContext(path) {
+    var match = String(path || "").match(/\/Message (?:Attachments|Thumbnails)\/([^/]+)\/([^/]+)$/);
+    var filename = match ? match[2] : fileNameOf(path);
+    var messageIdMatch = filename.match(/^(\d{8,})(?:[_.-]|$)/);
+    return {
+      chatId: match ? match[1] : "",
+      messageId: messageIdMatch ? messageIdMatch[1] : "",
+      filename: filename
+    };
+  }
+
+  function loadCleanupMessageRows(messageIds) {
+    return loadMessageRowsByIds(messageIds);
+  }
+
+  function cleanupContentLabel(contentType) {
+    return {
+      1: "照片", 2: "影片", 3: "語音", 4: "檔案", 14: "檔案",
+      16: "照片", 17: "影片", 100: "位置", 112: "照片"
+    }[Number(contentType)] || "附件";
+  }
+
+  function cleanupMessageContext(row) {
+    if (!row) return null;
+    var sender = sourceSender(row.source || "line", row.senderPk);
+    var isSelf = Boolean(
+      (sender && state.selfId && sender.id === state.selfId) ||
+      (!sender && numberOrNull(row.sendStatus) === 1)
+    );
+    var text = stringOrEmpty(row.text).replace(/\s+/g, " ").trim();
+    if (text.length > 150) text = text.slice(0, 147) + "…";
+    return {
+      id: stringOrEmpty(row.messageId),
+      pk: numberOrNull(row.messagePk),
+      chatPk: numberOrNull(row.chatPk),
+      timestamp: normalizeTimestamp(row.timestamp),
+      sender: isSelf ? "我" : (sender ? sender.name : "未知傳送者"),
+      contentLabel: cleanupContentLabel(row.contentType),
+      summary: text || "沒有文字內容（" + cleanupContentLabel(row.contentType) + "）",
+      source: row.source || "line",
+      sourceDatabase: sourceDatabaseLabel(row.source || "line")
+    };
+  }
+
+  function fallbackCleanupChat(chatId) {
+    var idKey = lookupId(chatId);
+    var user = state.users.get(idKey);
+    var squareGroup = state.squareGroupsById.get(idKey);
+    var unifiedGroup = state.unifiedGroupsById.get(idKey);
+    var group = state.groupsById.get(idKey);
+    if (user) return { id: chatId, title: user.name, type: "direct", pk: null };
+    if (squareGroup) return { id: chatId, title: squareGroup.name, type: "community", pk: squareGroup.chatPk };
+    if (unifiedGroup) return { id: chatId, title: unifiedGroup.name, type: unifiedGroup.type === null ? "group" : chatTypeLabel(unifiedGroup.type), pk: null };
+    if (group) return { id: chatId, title: group.name, type: "group", pk: group.pk };
+    return { id: chatId, title: "無法辨識的聊天室", type: "unknown", pk: null };
+  }
+
+  function specialCleanupChat(status) {
+    if (status === "unreferenced") {
+      return { id: "", title: "孤兒檔案（SQLite 未引用）", type: "unreferenced", pk: null };
     }
-    if (state.sourceMode === "index") {
-      el.exportAttachmentsButton.disabled = true;
-      el.attachmentPreview.innerHTML = '<div class="empty-state">大型索引只包含訊息分片，沒有複製附件；如需附件預覽與瘦身，請載入完整 LINE 備份資料夾。</div>';
-      return;
+    return { id: "", title: "無法確認引用的附件", type: "unknown", pk: null };
+  }
+
+  function cleanupGroupKey(chat, chatId, referenceStatus) {
+    if (chat && chat.key) return chat.key + "|" + referenceStatus;
+    if (referenceStatus === "unreferenced") return "__unreferenced__";
+    if (referenceStatus === "unconfirmed") return "__unconfirmed__";
+    return lookupId(chatId) || "unknown";
+  }
+
+  function buildAttachmentReviewIndex() {
+    state.attachmentReviewItems = [];
+    state.attachmentReviewByPath = new Map();
+    state.attachmentCleanupGroups = [];
+    if (!state.attachmentFiles.length) return;
+
+    var chatsById = new Map();
+    state.chats.forEach(function (chat) {
+      chatsById.set(lookupId(chat.id), chat);
+    });
+
+    var messageIds = new Set();
+    var pendingFiles = state.attachmentFiles.map(function (file) {
+      var path = relativePath(file);
+      var context = attachmentPathContext(path);
+      if (context.messageId) messageIds.add(context.messageId);
+      return { file: file, path: path, context: context };
+    });
+
+    var messageByChatAndId = new Map();
+    var messageById = new Map();
+    var messageRowsResult = loadCleanupMessageRows(messageIds);
+    messageRowsResult.rows.forEach(function (row) {
+      var chat = state.chatsBySourcePk.get(sourcePkKey(row.source || "line", Number(row.chatPk)));
+      var id = stringOrEmpty(row.messageId);
+      if (chat) {
+        var messageKey = chat.key + "|" + (row.source || "line") + "|" + id;
+        if (!messageByChatAndId.has(messageKey)) messageByChatAndId.set(messageKey, []);
+        messageByChatAndId.get(messageKey).push(row);
+      }
+      if (!messageById.has(id)) messageById.set(id, []);
+      messageById.get(id).push(row);
+    });
+
+    var reviewByKey = new Map();
+    pendingFiles.forEach(function (pending, index) {
+      var chatId = pending.context.chatId;
+      var messageId = pending.context.messageId;
+      var chatKey = lookupId(chatId);
+      var resolvedChat = chatsById.get(chatKey) || fallbackCleanupChat(chatId);
+      var exactMessages = resolvedChat && resolvedChat.sourceChats
+        ? ["line", "square"].reduce(function (matches, source) {
+          return matches.concat(messageByChatAndId.get(resolvedChat.key + "|" + source + "|" + messageId) || []);
+        }, [])
+        : [];
+      var exactMessage = exactMessages.length === 1 ? exactMessages[0] : null;
+      var idMatches = messageById.get(messageId) || [];
+      var referenceStatus = !messageRowsResult.success || !messageId || !chatId
+        ? "unconfirmed"
+        : (exactMessage ? "referenced" : ((exactMessages.length > 1 || idMatches.length) ? "unconfirmed" : "unreferenced"));
+      var chat = resolvedChat && resolvedChat.type !== "unknown" ? resolvedChat : specialCleanupChat(referenceStatus);
+      var groupKey = cleanupGroupKey(chat, chatId, referenceStatus);
+      var bundleKey = groupKey + "|" + (messageId || pending.context.filename || index);
+      if (!reviewByKey.has(bundleKey)) {
+        reviewByKey.set(bundleKey, {
+          key: bundleKey,
+          groupKey: groupKey,
+          chat: chat,
+          messageId: messageId,
+          message: referenceStatus === "referenced" ? cleanupMessageContext(exactMessage) : null,
+          referenceStatus: referenceStatus,
+          files: [],
+          previewFile: null,
+          previewFallbackFile: null,
+          searchText: ""
+        });
+      }
+      var review = reviewByKey.get(bundleKey);
+      var archivePath = archiveRelativePath(pending.file);
+      var descriptor = {
+        file: pending.file,
+        path: pending.path,
+        archivePath: archivePath,
+        category: attachmentCategory(archivePath),
+        kind: /\/Message Thumbnails\//.test(archivePath) ? "thumbnail" : "original",
+        referenceStatus: review.referenceStatus
+      };
+      review.files.push(descriptor);
+    });
+
+    state.attachmentReviewItems = Array.from(reviewByKey.values()).map(function (review) {
+      review.files.sort(function (left, right) {
+        if (left.kind !== right.kind) return left.kind === "original" ? -1 : 1;
+        return right.file.size - left.file.size;
+      });
+      var originalPreview = review.files.find(function (descriptor) {
+        return descriptor.kind === "original" && isCleanupPreviewImage(descriptor.file, descriptor.archivePath);
+      });
+      var thumbnailPreview = review.files.find(function (descriptor) { return descriptor.kind === "thumbnail"; });
+      review.previewFile = originalPreview || thumbnailPreview ||
+        review.files.find(function (descriptor) { return isCleanupPreviewImage(descriptor.file, descriptor.archivePath); }) || null;
+      review.previewFallbackFile = originalPreview && thumbnailPreview ? thumbnailPreview : null;
+      review.totalBytes = review.files.reduce(function (sum, descriptor) { return sum + (Number(descriptor.file.size) || 0); }, 0);
+      var fallbackTime = review.files.reduce(function (latest, descriptor) {
+        return Math.max(latest, Number(descriptor.file.lastModified) || 0);
+      }, 0);
+      review.fallbackTimestamp = fallbackTime ? new Date(fallbackTime) : null;
+      review.searchText = [
+        review.chat.title, review.chat.id, typeLabel(review.chat.type), review.messageId,
+        review.message && review.message.sender, review.message && review.message.summary,
+        review.message && review.message.timestamp ? review.message.timestamp.toISOString() : "",
+        review.fallbackTimestamp ? review.fallbackTimestamp.toISOString() : ""
+      ].concat(review.files.map(function (descriptor) {
+        return descriptor.archivePath + " " + descriptor.file.name + " " + descriptor.category;
+      })).join(" ").toLowerCase();
+      review.files.forEach(function (descriptor) {
+        state.attachmentReviewByPath.set(descriptor.path, { review: review, descriptor: descriptor });
+      });
+      return review;
+    }).sort(function (left, right) {
+      var leftUnknown = left.chat.type === "unknown" ? 1 : 0;
+      var rightUnknown = right.chat.type === "unknown" ? 1 : 0;
+      if (leftUnknown !== rightUnknown) return leftUnknown - rightUnknown;
+      var chatCompare = left.chat.title.localeCompare(right.chat.title, "zh-Hant");
+      if (chatCompare) return chatCompare;
+      var leftTime = left.message && left.message.timestamp ? left.message.timestamp.getTime() : 0;
+      var rightTime = right.message && right.message.timestamp ? right.message.timestamp.getTime() : 0;
+      return rightTime - leftTime;
+    });
+    buildAttachmentCleanupGroups();
+  }
+
+  function buildAttachmentCleanupGroups() {
+    var groupsByKey = new Map();
+    state.attachmentReviewItems.forEach(function (review) {
+      if (!groupsByKey.has(review.groupKey)) {
+        groupsByKey.set(review.groupKey, {
+          key: review.groupKey,
+          chat: review.chat,
+          referenceStatus: review.referenceStatus,
+          reviews: [],
+          totalBytes: 0,
+          fileCount: 0,
+          searchText: ""
+        });
+      }
+      var group = groupsByKey.get(review.groupKey);
+      group.reviews.push(review);
+      group.totalBytes += review.totalBytes;
+      group.fileCount += review.files.length;
+    });
+    state.attachmentCleanupGroups = Array.from(groupsByKey.values()).map(function (group) {
+      group.searchText = [group.chat.title, group.chat.id, typeLabel(group.chat.type)]
+        .concat(group.reviews.map(function (review) { return review.searchText; }))
+        .join(" ").toLowerCase();
+      return group;
+    }).sort(function (left, right) {
+      var priority = { unreferenced: 0, unconfirmed: 1 };
+      var leftPriority = priority[left.referenceStatus] === undefined ? 2 : priority[left.referenceStatus];
+      var rightPriority = priority[right.referenceStatus] === undefined ? 2 : priority[right.referenceStatus];
+      if (leftPriority !== rightPriority) return leftPriority - rightPriority;
+      if (left.totalBytes !== right.totalBytes) return right.totalBytes - left.totalBytes;
+      return left.chat.title.localeCompare(right.chat.title, "zh-Hant");
+    });
+  }
+
+  function getFilteredAttachmentReviewRows() {
+    var search = state.attachmentCleanupSearch;
+    var filter = state.attachmentKindFilter;
+    return state.attachmentReviewItems.map(function (review) {
+      if (state.selectedAttachmentCleanupGroup && review.groupKey !== state.selectedAttachmentCleanupGroup) return null;
+      if (state.attachmentCategoryFilter !== "all" && cleanupCategoryKey(review) !== state.attachmentCategoryFilter) return null;
+      if (search && review.searchText.indexOf(search) === -1) return null;
+      var visibleFiles = review.files.filter(function (descriptor) {
+        if (filter === "original") return descriptor.kind === "original";
+        if (filter === "thumbnail") return descriptor.kind === "thumbnail";
+        if (filter === "marked") return state.attachmentsMarkedForRemoval.has(descriptor.path);
+        return true;
+      });
+      return visibleFiles.length ? { review: review, files: visibleFiles } : null;
+    }).filter(Boolean).sort(compareCleanupReviewRows);
+  }
+
+  function getFilteredAttachmentCleanupGroups() {
+    var search = state.attachmentCleanupSearch;
+    var filter = state.attachmentKindFilter;
+    return state.attachmentCleanupGroups.filter(function (group) {
+      if (state.attachmentCategoryFilter !== "all" && cleanupCategoryKey(group) !== state.attachmentCategoryFilter) return false;
+      if (search && group.searchText.indexOf(search) === -1) return false;
+      return group.reviews.some(function (review) {
+        return review.files.some(function (descriptor) {
+          if (filter === "original") return descriptor.kind === "original";
+          if (filter === "thumbnail") return descriptor.kind === "thumbnail";
+          if (filter === "marked") return state.attachmentsMarkedForRemoval.has(descriptor.path);
+          return true;
+        });
+      });
+    }).sort(compareCleanupGroups);
+  }
+
+  function cleanupTimestamp(review) {
+    var timestamp = review.message && review.message.timestamp ? review.message.timestamp : review.fallbackTimestamp;
+    return timestamp ? timestamp.getTime() : -Infinity;
+  }
+
+  function compareCleanupReviewRows(left, right) {
+    if (state.attachmentSort === "size") {
+      var sizeDifference = right.files.reduce(function (sum, descriptor) { return sum + descriptor.file.size; }, 0) -
+        left.files.reduce(function (sum, descriptor) { return sum + descriptor.file.size; }, 0);
+      if (sizeDifference) return sizeDifference;
+    } else if (state.attachmentSort === "path") {
+      return left.files[0].archivePath.localeCompare(right.files[0].archivePath);
+    } else {
+      var timeDifference = cleanupTimestamp(right.review) - cleanupTimestamp(left.review);
+      if (timeDifference) return state.attachmentSort === "oldest" ? -timeDifference : timeDifference;
     }
-    el.exportAttachmentsButton.disabled = state.attachmentFiles.length === 0;
-    if (!state.attachmentFiles.length) {
-      el.attachmentPreview.innerHTML = '<div class="empty-state">沒有偵測到 Message Attachments 或 Message Thumbnails。</div>';
-      return;
+    return left.files[0].archivePath.localeCompare(right.files[0].archivePath);
+  }
+
+  function compareCleanupGroups(left, right) {
+    if (state.attachmentSort === "size") {
+      if (left.totalBytes !== right.totalBytes) return right.totalBytes - left.totalBytes;
+    } else if (state.attachmentSort === "path") {
+      return left.chat.title.localeCompare(right.chat.title, "zh-Hant");
+    } else {
+      var leftTime = left.reviews.reduce(function (latest, review) { return Math.max(latest, cleanupTimestamp(review)); }, -Infinity);
+      var rightTime = right.reviews.reduce(function (latest, review) { return Math.max(latest, cleanupTimestamp(review)); }, -Infinity);
+      if (leftTime !== rightTime) return state.attachmentSort === "oldest" ? leftTime - rightTime : rightTime - leftTime;
     }
-    var rows = state.attachmentFiles.slice(0, MAX_ATTACHMENT_PREVIEW).map(function (file) {
-      return '<tr><td class="file-name">' + escapeHtml(relativePath(file)) + '</td><td>' + escapeHtml(formatBytes(file.size)) + '</td><td>' + escapeHtml(file.type || "未知") + '</td></tr>';
-    }).join("");
-    var more = state.attachmentFiles.length > MAX_ATTACHMENT_PREVIEW
-      ? '<p class="muted">目前顯示前 ' + MAX_ATTACHMENT_PREVIEW + ' 筆，完整清單可匯出附件清單。</p>'
-      : "";
-    el.attachmentPreview.innerHTML = '<table class="attachment-table"><thead><tr><th>來源路徑</th><th>大小</th><th>MIME</th></tr></thead><tbody>' + rows + '</tbody></table>' + more;
+    return left.chat.title.localeCompare(right.chat.title, "zh-Hant");
   }
 
   function getFilteredAttachmentFiles() {
-    var search = state.attachmentCleanupSearch;
-    var filtered = state.attachmentFiles.filter(function (file) {
-      var context = attachmentContext(file);
-      if (state.attachmentCategoryFilter !== "all" && context.scope !== state.attachmentCategoryFilter) return false;
-      if (!search) return true;
-      var haystack = [
-        relativePath(file),
-        context.chatTitle,
-        context.sender,
-        context.context,
-        attachmentScopeLabel(context.scope)
-      ].join(" ").toLowerCase();
-      return haystack.indexOf(search) !== -1;
-    });
-    return filtered.sort(compareAttachmentFiles);
-  }
-
-  function compareAttachmentFiles(left, right) {
-    var leftContext = attachmentContext(left);
-    var rightContext = attachmentContext(right);
-    if (state.attachmentSort === "size") {
-      var sizeDifference = (Number(right.size) || 0) - (Number(left.size) || 0);
-      if (sizeDifference) return sizeDifference;
-    } else if (state.attachmentSort === "path") {
-      return archiveRelativePath(left).localeCompare(archiveRelativePath(right));
-    } else {
-      var leftTime = leftContext.timestamp ? leftContext.timestamp.getTime() : -Infinity;
-      var rightTime = rightContext.timestamp ? rightContext.timestamp.getTime() : -Infinity;
-      var timeDifference = state.attachmentSort === "oldest" ? leftTime - rightTime : rightTime - leftTime;
-      if (timeDifference) return timeDifference;
-    }
-    return archiveRelativePath(left).localeCompare(archiveRelativePath(right));
+    return getFilteredAttachmentReviewRows().reduce(function (files, row) {
+      return files.concat(row.files.map(function (descriptor) { return descriptor.file; }));
+    }, []);
   }
 
   function getAttachmentCleanupTotalPages() {
-    return Math.max(1, Math.ceil(getFilteredAttachmentFiles().length / ATTACHMENT_CLEANUP_PAGE_SIZE));
+    var items = state.selectedAttachmentCleanupGroup
+      ? getFilteredAttachmentReviewRows()
+      : getFilteredAttachmentCleanupGroups();
+    return Math.max(1, Math.ceil(items.length / ATTACHMENT_CLEANUP_PAGE_SIZE));
+  }
+
+  function getCurrentAttachmentReviewRows() {
+    if (!state.selectedAttachmentCleanupGroup) return [];
+    var rows = getFilteredAttachmentReviewRows();
+    var start = (state.attachmentCleanupPage - 1) * ATTACHMENT_CLEANUP_PAGE_SIZE;
+    return rows.slice(start, start + ATTACHMENT_CLEANUP_PAGE_SIZE);
   }
 
   function archiveRelativePath(file) {
@@ -1125,10 +1777,145 @@
     return /\/Message Thumbnails\//.test(path) ? "縮圖" : "原始附件";
   }
 
+  function isCleanupPreviewImage(file, path) {
+    return /\/Message Thumbnails\//.test(path) || /^image\//i.test(file.type || "") || /\.(?:jpe?g|png|gif|webp|bmp|avif)$/i.test(file.name || "");
+  }
+
+  function cleanupFileLabel(descriptor, review) {
+    var filename = descriptor.file.name;
+    var meaningful = filename.replace(new RegExp("^" + (review.messageId || "") + "[_-]?"), "");
+    if (!meaningful || /^\.[a-z0-9]{1,8}$/i.test(meaningful) || /^thumb$/i.test(meaningful)) {
+      var content = review.message ? review.message.contentLabel : "附件";
+      return content + (descriptor.kind === "thumbnail" ? "縮圖" : "原檔");
+    }
+    return meaningful;
+  }
+
+  function cleanupFileTypeLabel(descriptor) {
+    var extension = (descriptor.file.name.match(/\.([a-z0-9]{1,8})$/i) || [])[1];
+    if (descriptor.kind === "thumbnail") return "圖片預覽";
+    return extension ? extension.toUpperCase() + " 檔案" : (descriptor.file.type || "未知格式");
+  }
+
+  function cleanupFileImpact(descriptor) {
+    return descriptor.kind === "thumbnail"
+      ? "刪除後：聊天中的預覽圖可能消失，原檔仍可保留"
+      : "刪除後：聊天中的這份媒體或檔案將無法開啟";
+  }
+
+  function cleanupChatIcon(type) {
+    return { direct: "人", group: "群", community: "社", unreferenced: "鬼", unknown: "?" }[type] || "聊";
+  }
+
+  function cleanupFileIcon(descriptor) {
+    if (descriptor.kind === "thumbnail" || /^image\//i.test(descriptor.file.type || "") || /\.(?:jpe?g|png|gif|webp|heic)$/i.test(descriptor.file.name)) return "IMG";
+    var extension = (descriptor.file.name.match(/\.([a-z0-9]{1,5})$/i) || [])[1];
+    return extension ? extension.toUpperCase() : "FILE";
+  }
+
+  function createCleanupPreviewUrl(file) {
+    var url = URL.createObjectURL(file);
+    state.cleanupPreviewUrls.add(url);
+    return url;
+  }
+
+  function revokeCleanupPreviewUrls() {
+    state.cleanupPreviewUrls.forEach(function (url) { URL.revokeObjectURL(url); });
+    state.cleanupPreviewUrls.clear();
+  }
+
   function setCleanupPackageStatus(text, isError) {
     if (!el.cleanupPackageStatus) return;
     el.cleanupPackageStatus.textContent = text;
     el.cleanupPackageStatus.classList.toggle("error", Boolean(isError));
+  }
+
+  function showPackageModal(message) {
+    if (!el.packageModal) return;
+    el.packageModal.classList.remove("hidden", "is-success", "is-error");
+    el.packageModal.classList.add("is-processing");
+    el.packageModal.setAttribute("aria-hidden", "false");
+    el.packageModalTitle.textContent = "正在建立 .imazingapp";
+    el.packageModalMessage.textContent = message;
+    el.packageModalProgress.style.width = "0%";
+    el.packageModalProgress.setAttribute("aria-valuenow", "0");
+    el.packageModalProgressLabel.textContent = "0%";
+    el.packageModalClose.classList.add("hidden");
+    document.body.classList.add("package-modal-open");
+    if (el.appShell) {
+      el.appShell.inert = true;
+      el.appShell.setAttribute("aria-busy", "true");
+    }
+    if (el.diffPanel) el.diffPanel.inert = true;
+    window.requestAnimationFrame(function () {
+      if (el.packageModalCard) el.packageModalCard.focus();
+    });
+  }
+
+  function updatePackageModalProgress(percent, message) {
+    if (!el.packageModal || el.packageModal.classList.contains("hidden")) return;
+    var progress = Math.max(0, Math.min(100, Math.round(percent)));
+    el.packageModalProgress.style.width = progress + "%";
+    el.packageModalProgress.setAttribute("aria-valuenow", String(progress));
+    el.packageModalProgressLabel.textContent = progress + "%";
+    if (message) el.packageModalMessage.textContent = message;
+  }
+
+  function completePackageModal(isError, title, message) {
+    if (!el.packageModal) return;
+    el.packageModal.classList.remove("is-processing", "is-success", "is-error");
+    el.packageModal.classList.add(isError ? "is-error" : "is-success");
+    el.packageModalTitle.textContent = title;
+    el.packageModalMessage.textContent = message;
+    if (!isError) updatePackageModalProgress(100);
+    el.packageModalClose.textContent = isError ? "關閉" : "完成";
+    el.packageModalClose.classList.remove("hidden");
+    el.packageModalClose.focus();
+  }
+
+  function closePackageModal() {
+    if (packageInProgress || !el.packageModal) return;
+    el.packageModal.classList.add("hidden");
+    el.packageModal.setAttribute("aria-hidden", "true");
+    document.body.classList.remove("package-modal-open");
+    if (el.appShell) {
+      el.appShell.inert = false;
+      el.appShell.removeAttribute("aria-busy");
+    }
+    if (el.diffPanel) el.diffPanel.inert = false;
+  }
+
+  function showImageModal(url, alt, caption, trigger) {
+    if (!el.imageModal || !el.imageModalImage) return;
+    imageModalTrigger = trigger || null;
+    el.imageModalImage.src = url;
+    el.imageModalImage.alt = alt || "LINE 圖片";
+    el.imageModalCaption.textContent = caption || alt || "LINE 圖片";
+    el.imageModal.classList.remove("hidden");
+    el.imageModal.setAttribute("aria-hidden", "false");
+    document.body.classList.add("image-modal-open");
+    if (el.appShell) el.appShell.inert = true;
+    if (el.diffPanel) el.diffPanel.inert = true;
+    window.requestAnimationFrame(function () {
+      if (el.imageModalCard) el.imageModalCard.focus();
+    });
+  }
+
+  function closeImageModal() {
+    if (!el.imageModal || el.imageModal.classList.contains("hidden")) return;
+    el.imageModal.classList.add("hidden");
+    el.imageModal.setAttribute("aria-hidden", "true");
+    el.imageModalImage.removeAttribute("src");
+    document.body.classList.remove("image-modal-open");
+    if (el.appShell) el.appShell.inert = false;
+    if (el.diffPanel) el.diffPanel.inert = false;
+    if (imageModalTrigger) imageModalTrigger.focus();
+    imageModalTrigger = null;
+  }
+
+  function cleanupCategoryKey(item) {
+    if (item.referenceStatus === "unreferenced" || item.referenceStatus === "unconfirmed") return item.referenceStatus;
+    return item.chat.type === "direct" ? "individual" : item.chat.type;
   }
 
   function renderAttachmentCategorySummary() {
@@ -1138,18 +1925,19 @@
       { key: "individual", label: "個人聊天室" },
       { key: "group", label: "群組聊天室" },
       { key: "community", label: "社群" },
-      { key: "orphan", label: "孤兒檔案" }
+      { key: "unreferenced", label: "SQLite 未引用" },
+      { key: "unconfirmed", label: "無法確認" }
     ];
     var totals = new Map(categories.map(function (category) {
       return [category.key, { count: 0, bytes: 0 }];
     }));
-    state.attachmentFiles.forEach(function (file) {
-      var context = attachmentContext(file);
-      var record = totals.get(context.scope) || totals.get("orphan");
-      record.count += 1;
-      record.bytes += Number(file.size) || 0;
-      totals.get("all").count += 1;
-      totals.get("all").bytes += Number(file.size) || 0;
+    state.attachmentReviewItems.forEach(function (review) {
+      var category = cleanupCategoryKey(review);
+      var total = totals.get(category) || totals.get("unconfirmed");
+      total.count += review.files.length;
+      total.bytes += review.totalBytes;
+      totals.get("all").count += review.files.length;
+      totals.get("all").bytes += review.totalBytes;
     });
     el.attachmentCategorySummary.innerHTML = categories.map(function (category) {
       var total = totals.get(category.key);
@@ -1158,33 +1946,149 @@
     }).join("");
   }
 
-  function getAttachmentPreviewUrl(file) {
-    var path = relativePath(file);
-    if (!isImageAttachment({ name: file.name, mime: file.type })) return "";
-    if (!state.attachmentPreviewUrls.has(path)) {
-      state.attachmentPreviewUrls.set(path, URL.createObjectURL(file));
-    }
-    return state.attachmentPreviewUrls.get(path);
+  function cleanupReferenceStatusLabel(status) {
+    return {
+      referenced: "聊天室附件",
+      unreferenced: "SQLite 未引用",
+      unconfirmed: "無法確認"
+    }[status] || "附件";
   }
 
-  function attachmentPreviewHtml(file) {
-    var url = getAttachmentPreviewUrl(file);
-    if (url) {
-      return '<img src="' + escapeHtml(url) + '" alt="" loading="lazy" decoding="async">';
+  function cleanupReferenceSummary(status) {
+    if (status === "unreferenced") return "附件未被路徑所屬聊天室的 SQLite 訊息引用，請人工確認後再刪除。";
+    if (status === "unconfirmed") return "路徑或訊息 ID 無法可靠比對，未列為孤兒檔案。";
+    return "";
+  }
+
+  function isCleanupGroupFullyMarked(group) {
+    return group.reviews.every(function (review) {
+      return review.files.every(function (descriptor) {
+        return state.attachmentsMarkedForRemoval.has(descriptor.path);
+      });
+    });
+  }
+
+  function cleanupGroupHasOriginalAndThumbnail(group) {
+    var hasOriginal = false;
+    var hasThumbnail = false;
+    group.reviews.forEach(function (review) {
+      review.files.forEach(function (descriptor) {
+        if (descriptor.kind === "original") hasOriginal = true;
+        if (descriptor.kind === "thumbnail") hasThumbnail = true;
+      });
+    });
+    return hasOriginal && hasThumbnail;
+  }
+
+  function isCleanupGroupKeepingThumbnails(group) {
+    if (!cleanupGroupHasOriginalAndThumbnail(group)) return false;
+    return group.reviews.every(function (review) {
+      return review.files.every(function (descriptor) {
+        return descriptor.kind === "original"
+          ? state.attachmentsMarkedForRemoval.has(descriptor.path)
+          : !state.attachmentsMarkedForRemoval.has(descriptor.path);
+      });
+    });
+  }
+
+  function renderAttachmentCleanupGroups(groups) {
+    return '<div class="cleanup-group-list">' + groups.map(function (group) {
+      var markedCount = group.reviews.reduce(function (count, review) {
+        return count + review.files.filter(function (descriptor) {
+          return state.attachmentsMarkedForRemoval.has(descriptor.path);
+        }).length;
+      }, 0);
+      var specialClass = group.referenceStatus === "referenced" ? "" : " special " + group.referenceStatus;
+      var encodedGroupKey = escapeHtml(encodeURIComponent(group.key));
+      var fullyMarked = isCleanupGroupFullyMarked(group);
+      var actionLabel = fullyMarked ? "取消刪除全部" : "刪除全部";
+      var actionState = fullyMarked ? " is-cancel" : " is-delete";
+      var keepingThumbnails = isCleanupGroupKeepingThumbnails(group);
+      var keepThumbnailAction = cleanupGroupHasOriginalAndThumbnail(group)
+        ? '<button class="cleanup-group-open cleanup-group-action-button' + (keepingThumbnails ? " is-cancel" : " is-delete") + '" type="button" data-cleanup-group-action="keep-thumbnail" data-cleanup-group="' + encodedGroupKey + '" title="' + (keepingThumbnails ? "取消原始圖片的刪除標記" : "標記刪除原始附件，保留縮圖") + '">' + (keepingThumbnails ? "還原原始圖片" : "只保留縮圖") + '</button>'
+        : "";
+      return '<article class="cleanup-group-card' + specialClass + '"><div class="cleanup-group-row"><button class="cleanup-group-open-button" type="button" data-cleanup-open-group="' + encodedGroupKey + '"><span class="cleanup-chat-avatar" aria-hidden="true">' + escapeHtml(cleanupChatIcon(group.chat.type)) + '</span><span class="cleanup-group-main"><span class="cleanup-group-heading"><strong>' + escapeHtml(group.chat.title) + '</strong><span class="cleanup-chat-type">' + escapeHtml(cleanupReferenceStatusLabel(group.referenceStatus)) + '</span></span><small>' + escapeHtml(group.referenceStatus === "referenced" ? typeLabel(group.chat.type) : cleanupReferenceSummary(group.referenceStatus)) + '</small><span>' + formatNumber(group.fileCount) + ' 個檔案 · ' + escapeHtml(formatBytes(group.totalBytes)) + (markedCount ? ' · <b>已標記 ' + formatNumber(markedCount) + ' 個</b>' : '') + '</span></span></button><div class="cleanup-group-actions"><button class="cleanup-group-open cleanup-group-action-button' + actionState + '" type="button" data-cleanup-group-action="remove" data-cleanup-group="' + encodedGroupKey + '">' + actionLabel + '</button>' + keepThumbnailAction + '<button class="cleanup-group-open cleanup-group-view-button" type="button" data-cleanup-open-group="' + encodedGroupKey + '">查看</button></div></div></article>';
+    }).join("") + '</div>';
+  }
+
+  function renderCleanupReferenceContext(review) {
+    if (review.message) {
+      return '<div class="cleanup-message-meta"><span>' + escapeHtml(review.message.sender) + '</span><time>' + escapeHtml(formatDate(review.message.timestamp, true)) + '</time></div><p class="cleanup-message-summary">' + escapeHtml(review.message.summary) + '</p>';
     }
-    var icon = /video|mp4|mov/i.test(file.type || file.name) ? "🎞️" : (/audio|mp3|m4a|caf/i.test(file.type || file.name) ? "🎵" : "📄");
-    return '<span class="attachment-preview-placeholder" aria-hidden="true">' + icon + '</span>';
+    var heading = review.referenceStatus === "unreferenced"
+      ? "SQLite 未引用這個附件"
+      : "無法確認對應訊息";
+    var detail = review.referenceStatus === "unreferenced"
+      ? (review.messageId ? "路徑所屬聊天室未找到訊息 ID " + review.messageId : "路徑所屬聊天室沒有可對應的訊息 ID")
+      : (review.fallbackTimestamp ? "檔案修改於 " + formatDate(review.fallbackTimestamp, true) : (review.messageId ? "訊息 ID " + review.messageId : "無法取得訊息 ID"));
+    var summary = review.referenceStatus === "unreferenced"
+      ? "此檔案暫未被目前資料庫引用，仍請檢視預覽與檔名後再決定是否刪除。"
+      : "仍可依預覽與檔名判斷，但資料庫關聯不足，請保守處理。";
+    return '<div class="cleanup-message-meta uncertain"><span>' + escapeHtml(heading) + '</span><span>' + escapeHtml(detail) + '</span></div><p class="cleanup-message-summary">' + escapeHtml(summary) + '</p>';
+  }
+
+  function renderCleanupEvidence(review) {
+    var messagePk = review.message && review.message.pk !== null ? review.message.pk : "無";
+    var sourceDatabase = review.message && review.message.sourceDatabase ? review.message.sourceDatabase : "未確認";
+    var chatPk = review.message && review.message.chatPk !== null
+      ? review.message.chatPk
+      : (review.chat && review.chat.pk !== null ? review.chat.pk : "無");
+    return '<details class="cleanup-evidence"><summary>查看 SQLite 證據</summary><small>messageId=' +
+      escapeHtml(review.messageId || "無") + "；messagePk=" + escapeHtml(String(messagePk)) +
+      "；chatPk=" + escapeHtml(String(chatPk)) + "；source=" + escapeHtml(sourceDatabase) + "；referenceStatus=" +
+      escapeHtml(review.referenceStatus) + "；confidence=" +
+      escapeHtml(review.referenceStatus === "referenced" ? "exact" : "unconfirmed") + "</small></details>";
+  }
+
+  function renderAttachmentCleanupDetails(rows) {
+    var selectedGroup = state.attachmentCleanupGroups.find(function (group) {
+      return group.key === state.selectedAttachmentCleanupGroup;
+    });
+    if (!selectedGroup) return '<div class="empty-state">找不到此附件分類，請返回聊天室列表後再試。</div>';
+    var previewUrls = new Map();
+    var cleanupChoiceCounter = 0;
+    var visibleDescriptors = rows.reduce(function (all, row) { return all.concat(row.files); }, []);
+    var markedInGroup = visibleDescriptors.filter(function (descriptor) {
+      return state.attachmentsMarkedForRemoval.has(descriptor.path);
+    }).length;
+    var cards = rows.map(function (row) {
+      var review = row.review;
+      var previewHtml = '<span class="cleanup-preview-fallback">' + escapeHtml(cleanupFileIcon(row.files[0])) + '</span>';
+      if (review.previewFile) {
+        var previewPath = review.previewFile.path;
+        if (!previewUrls.has(previewPath)) previewUrls.set(previewPath, createCleanupPreviewUrl(review.previewFile.file));
+        var fallbackAttribute = "";
+        if (review.previewFallbackFile && review.previewFallbackFile.path !== previewPath) {
+          var fallbackPath = review.previewFallbackFile.path;
+          if (!previewUrls.has(fallbackPath)) previewUrls.set(fallbackPath, createCleanupPreviewUrl(review.previewFallbackFile.file));
+          fallbackAttribute = ' data-preview-fallback-url="' + escapeHtml(previewUrls.get(fallbackPath)) + '"';
+        }
+        previewHtml = '<img src="' + escapeHtml(previewUrls.get(previewPath)) + '" alt="附件預覽" loading="lazy" decoding="async"' + fallbackAttribute + '><span class="cleanup-preview-fallback">' + escapeHtml(cleanupFileIcon(review.previewFile)) + '</span>';
+      }
+      var fileChoices = row.files.map(function (descriptor) {
+        var checked = state.attachmentsMarkedForRemoval.has(descriptor.path) ? " checked" : "";
+        cleanupChoiceCounter += 1;
+        var choiceId = "cleanup-file-choice-" + state.attachmentCleanupPage + "-" + cleanupChoiceCounter;
+        return '<div class="cleanup-file-choice"><input id="' + choiceId + '" type="checkbox" data-attachment-path="' + escapeHtml(descriptor.path) + '"' + checked + '><div class="cleanup-file-choice-main"><span class="cleanup-file-title"><strong>' + escapeHtml(cleanupFileLabel(descriptor, review)) + '</strong><span class="cleanup-kind-badge ' + escapeHtml(descriptor.kind) + '">' + escapeHtml(descriptor.category) + '</span></span><small>' + escapeHtml(cleanupFileTypeLabel(descriptor) + " · " + formatBytes(descriptor.file.size)) + '</small><span class="cleanup-impact">' + escapeHtml(cleanupFileImpact(descriptor)) + '</span><details class="cleanup-path"><summary>查看實際檔名與路徑</summary><code>' + escapeHtml(descriptor.archivePath) + '</code></details></div><label class="cleanup-delete-label" for="' + choiceId + '">刪除此檔</label></div>';
+      }).join("");
+      return '<article class="cleanup-review-card"><div class="cleanup-preview">' + previewHtml + '</div><div class="cleanup-review-context">' + renderCleanupReferenceContext(review) + renderCleanupEvidence(review) + '<div class="cleanup-file-choices">' + fileChoices + '</div></div></article>';
+    }).join("");
+    return '<section class="cleanup-chat-group"><header class="cleanup-chat-header"><button class="button button-secondary cleanup-back-button" type="button" data-cleanup-back>返回聊天室列表</button><span class="cleanup-chat-avatar" aria-hidden="true">' + escapeHtml(cleanupChatIcon(selectedGroup.chat.type)) + '</span><div class="cleanup-chat-title"><div><h3>' + escapeHtml(selectedGroup.chat.title) + '</h3><span class="cleanup-chat-type">' + escapeHtml(cleanupReferenceStatusLabel(selectedGroup.referenceStatus)) + '</span></div><p>' + escapeHtml(selectedGroup.referenceStatus === "referenced" ? typeLabel(selectedGroup.chat.type) : cleanupReferenceSummary(selectedGroup.referenceStatus)) + ' · 本頁 ' + formatNumber(visibleDescriptors.length) + ' 個檔案 · ' + escapeHtml(formatBytes(visibleDescriptors.reduce(function (sum, descriptor) { return sum + (Number(descriptor.file.size) || 0); }, 0))) + (markedInGroup ? ' · <strong>已標記 ' + formatNumber(markedInGroup) + ' 個</strong>' : '') + '</p></div></header><div class="cleanup-review-grid">' + cards + '</div></section>';
   }
 
   function renderAttachmentCleanup() {
     var databaseOnly = state.sourceMode === "database";
     var indexOnly = state.sourceMode === "index";
     var hasFiles = !databaseOnly && state.attachmentFiles.length > 0;
-    var filtered = getFilteredAttachmentFiles();
+    var detailMode = Boolean(state.selectedAttachmentCleanupGroup);
+    var filteredRows = getFilteredAttachmentReviewRows();
+    var filteredGroups = getFilteredAttachmentCleanupGroups();
+    var filteredFiles = filteredRows.reduce(function (files, row) { return files.concat(row.files); }, []);
     var totalPages = getAttachmentCleanupTotalPages();
     state.attachmentCleanupPage = Math.min(state.attachmentCleanupPage, totalPages);
     var start = (state.attachmentCleanupPage - 1) * ATTACHMENT_CLEANUP_PAGE_SIZE;
-    var pageFiles = filtered.slice(start, start + ATTACHMENT_CLEANUP_PAGE_SIZE);
+    var pageItems = (detailMode ? filteredRows : filteredGroups).slice(start, start + ATTACHMENT_CLEANUP_PAGE_SIZE);
+    revokeCleanupPreviewUrls();
 
     renderAttachmentCategorySummary();
     if (databaseOnly) {
@@ -1193,35 +2097,47 @@
       el.attachmentCleanupList.innerHTML = '<div class="empty-state">大型索引不複製附件檔案；請載入完整 LINE 備份資料夾後使用附件瘦身。</div>';
     } else if (!hasFiles) {
       el.attachmentCleanupList.innerHTML = '<div class="empty-state">沒有可供瘦身的附件或縮圖。</div>';
-    } else if (!filtered.length) {
-      el.attachmentCleanupList.innerHTML = '<div class="empty-state">找不到符合搜尋條件的附件。</div>';
+    } else if (!pageItems.length) {
+      el.attachmentCleanupList.innerHTML = '<div class="empty-state">找不到符合條件的' + (detailMode ? "附件" : "聊天室") + '。可以清除搜尋文字或切換「顯示」篩選。</div>';
+    } else if (detailMode) {
+      el.attachmentCleanupList.innerHTML = renderAttachmentCleanupDetails(pageItems);
+      Array.from(el.attachmentCleanupList.querySelectorAll(".cleanup-preview img")).forEach(function (image) {
+        image.addEventListener("error", function () {
+          var fallbackUrl = image.getAttribute("data-preview-fallback-url");
+          if (fallbackUrl) {
+            image.removeAttribute("data-preview-fallback-url");
+            image.setAttribute("data-preview-fallback-used", "true");
+            image.src = fallbackUrl;
+            image.alt = "附件縮圖預覽";
+            return;
+          }
+          image.closest(".cleanup-preview").classList.add("preview-error");
+        });
+      });
     } else {
-      var rows = pageFiles.map(function (file) {
-        var path = relativePath(file);
-        var archivePath = archiveRelativePath(file);
-        var context = attachmentContext(file);
-        var checked = state.attachmentsMarkedForRemoval.has(path) ? " checked" : "";
-        var timestamp = context.timestamp ? formatDate(context.timestamp, true) : "沒有時間";
-        var contextLine = context.chatTitle + " · " + context.direction + " · " + timestamp;
-        var evidence = '<details class="attachment-evidence"><summary>查看 SQLite 證據</summary><small>' + escapeHtml(context.relation + "；messageId=" + (context.messageId || "無") + "；messagePk=" + (context.messagePk === null ? "無" : context.messagePk) + "；chatPk=" + (context.chatPk === null ? "無" : context.chatPk) + "；confidence=" + context.status) + '</small></details>';
-        return '<label class="attachment-cleanup-row"><input type="checkbox" data-attachment-path="' + escapeHtml(path) + '"' + checked + '><span class="attachment-cleanup-thumb">' + attachmentPreviewHtml(file) + '</span><span class="attachment-cleanup-main"><span class="file-name">' + escapeHtml(archivePath) + '</span><span class="attachment-badges"><small class="attachment-scope-badge ' + escapeHtml(context.scope) + '">' + escapeHtml(attachmentScopeLabel(context.scope)) + '</small><small>' + escapeHtml(attachmentCategory(archivePath) + " · " + (file.type || "未知")) + '</small></span><small class="attachment-context-line">' + escapeHtml(contextLine) + '</small><small class="attachment-relation-line">' + escapeHtml(context.relation + " · confidence: " + context.status + " · " + context.context.slice(0, 160)) + '</small>' + evidence + '</span><span class="attachment-cleanup-size">' + escapeHtml(formatBytes(file.size)) + '</span></label>';
-      }).join("");
-      el.attachmentCleanupList.innerHTML = rows;
+      el.attachmentCleanupList.innerHTML = renderAttachmentCleanupGroups(pageItems);
     }
 
+    updateCleanupSummary();
+    if (el.cleanupResultInfo) {
+      el.cleanupResultInfo.textContent = detailMode
+        ? (filteredRows.length ? "正在檢視「" + (state.attachmentCleanupGroups.find(function (group) { return group.key === state.selectedAttachmentCleanupGroup; }) || { chat: { title: "附件" } }).chat.title + "」的 " + formatNumber(filteredRows.length) + " 組附件脈絡，共 " + formatNumber(filteredFiles.length) + " 個檔案。" : "")
+        : (filteredGroups.length ? "找到 " + formatNumber(filteredGroups.length) + " 個聊天室或特殊分類；點入後才會顯示附件內容。" : "");
+    }
+    var itemCount = detailMode ? filteredRows.length : filteredGroups.length;
+    el.attachmentPageInfo.textContent = hasFiles && itemCount ? "第 " + state.attachmentCleanupPage + " / " + totalPages + " 頁 · " + formatNumber(itemCount) + (detailMode ? " 組附件" : " 個分類") : "第 1 頁";
+    el.attachmentPrevButton.disabled = !hasFiles || state.attachmentCleanupPage <= 1;
+    el.attachmentNextButton.disabled = !hasFiles || state.attachmentCleanupPage >= totalPages;
+    el.exportCleanupPlanButton.disabled = !hasFiles;
+    el.exportCleanupTextButton.disabled = !hasFiles;
+    el.buildImazingCandidateButton.disabled = !hasFiles || packageInProgress;
+  }
+
+  function updateCleanupSummary() {
     var markedFiles = getMarkedAttachmentFiles();
     var markedSize = markedFiles.reduce(function (sum, file) { return sum + (Number(file.size) || 0); }, 0);
     el.markedAttachmentCount.textContent = formatNumber(markedFiles.length);
     el.markedAttachmentSize.textContent = formatBytes(markedSize);
-    el.attachmentPageInfo.textContent = hasFiles ? "第 " + state.attachmentCleanupPage + " / " + totalPages + " 頁" : "第 1 頁";
-    el.attachmentPrevButton.disabled = !hasFiles || state.attachmentCleanupPage <= 1;
-    el.attachmentNextButton.disabled = !hasFiles || state.attachmentCleanupPage >= totalPages;
-    el.markFilteredAttachmentsButton.disabled = !hasFiles || filtered.length === 0;
-    el.keepAllAttachmentsButton.disabled = !hasFiles || markedFiles.length === 0;
-    el.clearAttachmentSelectionButton.disabled = !hasFiles || markedFiles.length === 0;
-    el.exportCleanupPlanButton.disabled = !hasFiles;
-    el.exportCleanupTextButton.disabled = !hasFiles;
-    el.buildImazingCandidateButton.disabled = !hasFiles || packageInProgress;
   }
 
   function getMarkedAttachmentFiles() {
@@ -1233,9 +2149,9 @@
   function buildAttachmentCleanupPlan() {
     var markedFiles = getMarkedAttachmentFiles();
     var markedSize = markedFiles.reduce(function (sum, file) { return sum + (Number(file.size) || 0); }, 0);
-    var lineFile = state.sourceMode === "folder" ? findFileEnding("/Messages/Line.sqlite") : state.files[0];
+    var lineFile = state.sourceMode === "folder" ? findLineDatabaseFile() : state.files[0];
     return {
-      schemaVersion: "0.1",
+      schemaVersion: "0.3",
       planType: "line-attachment-cleanup",
       generatedAt: new Date().toISOString(),
       source: {
@@ -1254,28 +2170,48 @@
         hashStatus: "未計算；此階段只輸出操作計畫"
       },
       markedForRemoval: markedFiles.map(function (file) {
-        var context = attachmentContext(file);
-        return {
+        var path = relativePath(file);
+        var context = state.attachmentReviewByPath.get(path);
+        var review = context && context.review;
+        var entry = {
           path: archiveRelativePath(file),
           category: attachmentCategory(archiveRelativePath(file)),
-          scope: context.scope,
-          scopeLabel: attachmentScopeLabel(context.scope),
-          relation: context.relation,
-          chatTitle: context.chatTitle,
-          messageId: context.messageId,
-          messageTimestamp: context.timestamp ? context.timestamp.toISOString() : null,
-          direction: context.direction,
-          context: context.context,
           size: Number(file.size) || 0,
           mime: file.type || "",
-          lastModified: file.lastModified ? new Date(file.lastModified).toISOString() : null
+          lastModified: file.lastModified ? new Date(file.lastModified).toISOString() : null,
+          referenceStatus: review ? review.referenceStatus : "unconfirmed"
         };
+        if (review && review.referenceStatus === "referenced") {
+          entry.conversation = {
+            id: review.chat.id || "",
+            title: review.chat.title,
+            type: review.chat.type
+          };
+          entry.message = {
+            id: review.messageId || "",
+            timestamp: review.message && review.message.timestamp ? review.message.timestamp.toISOString() : null,
+            sender: review.message ? review.message.sender : "",
+            summary: review.message ? review.message.summary : ""
+          };
+          entry.relatedFiles = review.files.filter(function (descriptor) {
+            return descriptor.path !== path;
+          }).map(function (descriptor) {
+            return { path: descriptor.archivePath, category: descriptor.category };
+          });
+        } else if (review) {
+          entry.referenceContext = {
+            classification: cleanupReferenceStatusLabel(review.referenceStatus),
+            pathChatId: attachmentPathContext(path).chatId || "",
+            messageId: review.messageId || ""
+          };
+        }
+        return entry;
       }),
       warnings: [
         "這不是已驗證可直接還原的 .imazingapp；請在副本上執行。",
         "請保留 Container、Messages/Line.sqlite 與所有未列出的檔案。",
         "刪除原始附件可能使 LINE 聊天中的媒體無法開啟；刪除縮圖通常只會移除預覽圖。",
-        "個人／群組／社群分類來自 SQLite 訊息與聊天室關聯；孤兒檔案未找到可靠訊息關聯，請人工確認後再處理。",
+        "「SQLite 未引用」表示附件未被路徑所屬聊天室的目前 Line.sqlite 訊息引用，仍應人工確認後再刪除。",
         "瀏覽器無法保證保留或設定 macOS 檔案的 creation time；SQLite 內的訊息時間不會由本計畫改寫。"
       ]
     };
@@ -1309,8 +2245,27 @@
       "標記移除的檔案："
     ];
     if (!plan.markedForRemoval.length) lines.push("（目前沒有標記，所有檔案都應保留）");
+    var entriesByConversation = new Map();
     plan.markedForRemoval.forEach(function (entry) {
-      lines.push("- " + entry.path + " · " + entry.scopeLabel + " · " + entry.chatTitle + " · " + (entry.messageTimestamp || "無時間") + " · " + entry.category + " · " + formatBytes(entry.size));
+      var conversationTitle = entry.conversation
+        ? entry.conversation.title
+        : (entry.referenceStatus === "unreferenced" ? "孤兒檔案（SQLite 未引用）" : "無法確認引用的附件");
+      if (!entriesByConversation.has(conversationTitle)) entriesByConversation.set(conversationTitle, []);
+      entriesByConversation.get(conversationTitle).push(entry);
+    });
+    entriesByConversation.forEach(function (entries, conversationTitle) {
+      var firstEntry = entries[0];
+      lines.push("", "【" + conversationTitle + "】" + (firstEntry.conversation ? " " + typeLabel(firstEntry.conversation.type) : ""));
+      if (!firstEntry.conversation) {
+        lines.push("  分類：" + cleanupReferenceStatusLabel(firstEntry.referenceStatus) + "，請人工確認後再刪除。");
+      }
+      entries.forEach(function (entry) {
+        if (entry.message && (entry.message.sender || entry.message.timestamp || entry.message.summary)) {
+          var messageDate = entry.message.timestamp ? formatDate(new Date(entry.message.timestamp), true) : "未知時間";
+          lines.push("  對話：" + (entry.message.sender || "未知傳送者") + " · " + messageDate + " · " + (entry.message.summary || "沒有文字摘要"));
+        }
+        lines.push("  - " + entry.path + " · " + entry.category + " · " + formatBytes(entry.size));
+      });
     });
     lines.push("", "注意：這份清單不會改寫 SQLite，也不能承諾保留 macOS creation time；LINE 訊息時間來自 SQLite。");
     downloadText("line-attachment-cleanup-instructions.txt", lines.join("\n"), "text/plain;charset=utf-8");
@@ -1319,7 +2274,8 @@
   function getCandidateBackupFiles() {
     return state.files.filter(function (file) {
       var path = archiveRelativePath(file);
-      return path === ".lock" || path === "iTunesArtwork" || path === "iTunesMetadata.plist" || path.indexOf("Container/") === 0 || path.indexOf("Payload/") === 0;
+      var filename = fileNameOf(path);
+      return !filename.startsWith("._") && filename !== ".DS_Store" && (path === ".lock" || path === "iTunesArtwork" || path === "iTunesMetadata.plist" || path.indexOf("Container/") === 0 || path.indexOf("Payload/") === 0);
     });
   }
 
@@ -1330,87 +2286,300 @@
   }
 
   function candidateFilename() {
-    return "LINE-slimmed-" + new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z") + ".imazingapp.candidate";
+    return "LINE-slimmed-" + new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z") + ".imazingapp";
   }
 
   async function openCandidateOutput(filename) {
     if (typeof window.showSaveFilePicker === "function") {
       var handle = await window.showSaveFilePicker({
         suggestedName: filename,
-        types: [{ description: "iMazing 候選封裝", accept: { "application/octet-stream": [".imazingapp.candidate", ".imazingapp"] } }]
+        types: [{ description: "iMazing App Data 封裝", accept: { "application/octet-stream": [".imazingapp"] } }]
       });
       return { writable: await handle.createWritable(), chunks: [], bytes: 0, pending: Promise.resolve(), error: null, closed: false };
     }
     return { writable: null, chunks: [], bytes: 0, pending: Promise.resolve(), error: null, closed: false };
   }
 
-  function queueCandidateChunk(output, chunk) {
+  function createZipCrcTable() {
+    var table = new Uint32Array(256);
+    for (var index = 0; index < table.length; index += 1) {
+      var value = index;
+      for (var bit = 0; bit < 8; bit += 1) {
+        value = value & 1 ? (value >>> 1) ^ 0xedb88320 : value >>> 1;
+      }
+      table[index] = value >>> 0;
+    }
+    return table;
+  }
+
+  function updateZipCrc32(crc, bytes) {
+    for (var index = 0; index < bytes.length; index += 1) {
+      crc = (ZIP_CRC_TABLE[(crc ^ bytes[index]) & 0xff] ^ (crc >>> 8)) >>> 0;
+    }
+    return crc;
+  }
+
+  function zipDosDateTime(value) {
+    var date = new Date(value || 0);
+    if (!Number.isFinite(date.getTime()) || date.getFullYear() < 1980) {
+      return { time: 0, date: 0x0021 };
+    }
+    if (date.getFullYear() > 2107) return { time: 0xbf7d, date: 0xff9f };
+    return {
+      time: (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2),
+      date: ((date.getFullYear() - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate()
+    };
+  }
+
+  function zipEntryBytes(path) {
+    return new TextEncoder().encode(path);
+  }
+
+  function setZipUint16(bytes, offset, value) {
+    new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint16(offset, value, true);
+  }
+
+  function setZipUint32(bytes, offset, value) {
+    new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).setUint32(offset, value, true);
+  }
+
+  function makeZipLocalHeader(entry) {
+    var bytes = new Uint8Array(30 + entry.nameBytes.length);
+    setZipUint32(bytes, 0, 0x04034b50);
+    setZipUint16(bytes, 4, entry.isDirectory ? 10 : 20);
+    setZipUint16(bytes, 6, 0x0800);
+    setZipUint16(bytes, 8, 0);
+    setZipUint16(bytes, 10, entry.dos.time);
+    setZipUint16(bytes, 12, entry.dos.date);
+    setZipUint32(bytes, 14, entry.crc32);
+    setZipUint32(bytes, 18, entry.size);
+    setZipUint32(bytes, 22, entry.size);
+    setZipUint16(bytes, 26, entry.nameBytes.length);
+    setZipUint16(bytes, 28, 0);
+    bytes.set(entry.nameBytes, 30);
+    return bytes;
+  }
+
+  function makeZipCentralHeader(entry) {
+    var bytes = new Uint8Array(46 + entry.nameBytes.length);
+    setZipUint32(bytes, 0, 0x02014b50);
+    setZipUint16(bytes, 4, entry.isDirectory ? 10 : 20);
+    setZipUint16(bytes, 6, entry.isDirectory ? 10 : 20);
+    setZipUint16(bytes, 8, 0x0800);
+    setZipUint16(bytes, 10, 0);
+    setZipUint16(bytes, 12, entry.dos.time);
+    setZipUint16(bytes, 14, entry.dos.date);
+    setZipUint32(bytes, 16, entry.crc32);
+    setZipUint32(bytes, 20, entry.size);
+    setZipUint32(bytes, 24, entry.size);
+    setZipUint16(bytes, 28, entry.nameBytes.length);
+    setZipUint16(bytes, 30, 0);
+    setZipUint16(bytes, 32, 0);
+    setZipUint16(bytes, 34, 0);
+    setZipUint16(bytes, 36, entry.internalAttributes || 0);
+    setZipUint32(bytes, 38, entry.isDirectory ? 0x10 : 0);
+    setZipUint32(bytes, 42, entry.localOffset);
+    bytes.set(entry.nameBytes, 46);
+    return bytes;
+  }
+
+  function makeZipEndOfCentralDirectory(entryCount, centralSize, centralOffset) {
+    var bytes = new Uint8Array(22);
+    setZipUint32(bytes, 0, 0x06054b50);
+    setZipUint16(bytes, 4, 0);
+    setZipUint16(bytes, 6, 0);
+    setZipUint16(bytes, 8, entryCount);
+    setZipUint16(bytes, 10, entryCount);
+    setZipUint32(bytes, 12, centralSize);
+    setZipUint32(bytes, 16, centralOffset);
+    setZipUint16(bytes, 20, 0);
+    return bytes;
+  }
+
+  function compareImazingZipEntries(left, right) {
+    function rank(entry) {
+      if (entry.path === "iTunesMetadata.plist") return 0;
+      if (entry.path.indexOf("Payload/") === 0) return 1;
+      if (entry.path.indexOf("Container/") === 0) return 2;
+      if (entry.path === ".lock") return 9;
+      return 3;
+    }
+    var rankDifference = rank(left) - rank(right);
+    if (rankDifference) return rankDifference;
+    return left.path.localeCompare(right.path);
+  }
+
+  function buildImazingZipEntries(files) {
+    var directoryTimes = new Map();
+    var fileEntries = [];
+    files.forEach(function (file) {
+      var path = safeArchivePath(archiveRelativePath(file));
+      if (!path) return;
+      var parts = path.split("/");
+      for (var index = 1; index < parts.length; index += 1) {
+        var directory = parts.slice(0, index).join("/") + "/";
+        var existing = directoryTimes.get(directory) || 0;
+        directoryTimes.set(directory, Math.max(existing, Number(file.lastModified) || 0));
+      }
+      fileEntries.push({
+        path: path,
+        file: file,
+        isDirectory: false,
+        size: Number(file.size) || 0,
+        dos: zipDosDateTime(file.lastModified),
+        nameBytes: zipEntryBytes(path),
+        internalAttributes: /\.txt$/i.test(path) ? 1 : 0
+      });
+    });
+    var uniquePaths = new Set();
+    fileEntries.forEach(function (entry) {
+      if (uniquePaths.has(entry.path)) throw new Error("來源包含重複 ZIP 路徑：" + entry.path);
+      uniquePaths.add(entry.path);
+    });
+    var directoryEntries = Array.from(directoryTimes.entries()).map(function (entry) {
+      var path = entry[0];
+      return {
+        path: path,
+        file: null,
+        isDirectory: true,
+        size: 0,
+        dos: zipDosDateTime(entry[1]),
+        nameBytes: zipEntryBytes(path),
+        internalAttributes: 0,
+        crc32: 0
+      };
+    });
+    return directoryEntries.concat(fileEntries).sort(compareImazingZipEntries);
+  }
+
+  function assertClassicZipLimits(entries) {
+    if (entries.length > ZIP_CLASSIC_MAX_U16) {
+      throw new Error("檔案數超過非 ZIP64 .imazingapp 可處理上限。");
+    }
+    var estimatedSize = 22n;
+    entries.forEach(function (entry) {
+      if (entry.nameBytes.length > ZIP_CLASSIC_MAX_U16 || entry.size > ZIP_CLASSIC_MAX_U32) {
+        throw new Error("有檔案超過非 ZIP64 .imazingapp 可處理上限：" + entry.path);
+      }
+      estimatedSize += BigInt(30 + entry.nameBytes.length + entry.size + 46 + entry.nameBytes.length);
+    });
+    if (estimatedSize > 0xffffffffn) {
+      throw new Error("瘦身後封裝超過 4 GB，為保持 .imazingapp 相容性不建立 ZIP64 封裝。");
+    }
+  }
+
+  async function writeCandidateChunk(output, chunk) {
     if (!chunk || !chunk.length) return;
+    if (output.error) throw output.error;
     output.bytes += chunk.length;
     if (output.writable) {
-      output.pending = output.pending.then(function () { return output.writable.write(chunk); });
+      try {
+        await output.writable.write(chunk);
+      } catch (error) {
+        output.error = error;
+        throw error;
+      }
     } else {
       output.chunks.push(chunk);
     }
   }
 
-  async function flushCandidateOutput(output) {
-    await output.pending;
-    if (output.error) throw output.error;
+  function yieldZipExport() {
+    return new Promise(function (resolve) { window.setTimeout(resolve, 0); });
   }
 
-  function updateCandidateProgress(processedBytes, totalBytes, processedFiles, totalFiles) {
+  async function calculateFileCrc32(file, onProgress) {
+    var crc = 0xffffffff;
+    var chunkCount = 0;
+    for (var offset = 0; offset < file.size; offset += ZIP_READ_CHUNK_BYTES) {
+      var end = Math.min(file.size, offset + ZIP_READ_CHUNK_BYTES);
+      var bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+      crc = updateZipCrc32(crc, bytes);
+      if (onProgress) onProgress(bytes.length);
+      chunkCount += 1;
+      if (chunkCount % ZIP_EVENT_LOOP_YIELD_INTERVAL === 0) await yieldZipExport();
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  async function writeFileToCandidateZip(file, output, onProgress) {
+    var chunkCount = 0;
+    for (var offset = 0; offset < file.size; offset += ZIP_READ_CHUNK_BYTES) {
+      var end = Math.min(file.size, offset + ZIP_READ_CHUNK_BYTES);
+      var bytes = new Uint8Array(await file.slice(offset, end).arrayBuffer());
+      await writeCandidateChunk(output, bytes);
+      if (onProgress) onProgress(bytes.length);
+      chunkCount += 1;
+      if (chunkCount % ZIP_EVENT_LOOP_YIELD_INTERVAL === 0) await yieldZipExport();
+    }
+  }
+
+  function updateCandidateProgress(processedBytes, totalBytes, detail) {
     var percent = totalBytes ? Math.round(processedBytes / totalBytes * 100) : 100;
-    setCleanupPackageStatus("正在建立候選封裝… " + percent + "%（" + formatNumber(processedFiles) + " / " + formatNumber(totalFiles) + " 個檔案）", false);
+    var progressText = detail + " " + percent + "%";
+    setCleanupPackageStatus(progressText, false);
+    updatePackageModalProgress(percent, progressText);
   }
 
   async function writeCandidateZip(files, output) {
-    var zipApi = window.fflate;
-    if (!zipApi || typeof zipApi.Zip !== "function" || typeof zipApi.ZipPassThrough !== "function") {
-      throw new Error("無法載入 ZIP 封裝引擎；請確認網路連線後重新整理頁面。");
-    }
-    var totalBytes = files.reduce(function (sum, file) { return sum + (Number(file.size) || 0); }, 0);
-    var processedBytes = 0;
-    var processedFiles = 0;
-    var zip = new zipApi.Zip(function (error, chunk) {
-      if (error) {
-        output.error = error;
-        return;
-      }
-      queueCandidateChunk(output, chunk);
-    });
+    var entries = buildImazingZipEntries(files);
+    assertClassicZipLimits(entries);
+    var totalBytes = entries.reduce(function (sum, entry) { return sum + entry.size; }, 0);
+    var totalWorkBytes = totalBytes * 2;
+    var processedCrcBytes = 0;
+    var processedWriteBytes = 0;
+    var fileEntries = entries.filter(function (entry) { return !entry.isDirectory; });
+    var processedCrcFiles = 0;
+    var processedWriteFiles = 0;
+    var localOffset = 0n;
+    var centralEntries = [];
 
-    for (var index = 0; index < files.length; index += 1) {
-      var file = files[index];
-      var archivePath = safeArchivePath(archiveRelativePath(file));
-      if (!archivePath) continue;
-      var entry = new zipApi.ZipPassThrough(archivePath);
-      if (file.lastModified) entry.mtime = new Date(file.lastModified);
-      zip.add(entry);
-      if (typeof file.stream === "function") {
-        var reader = file.stream().getReader();
-        try {
-          while (true) {
-            var result = await reader.read();
-            if (result.done) break;
-            entry.push(result.value, false);
-            await flushCandidateOutput(output);
-          }
-        } finally {
-          reader.releaseLock();
-        }
-      } else {
-        entry.push(new Uint8Array(await file.arrayBuffer()), false);
-        await flushCandidateOutput(output);
+    for (var index = 0; index < entries.length; index += 1) {
+      var entry = entries[index];
+      entry.crc32 = entry.isDirectory ? 0 : await calculateFileCrc32(entry.file, function (bytes) {
+        processedCrcBytes += bytes;
+        updateCandidateProgress(
+          processedCrcBytes + processedWriteBytes,
+          totalWorkBytes,
+          "正在驗證檔案…（" + formatNumber(processedCrcFiles + 1) + " / " + formatNumber(fileEntries.length) + "）"
+        );
+      });
+      if (!entry.isDirectory) processedCrcFiles += 1;
+      if (localOffset > 0xfffffffen) throw new Error("瘦身後封裝超過非 ZIP64 offset 上限。");
+      entry.localOffset = Number(localOffset);
+      var localHeader = makeZipLocalHeader(entry);
+      await writeCandidateChunk(output, localHeader);
+      localOffset += BigInt(localHeader.length);
+      if (!entry.isDirectory) {
+        await writeFileToCandidateZip(entry.file, output, function (bytes) {
+          processedWriteBytes += bytes;
+          updateCandidateProgress(
+            processedCrcBytes + processedWriteBytes,
+            totalWorkBytes,
+            "正在寫入檔案…（" + formatNumber(processedWriteFiles + 1) + " / " + formatNumber(fileEntries.length) + "）"
+          );
+        });
+        localOffset += BigInt(entry.size);
+        processedWriteFiles += 1;
       }
-      entry.push(new Uint8Array(0), true);
-      await flushCandidateOutput(output);
-      processedBytes += Number(file.size) || 0;
-      processedFiles += 1;
-      updateCandidateProgress(processedBytes, totalBytes, processedFiles, files.length);
+      centralEntries.push(entry);
     }
-    zip.end();
-    await flushCandidateOutput(output);
+
+    var centralOffset = localOffset;
+    for (var centralIndex = 0; centralIndex < centralEntries.length; centralIndex += 1) {
+      var centralHeader = makeZipCentralHeader(centralEntries[centralIndex]);
+      await writeCandidateChunk(output, centralHeader);
+      localOffset += BigInt(centralHeader.length);
+    }
+    var centralSize = localOffset - centralOffset;
+    if (centralOffset > 0xfffffffen || centralSize > 0xfffffffen) {
+      throw new Error("瘦身後封裝超過非 ZIP64 central directory 上限。");
+    }
+    await writeCandidateChunk(output, makeZipEndOfCentralDirectory(
+      centralEntries.length,
+      Number(centralSize),
+      Number(centralOffset)
+    ));
     if (output.writable && !output.closed) {
       await output.writable.close();
       output.closed = true;
@@ -1426,44 +2595,58 @@
     var packageInputBytes = packageFiles.reduce(function (sum, file) { return sum + (Number(file.size) || 0); }, 0);
     var canStreamToFile = typeof window.showSaveFilePicker === "function";
     var hasContainer = packageFiles.some(function (file) { return archiveRelativePath(file).indexOf("Container/") === 0; });
-    var lineFile = findFileEnding("/Messages/Line.sqlite");
+    var lineFile = findLineDatabaseFile();
     var hasLineSqlite = Boolean(lineFile && packageFiles.indexOf(lineFile) !== -1);
     var hasLock = packageFiles.some(function (file) { return archiveRelativePath(file) === ".lock"; });
+    var hasLineWal = state.files.some(function (file) {
+      return /\/Messages\/Line\.sqlite-wal$/i.test(relativePath(file));
+    });
     if (!hasContainer) {
-      setCleanupPackageStatus("無法建立候選封裝：選取的資料夾沒有 Container/；請選取包含 Container 與 Payload 的完整 iMazing 備份資料夾。", true);
+      setCleanupPackageStatus("無法建立瘦身 .imazingapp：選取的資料夾沒有 Container/；請選取包含 Container 與 Payload 的完整 iMazing 備份資料夾。", true);
       return;
     }
     if (!hasLineSqlite) {
-      setCleanupPackageStatus("無法建立候選封裝：Messages/Line.sqlite 不在保留檔案中。", true);
+      setCleanupPackageStatus("無法建立瘦身 .imazingapp：Messages/Line.sqlite 不在保留檔案中。", true);
       return;
     }
     if (!canStreamToFile && packageInputBytes > MAX_BLOB_CANDIDATE_BYTES) {
-      setCleanupPackageStatus("目前瀏覽器不支援直接寫入大型檔案；候選封裝預估超過 256 MB，請改用支援 File System Access API 的 Chrome／Edge 桌面版，以避免 Blob 下載造成記憶體峰值。", true);
+      setCleanupPackageStatus("目前瀏覽器不支援直接寫入大型檔案；瘦身 .imazingapp 預估超過 256 MB，請改用支援 File System Access API 的 Chrome／Edge 桌面版，以避免 Blob 下載造成記憶體峰值。", true);
       return;
     }
 
     packageInProgress = true;
+    var initialPackageMessage = hasLineWal
+      ? "正在準備封裝，會保留 Line.sqlite-wal。"
+      : "正在整理保留的檔案，請勿關閉此頁面。";
+    showPackageModal(initialPackageMessage);
     renderAttachmentCleanup();
-    setCleanupPackageStatus("準備建立候選封裝…", false);
+    setCleanupPackageStatus(initialPackageMessage, false);
     var output = null;
     try {
       var filename = candidateFilename();
+      if (!canStreamToFile) await waitForUiPaint();
       output = await openCandidateOutput(filename);
       await writeCandidateZip(packageFiles, output);
       if (!output.writable) {
         downloadBlob(filename, new Blob(output.chunks, { type: "application/octet-stream" }));
       }
       var warnings = [];
-      if (!hasLock) warnings.push("來源沒有 .lock，無法視為正式 iMazing 封裝");
+      if (!hasLock) warnings.push("來源沒有 .lock，請勿視為可驗證的 iMazing 封裝");
       if (!packageFiles.some(function (file) { return archiveRelativePath(file).indexOf("Payload/") === 0; })) warnings.push("來源沒有 Payload/，請以 iMazing dry-run 驗證");
-      warnings.push("此候選封裝由瀏覽器重新建立，尚未通過 iMazing 實機還原");
-      setCleanupPackageStatus("候選封裝已建立：" + formatBytes(output.bytes) + "，保留 " + formatNumber(packageFiles.length) + " 個檔案。" + (warnings.length ? " 警告：" + warnings.join("；") + "。" : ""), Boolean(warnings.length));
+      if (hasLineWal) warnings.push("已保留 Line.sqlite-wal，但附件引用判定未套用 WAL");
+      warnings.push("此 .imazingapp 由瀏覽器重新建立，尚未通過 iMazing 實機還原");
+      var successMessage = "已建立 " + formatBytes(output.bytes) + " 的 .imazingapp，保留 " + formatNumber(packageFiles.length) + " 個檔案。" + (warnings.length ? " 注意：" + warnings.join("；") + "。" : "");
+      setCleanupPackageStatus(successMessage, false);
+      completePackageModal(false, "瘦身 .imazingapp 已建立", successMessage);
     } catch (error) {
       if (output && output.writable && !output.closed) {
         try { await output.writable.abort(); } catch (abortError) { console.warn(abortError); }
       }
-      if (error && error.name === "AbortError") setCleanupPackageStatus("已取消候選封裝輸出。", false);
-      else setCleanupPackageStatus("候選封裝失敗：" + (error && error.message ? error.message : String(error)), true);
+      var errorMessage = error && error.name === "AbortError"
+        ? "已取消建立瘦身 .imazingapp。"
+        : "瘦身 .imazingapp 建立失敗：" + (error && error.message ? error.message : String(error));
+      setCleanupPackageStatus(errorMessage, error && error.name !== "AbortError");
+      completePackageModal(true, error && error.name === "AbortError" ? "已取消建立" : "建立失敗", errorMessage);
       console.error(error);
     } finally {
       packageInProgress = false;
@@ -1593,8 +2776,11 @@
   }
 
   function getSearchFilters() {
+    var chatKey = el.globalSearchChatSelect && el.globalSearchChatSelect.value ? el.globalSearchChatSelect.value : "";
+    var selectedChat = chatKey ? state.chatsByKey.get(chatKey) : null;
     var filters = {
-      chatPk: el.globalSearchChatSelect && el.globalSearchChatSelect.value ? Number(el.globalSearchChatSelect.value) : null,
+      chatKey: chatKey,
+      chatPk: state.indexMode && selectedChat ? selectedChat.pk : null,
       senderPk: el.globalSearchSenderSelect && el.globalSearchSenderSelect.value ? Number(el.globalSearchSenderSelect.value) : null,
       contentType: el.globalSearchContentType && el.globalSearchContentType.value !== "" ? Number(el.globalSearchContentType.value) : null,
       fromTimestamp: null,
@@ -1624,20 +2810,37 @@
   }
 
   function searchDatabase(term, filters) {
+    var results = ["line", "square"].filter(function (source) { return Boolean(databaseForSource(source)); }).reduce(function (all, source) {
+      return all.concat(searchDatabaseSource(source, term, filters));
+    }, []);
+    return results.sort(function (left, right) {
+      var timestamp = (Number(right.timestampRaw) || 0) - (Number(left.timestampRaw) || 0);
+      if (timestamp) return timestamp;
+      var source = String(left.source || "").localeCompare(String(right.source || ""));
+      if (source) return source;
+      return Number(right.pk || 0) - Number(left.pk || 0);
+    }).slice(0, 100);
+  }
+
+  function searchDatabaseSource(source, term, filters) {
     filters = filters || {};
     var conditions = ["COALESCE(ZTEXT, '') LIKE $pattern ESCAPE '\\'"];
     var params = { $pattern: "%" + term.replace(/[\\%_]/g, "\\$&") + "%" };
-    if (filters.chatPk !== null && filters.chatPk !== undefined) { conditions.push("ZCHAT = $chatPk"); params.$chatPk = filters.chatPk; }
-    if (filters.senderPk !== null && filters.senderPk !== undefined) { conditions.push("ZSENDER = $senderPk"); params.$senderPk = filters.senderPk; }
+    var chat = filters.chatKey ? state.chatsByKey.get(filters.chatKey) : null;
+    var reference = chat && chat.sourceChats ? chat.sourceChats[source] : null;
+    if (filters.chatKey && !reference) return [];
+    if (reference) { conditions.push("ZCHAT = $chatPk"); params.$chatPk = reference.pk; }
+    if (source === "line" && filters.senderPk !== null && filters.senderPk !== undefined) { conditions.push("ZSENDER = $senderPk"); params.$senderPk = filters.senderPk; }
     if (filters.contentType !== null && filters.contentType !== undefined) { conditions.push("ZCONTENTTYPE = $contentType"); params.$contentType = filters.contentType; }
     if (filters.fromTimestamp !== null && filters.fromTimestamp !== undefined) { conditions.push("COALESCE(ZTIMESTAMP, 0) >= $fromTimestamp"); params.$fromTimestamp = filters.fromTimestamp; }
     if (filters.toTimestamp !== null && filters.toTimestamp !== undefined) { conditions.push("COALESCE(ZTIMESTAMP, 0) <= $toTimestamp"); params.$toTimestamp = filters.toTimestamp; }
-    var rows = safeQuery(
+    var rows = safeQuerySource(
+      source,
       "SELECT Z_PK AS messagePk, ZID AS messageId, ZCHAT AS chatPk, ZSENDER AS senderPk, ZCONTENTTYPE AS contentType, ZTIMESTAMP AS timestamp, ZTEXT AS text " +
       "FROM ZMESSAGE WHERE " + conditions.join(" AND ") + " ORDER BY COALESCE(ZTIMESTAMP, 0) DESC, Z_PK DESC LIMIT 100",
       params
     );
-    return rows.map(function (row) { return makeSearchResult(row, term, "exact"); });
+    return rows.map(function (row) { return makeSearchResult(row, term, "exact", source); });
   }
 
   async function searchReaderIndex(term, filters) {
@@ -1672,10 +2875,13 @@
     return results.sort(function (left, right) { return (right.timestampRaw || 0) - (left.timestampRaw || 0); });
   }
 
-  function makeSearchResult(row, term, confidence) {
+  function makeSearchResult(row, term, confidence, source) {
+    source = source || "line";
     var chatPk = row.chatPk !== undefined ? row.chatPk : row.chat_pk;
     var timestampRaw = row.timestamp !== undefined ? row.timestamp : row.timestamp_raw;
-    var chat = state.chats.find(function (item) { return Number(item.pk) === Number(chatPk); });
+    var chat = state.indexMode
+      ? state.chats.find(function (item) { return Number(item.pk) === Number(chatPk); })
+      : state.chatsBySourcePk.get(sourcePkKey(source, chatPk));
     var text = stringOrEmpty(row.text);
     var lowerText = text.toLocaleLowerCase();
     var index = lowerText.indexOf(term.toLocaleLowerCase());
@@ -1685,14 +2891,15 @@
       pk: numberOrNull(row.messagePk || row.pk),
       id: stringOrEmpty(row.messageId || row.id),
       chatPk: numberOrNull(chatPk),
+      chatKey: chat ? (chat.key || "") : "",
       chatTitle: chat ? chat.title : "未知聊天室",
       text: text,
       snippet: snippet,
       timestampRaw: timestampRaw,
       timestamp: normalizeTimestamp(timestampRaw),
-      sender: stringOrEmpty(row.sender || row.sender_name),
+      sender: firstNonEmpty(row.sender, row.sender_name, (sourceSender(source, row.senderPk !== undefined ? row.senderPk : row.sender_pk) || {}).name),
       confidence: confidence,
-      source: row.source_shard || "ZMESSAGE"
+      source: row.source_shard || sourceDatabaseLabel(source)
     };
   }
 
@@ -1702,11 +2909,13 @@
       return;
     }
     el.globalSearchResults.innerHTML = results.map(function (result) {
-      return '<button type="button" class="search-result" data-search-chat-pk="' + escapeHtml(String(result.chatPk)) + '"><strong>' + escapeHtml(result.chatTitle) + '</strong><span>' + escapeHtml(result.snippet) + '</span><small>' + escapeHtml((result.sender ? result.sender + " · " : "") + formatDate(result.timestamp, true) + " · " + result.confidence + " · " + result.source) + '</small></button>';
+      return '<button type="button" class="search-result" data-search-chat-key="' + escapeHtml(result.chatKey) + '" data-search-chat-pk="' + escapeHtml(String(result.chatPk)) + '"><strong>' + escapeHtml(result.chatTitle) + '</strong><span>' + escapeHtml(result.snippet) + '</span><small>' + escapeHtml((result.sender ? result.sender + " · " : "") + formatDate(result.timestamp, true) + " · " + result.confidence + " · " + result.source) + '</small></button>';
     }).join("");
-    el.globalSearchResults.querySelectorAll("button[data-search-chat-pk]").forEach(function (button) {
+    el.globalSearchResults.querySelectorAll("button[data-search-chat-key]").forEach(function (button) {
       button.addEventListener("click", function () {
-        var chat = state.chats.find(function (item) { return Number(item.pk) === Number(button.getAttribute("data-search-chat-pk")); });
+        var chat = state.indexMode
+          ? state.chats.find(function (item) { return Number(item.pk) === Number(button.getAttribute("data-search-chat-pk")); })
+          : state.chatsByKey.get(button.getAttribute("data-search-chat-key") || "");
         if (chat) selectChat(chat);
       });
     });
@@ -1718,7 +2927,7 @@
     if (state.indexMode) {
       rows = state.currentMessages.map(function (message) { return { timestamp: message.timestampRaw, pk: message.pk }; });
     } else {
-      rows = safeQuery("SELECT ZTIMESTAMP AS timestamp, Z_PK AS pk FROM ZMESSAGE WHERE ZCHAT = $chatPk ORDER BY COALESCE(ZTIMESTAMP, 0), Z_PK", { $chatPk: state.currentChat.pk });
+      rows = loadAllMessagesForChat(state.currentChat).map(function (message) { return { timestamp: message.timestampRaw, pk: message.pk, source: message.provenance.source }; });
     }
     var events = [];
     var previous = null;
@@ -1985,8 +3194,8 @@
   }
 
   function updateStats() {
-    el.chatCount.textContent = formatNumber(state.chats.length);
-    el.messageCount.textContent = formatNumber(state.chats.reduce(function (sum, chat) { return sum + chat.messageCount; }, 0));
+    el.chatCount.textContent = formatNumber(state.chats.filter(chatHasMessages).length);
+    el.messageCount.textContent = formatNumber(state.chats.reduce(function (sum, chat) { return sum + chat.humanMessageCount; }, 0));
     el.attachmentCount.textContent = formatNumber(state.attachmentFiles.length);
     el.sourceSize.textContent = formatBytes(state.sourceSize);
   }
@@ -2004,7 +3213,7 @@
     var payload = {
       schemaVersion: "0.1",
       exportedAt: new Date().toISOString(),
-      source: state.sourceMode === "database" ? "LINE Messages/Line.sqlite" : (state.indexMode ? "LINE CLI reader index" : "LINE iOS App Container"),
+      source: state.sourceMode === "database" ? "LINE Messages/Line.sqlite" : (state.indexMode ? "LINE CLI reader index" : (state.squareDatabase ? "LINE Messages/Line.sqlite + Messages/LineSquare.sqlite" : "LINE iOS App Container")),
       sourceMode: state.sourceMode,
       conversation: state.currentChat,
       messages: messages.map(sanitizeMessageForExport)
@@ -2014,15 +3223,27 @@
 
   function loadAllMessagesForExport() {
     if (state.indexMode) return state.currentMessages.slice();
-    var rows = safeQuery(
+    return loadAllMessagesForChat(state.currentChat);
+  }
+
+  function loadAllMessagesForChat(chat) {
+    if (!chat) return [];
+    var messages = [];
+    ["line", "square"].forEach(function (source) {
+      var reference = chat.sourceChats && chat.sourceChats[source];
+      if (!reference || !databaseForSource(source)) return;
+      var rows = safeQuerySource(
+        source,
       "SELECT m.Z_PK AS messagePk, m.ZID AS messageId, m.ZTIMESTAMP AS timestamp, " +
       "m.ZSENDER AS senderPk, m.ZSENDSTATUS AS sendStatus, m.ZCONTENTTYPE AS contentType, m.ZTEXT AS text, " +
       "m.ZMESSAGETYPE AS messageType, m.ZLATITUDE AS latitude, m.ZLONGITUDE AS longitude, " +
       "m.ZCONTENTMETADATA AS contentMetadata, m.ZCHAT AS chatPk " +
       "FROM ZMESSAGE m WHERE m.ZCHAT = $chatPk ORDER BY COALESCE(m.ZTIMESTAMP, 0) ASC, m.Z_PK ASC",
-      { $chatPk: state.currentChat.pk }
-    );
-    return rows.map(mapMessage);
+        { $chatPk: reference.pk }
+      );
+      messages = messages.concat(rows.map(function (row) { return mapMessage(row, source); }));
+    });
+    return messages.sort(compareMessages);
   }
 
   function buildChatHtml(chat, messages) {
@@ -2051,19 +3272,16 @@
     return "body{margin:0;padding:24px;background:#f3f5f7;color:#1f2937;font:16px/1.55 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}main{max-width:860px;margin:auto}h1{letter-spacing:-.03em}.meta,.note{color:#6b7280}.note{padding:10px 12px;border-radius:10px;background:#fff}.message{max-width:78%;margin:12px 0;padding:10px 12px;border:1px solid #e5e7eb;border-radius:12px;background:#fff}.message.self{margin-left:auto;border-color:#99f6e4;background:#f0fdfa}.message.system{margin-left:auto;margin-right:auto;border-style:dashed;color:#6b7280;background:#f8fafc}.message header{display:flex;gap:12px;justify-content:space-between;color:#6b7280;font-size:.78rem}.message-text{white-space:pre-wrap;overflow-wrap:anywhere}.message-text a{color:#0f766e;text-decoration:underline}.message-call{margin:0;font-weight:700;color:#0f766e}.message-call.unanswered{color:#b45309}.message-kind{color:#92400e}.coordinates{color:#6b7280;font-size:.8rem}.link-previews{display:grid;gap:8px;margin-top:9px}.link-preview{display:grid;grid-template-columns:minmax(0,1fr) 132px;overflow:hidden;border:1px solid #dbe4ea;border-radius:10px;color:inherit;text-decoration:none;background:#f8fafc}.link-preview.no-image{grid-template-columns:minmax(0,1fr)}.link-preview-content{min-width:0;padding:9px 10px}.link-preview-domain{display:block;color:#64748b;font-size:.72rem;text-transform:uppercase}.link-preview-title{display:block;margin-top:2px;font-weight:750}.link-preview-summary{display:-webkit-box;overflow:hidden;margin-top:3px;color:#64748b;font-size:.78rem;-webkit-box-orient:vertical;-webkit-line-clamp:2}.link-preview img{width:132px;height:100%;min-height:96px;object-fit:cover;background:#e2e8f0}.attachments{margin:8px 0 0;padding-left:20px;color:#0f766e}.attachments span{color:#6b7280}";
   }
 
-  function exportAttachmentCsv() {
-    var lines = ["path,size,mime"]; 
-    state.attachmentFiles.forEach(function (file) {
-      lines.push([relativePath(file), file.size, file.type || ""].map(csvEscape).join(","));
-    });
-    downloadText("line-attachments.csv", "\ufeff" + lines.join("\n"), "text/csv;charset=utf-8");
-  }
-
   function clearWorkspace(resetInput) {
     if (state.database) {
       try { state.database.close(); } catch (error) { console.warn(error); }
     }
+    if (state.squareDatabase) {
+      try { state.squareDatabase.close(); } catch (error) { console.warn(error); }
+    }
     state.database = null;
+    state.squareDatabase = null;
+    state.lineDatabasePath = "";
     state.sqlReady = false;
     state.files = [];
     state.fileByPath = new Map();
@@ -2077,29 +3295,38 @@
     state.chats = [];
     state.chatPage = 1;
     state.users.clear();
+    state.squareUsers.clear();
     state.groupsById.clear();
     state.groupsByPk.clear();
     state.unifiedGroupsById.clear();
+    state.squareGroupsById.clear();
     state.groupNamesByChatPk.clear();
+    state.chatsByKey.clear();
+    state.chatsBySourcePk.clear();
     state.currentChat = null;
     state.currentMessages = [];
     state.currentOffset = 0;
     state.currentAfterTimestamp = 0;
     state.currentAfterPk = 0;
+    state.currentCursors = { line: { timestamp: 0, pk: 0 }, square: { timestamp: 0, pk: 0 } };
     state.attachmentFiles = [];
     state.attachmentByBasename = new Map();
     state.attachmentByMessageId = new Map();
     state.attachmentByToken = new Map();
     state.attachmentContextByPath = new Map();
-    revokeAttachmentPreviewUrls();
-    state.attachmentPreviewUrls = new Map();
+    state.attachmentReviewItems = [];
+    state.attachmentReviewByPath = new Map();
+    state.attachmentCleanupGroups = [];
+    state.selectedAttachmentCleanupGroup = "";
     state.attachmentCleanupPage = 1;
     state.attachmentCleanupSearch = "";
+    state.attachmentKindFilter = "all";
     state.attachmentCategoryFilter = "all";
     state.attachmentSort = "recent";
     state.attachmentsMarkedForRemoval = new Set();
     state.attachmentDuplicateGroups = [];
     revokeObjectUrls();
+    revokeCleanupPreviewUrls();
     state.selfId = "";
     state.sourceSize = 0;
     if (resetInput !== false && el.folderInput) el.folderInput.value = "";
@@ -2108,32 +3335,30 @@
     if (el.workspace) el.workspace.classList.add("hidden");
     if (el.diffPanel) el.diffPanel.classList.add("hidden");
     if (el.chatList) el.chatList.innerHTML = "";
+    if (el.chatSearch) el.chatSearch.value = "";
     if (el.chatPageInfo) el.chatPageInfo.textContent = "第 1 頁";
     if (el.chatPrevButton) el.chatPrevButton.disabled = true;
     if (el.chatNextButton) el.chatNextButton.disabled = true;
     if (el.messageList) el.messageList.innerHTML = '<div class="empty-state">尚未選取聊天室。</div>';
-    if (el.attachmentPreview) el.attachmentPreview.innerHTML = "";
     if (el.attachmentSearch) el.attachmentSearch.value = "";
+    if (el.attachmentKindFilter) el.attachmentKindFilter.value = "all";
     if (el.attachmentCategoryFilter) el.attachmentCategoryFilter.value = "all";
     if (el.attachmentSort) el.attachmentSort.value = "recent";
     if (el.attachmentCategorySummary) el.attachmentCategorySummary.innerHTML = "";
+    if (el.cleanupResultInfo) el.cleanupResultInfo.textContent = "";
     if (el.attachmentCleanupList) el.attachmentCleanupList.innerHTML = "";
     if (el.attachmentPageInfo) el.attachmentPageInfo.textContent = "第 1 頁";
     if (el.attachmentPrevButton) el.attachmentPrevButton.disabled = true;
     if (el.attachmentNextButton) el.attachmentNextButton.disabled = true;
-    if (el.markFilteredAttachmentsButton) el.markFilteredAttachmentsButton.disabled = true;
-    if (el.keepAllAttachmentsButton) el.keepAllAttachmentsButton.disabled = true;
-    if (el.clearAttachmentSelectionButton) el.clearAttachmentSelectionButton.disabled = true;
     if (el.exportCleanupPlanButton) el.exportCleanupPlanButton.disabled = true;
     if (el.exportCleanupTextButton) el.exportCleanupTextButton.disabled = true;
     if (el.buildImazingCandidateButton) el.buildImazingCandidateButton.disabled = true;
     packageInProgress = false;
-    setCleanupPackageStatus("候選封裝會保留未標記的 Container／Payload 檔案，但尚未經 iMazing 實機驗證。", false);
+    setCleanupPackageStatus("瘦身 .imazingapp 會保留未標記的 Container／Payload 檔案，尚未經 iMazing 實機驗證。", false);
     if (el.markedAttachmentCount) el.markedAttachmentCount.textContent = "0";
     if (el.markedAttachmentSize) el.markedAttachmentSize.textContent = "0 B";
     if (el.exportHtmlButton) el.exportHtmlButton.disabled = true;
     if (el.exportJsonButton) el.exportJsonButton.disabled = true;
-    if (el.exportAttachmentsButton) el.exportAttachmentsButton.disabled = true;
     if (el.runHealthButton) el.runHealthButton.disabled = true;
     if (el.globalSearchButton) el.globalSearchButton.disabled = true;
     if (el.globalSearchInput) el.globalSearchInput.value = "";
@@ -2786,10 +4011,12 @@
     var exactAttachments = (message.attachments || []).filter(function (attachment) {
       return attachment.linkStatus === "exact";
     });
-    var originalImages = exactAttachments.filter(isImageAttachment);
-    var thumbnailImages = exactAttachments.filter(isThumbnailAttachment);
-    // Prefer the original browser-readable image. Older backups often retain
-    // only Message Thumbnails/*.thumb, which are still ordinary image bytes.
+    var originalImages = exactAttachments.filter(function (attachment) {
+      return !isThumbnailAttachment(attachment) && isImageAttachment(attachment);
+    });
+    var thumbnailImages = exactAttachments.filter(function (attachment) {
+      return isThumbnailAttachment(attachment) && isImageAttachment(attachment);
+    });
     var images = (originalImages.length ? originalImages : thumbnailImages).slice(0, 4);
     var media = null;
 
@@ -2826,11 +4053,11 @@
   function createImagePreview(url, alt, captionText) {
     var figure = document.createElement("figure");
     figure.className = "message-image";
-    var link = document.createElement("a");
-    link.href = url;
-    link.target = "_blank";
-    link.rel = "noopener";
-    link.title = captionText;
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "message-image-button";
+    button.title = "放大預覽圖片";
+    button.setAttribute("aria-label", "放大預覽：" + (alt || "LINE 圖片"));
     var image = document.createElement("img");
     image.src = url;
     image.alt = alt || "LINE 圖片";
@@ -2842,8 +4069,11 @@
       figure.classList.add("preview-error");
       image.alt = "這個圖片格式無法由瀏覽器直接顯示";
     });
-    link.appendChild(image);
-    figure.appendChild(link);
+    button.addEventListener("click", function () {
+      showImageModal(url, alt, captionText, button);
+    });
+    button.appendChild(image);
+    figure.appendChild(button);
     var caption = document.createElement("figcaption");
     caption.textContent = captionText;
     figure.appendChild(caption);
@@ -2894,11 +4124,6 @@
   function revokeObjectUrls() {
     state.objectUrls.forEach(function (url) { URL.revokeObjectURL(url); });
     state.objectUrls.clear();
-  }
-
-  function revokeAttachmentPreviewUrls() {
-    state.attachmentPreviewUrls.forEach(function (url) { URL.revokeObjectURL(url); });
-    state.attachmentPreviewUrls.clear();
   }
 
   function sanitizeMessageForExport(message) {
@@ -2954,7 +4179,7 @@
 
   function chatTypeLabel(chatType) {
     if (Number(chatType) === 0) return "direct";
-    if (Number(chatType) === 100) return "community";
+    if (Number(chatType) === 4 || Number(chatType) === 100) return "community";
     if (Number(chatType) === 1 || Number(chatType) === 2) return "group";
     return "unknown";
   }
@@ -2962,6 +4187,7 @@
   function titleSourceLabel(source) {
     return {
       user: "LINE 使用者資料",
+      "line-square": "LineSquare.sqlite 社群名稱",
       "unified-group": "UnifiedGroup.sqlite 目前名稱",
       rename: "群組改名系統訊息",
       group: "LINE 群組資料",
@@ -3026,11 +4252,6 @@
     return String(value === null || value === undefined ? "" : value).replace(/[&<>\"']/g, function (character) {
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[character];
     });
-  }
-
-  function csvEscape(value) {
-    var text = String(value === null || value === undefined ? "" : value);
-    return '"' + text.replace(/"/g, '""') + '"';
   }
 
   function slugify(value) {
