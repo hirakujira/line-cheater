@@ -1,4 +1,4 @@
-/* global initSqlJs */
+/* global initSqlJs, fflate */
 
 (function () {
   "use strict";
@@ -7,7 +7,11 @@
   var MESSAGE_PAGE_SIZE = 180;
   var CHAT_ITEM_FALLBACK_HEIGHT = 65;
   var MAX_ATTACHMENT_PREVIEW = 120;
+  var ATTACHMENT_CLEANUP_PAGE_SIZE = 30;
+  var MAX_BLOB_CANDIDATE_BYTES = 256 * 1024 * 1024;
+  var MAX_IN_MEMORY_SQLITE_BYTES = 1024 * 1024 * 1024;
   var chatResizeTimer = null;
+  var packageInProgress = false;
 
   var state = {
     files: [],
@@ -15,22 +19,39 @@
     sourceMode: "folder",
     sourceRoot: "",
     sourceSize: 0,
+    indexFiles: [],
+    indexManifest: null,
+    indexConversations: [],
+    indexParticipants: [],
+    indexMode: false,
     database: null,
     sqlReady: false,
+    capabilities: null,
+    health: null,
     chats: [],
     chatPage: 1,
     users: new Map(),
     groupsById: new Map(),
     groupsByPk: new Map(),
+    unifiedGroupsById: new Map(),
     groupNamesByChatPk: new Map(),
-    groupMemberNamesByChatPk: new Map(),
     currentChat: null,
     currentMessages: [],
     currentOffset: 0,
+    currentAfterTimestamp: 0,
+    currentAfterPk: 0,
     attachmentFiles: [],
     attachmentByBasename: new Map(),
     attachmentByMessageId: new Map(),
     attachmentByToken: new Map(),
+    attachmentContextByPath: new Map(),
+    attachmentPreviewUrls: new Map(),
+    attachmentCleanupPage: 1,
+    attachmentCleanupSearch: "",
+    attachmentCategoryFilter: "all",
+    attachmentSort: "recent",
+    attachmentsMarkedForRemoval: new Set(),
+    attachmentDuplicateGroups: [],
     objectUrls: new Set(),
     selfId: ""
   };
@@ -40,13 +61,16 @@
   document.addEventListener("DOMContentLoaded", function () {
     el.folderInput = document.getElementById("folderInput");
     el.databaseInput = document.getElementById("databaseInput");
+    el.indexInput = document.getElementById("indexInput");
     el.sourceModeInputs = Array.from(document.querySelectorAll('input[name="sourceMode"]'));
     el.folderSourcePicker = document.getElementById("folderSourcePicker");
     el.databaseSourcePicker = document.getElementById("databaseSourcePicker");
+    el.indexSourcePicker = document.getElementById("indexSourcePicker");
     el.runtimeBadge = document.getElementById("runtimeBadge");
     el.loadStatus = document.getElementById("loadStatus");
     el.progressBar = document.getElementById("progressBar");
     el.workspace = document.getElementById("workspace");
+    el.diffPanel = document.getElementById("diffPanel");
     el.chatCount = document.getElementById("chatCount");
     el.messageCount = document.getElementById("messageCount");
     el.attachmentCount = document.getElementById("attachmentCount");
@@ -59,6 +83,7 @@
     el.clearButton = document.getElementById("clearButton");
     el.selectedChatTitle = document.getElementById("selectedChatTitle");
     el.selectedChatMeta = document.getElementById("selectedChatMeta");
+    el.selectedChatEvidence = document.getElementById("selectedChatEvidence");
     el.messageStatus = document.getElementById("messageStatus");
     el.messageList = document.getElementById("messageList");
     el.loadMoreButton = document.getElementById("loadMoreButton");
@@ -66,12 +91,57 @@
     el.exportJsonButton = document.getElementById("exportJsonButton");
     el.exportAttachmentsButton = document.getElementById("exportAttachmentsButton");
     el.attachmentPreview = document.getElementById("attachmentPreview");
+    el.attachmentSearch = document.getElementById("attachmentSearch");
+    el.attachmentCategoryFilter = document.getElementById("attachmentCategoryFilter");
+    el.attachmentSort = document.getElementById("attachmentSort");
+    el.attachmentCategorySummary = document.getElementById("attachmentCategorySummary");
+    el.markedAttachmentCount = document.getElementById("markedAttachmentCount");
+    el.markedAttachmentSize = document.getElementById("markedAttachmentSize");
+    el.attachmentCleanupList = document.getElementById("attachmentCleanupList");
+    el.attachmentPrevButton = document.getElementById("attachmentPrevButton");
+    el.attachmentNextButton = document.getElementById("attachmentNextButton");
+    el.attachmentPageInfo = document.getElementById("attachmentPageInfo");
+    el.markFilteredAttachmentsButton = document.getElementById("markFilteredAttachmentsButton");
+    el.keepAllAttachmentsButton = document.getElementById("keepAllAttachmentsButton");
+    el.clearAttachmentSelectionButton = document.getElementById("clearAttachmentSelectionButton");
+    el.exportCleanupPlanButton = document.getElementById("exportCleanupPlanButton");
+    el.exportCleanupTextButton = document.getElementById("exportCleanupTextButton");
+    el.buildImazingCandidateButton = document.getElementById("buildImazingCandidateButton");
+    el.cleanupPackageStatus = document.getElementById("cleanupPackageStatus");
+    el.capabilitySummary = document.getElementById("capabilitySummary");
+    el.runHealthButton = document.getElementById("runHealthButton");
+    el.healthSummary = document.getElementById("healthSummary");
+    el.globalSearchInput = document.getElementById("globalSearchInput");
+    el.globalSearchButton = document.getElementById("globalSearchButton");
+    el.globalSearchChatSelect = document.getElementById("globalSearchChatSelect");
+    el.globalSearchSenderSelect = document.getElementById("globalSearchSenderSelect");
+    el.globalSearchContentType = document.getElementById("globalSearchContentType");
+    el.globalSearchFrom = document.getElementById("globalSearchFrom");
+    el.globalSearchTo = document.getElementById("globalSearchTo");
+    el.searchEngineBadge = document.getElementById("searchEngineBadge");
+    el.globalSearchResults = document.getElementById("globalSearchResults");
+    el.runTimelineButton = document.getElementById("runTimelineButton");
+    el.timelineSummary = document.getElementById("timelineSummary");
+    el.schemaTableSelect = document.getElementById("schemaTableSelect");
+    el.schemaStatus = document.getElementById("schemaStatus");
+    el.schemaExplorer = document.getElementById("schemaExplorer");
+    el.scanAttachmentDuplicatesButton = document.getElementById("scanAttachmentDuplicatesButton");
+    el.duplicateStatus = document.getElementById("duplicateStatus");
+    el.duplicateResults = document.getElementById("duplicateResults");
+    el.diffLeftInput = document.getElementById("diffLeftInput");
+    el.diffRightInput = document.getElementById("diffRightInput");
+    el.runDiffButton = document.getElementById("runDiffButton");
+    el.diffStatus = document.getElementById("diffStatus");
+    el.diffResults = document.getElementById("diffResults");
 
     el.folderInput.addEventListener("change", function (event) {
       loadSource(event.target.files, "folder");
     });
     el.databaseInput.addEventListener("change", function (event) {
       loadSource(event.target.files, "database");
+    });
+    el.indexInput.addEventListener("change", function (event) {
+      loadSource(event.target.files, "index");
     });
     el.sourceModeInputs.forEach(function (input) {
       input.addEventListener("change", function (event) {
@@ -100,6 +170,85 @@
     el.exportHtmlButton.addEventListener("click", exportCurrentHtml);
     el.exportJsonButton.addEventListener("click", exportCurrentJson);
     el.exportAttachmentsButton.addEventListener("click", exportAttachmentCsv);
+    el.attachmentSearch.addEventListener("input", function (event) {
+      state.attachmentCleanupSearch = event.target.value.trim().toLowerCase();
+      state.attachmentCleanupPage = 1;
+      renderAttachmentCleanup();
+    });
+    el.attachmentCategoryFilter.addEventListener("change", function (event) {
+      state.attachmentCategoryFilter = event.target.value || "all";
+      state.attachmentCleanupPage = 1;
+      renderAttachmentCleanup();
+    });
+    el.attachmentSort.addEventListener("change", function (event) {
+      state.attachmentSort = event.target.value || "recent";
+      state.attachmentCleanupPage = 1;
+      renderAttachmentCleanup();
+    });
+    el.attachmentCategorySummary.addEventListener("click", function (event) {
+      var button = event.target.closest("button[data-attachment-category]");
+      if (!button) return;
+      state.attachmentCategoryFilter = button.getAttribute("data-attachment-category") || "all";
+      state.attachmentCleanupPage = 1;
+      el.attachmentCategoryFilter.value = state.attachmentCategoryFilter;
+      renderAttachmentCleanup();
+    });
+    el.attachmentPrevButton.addEventListener("click", function () {
+      if (state.attachmentCleanupPage > 1) {
+        state.attachmentCleanupPage -= 1;
+        renderAttachmentCleanup();
+      }
+    });
+    el.attachmentNextButton.addEventListener("click", function () {
+      var totalPages = getAttachmentCleanupTotalPages();
+      if (state.attachmentCleanupPage < totalPages) {
+        state.attachmentCleanupPage += 1;
+        renderAttachmentCleanup();
+      }
+    });
+    el.keepAllAttachmentsButton.addEventListener("click", function () {
+      state.attachmentsMarkedForRemoval.clear();
+      renderAttachmentCleanup();
+    });
+    el.markFilteredAttachmentsButton.addEventListener("click", function () {
+      getFilteredAttachmentFiles().forEach(function (file) {
+        state.attachmentsMarkedForRemoval.add(relativePath(file));
+      });
+      renderAttachmentCleanup();
+    });
+    el.clearAttachmentSelectionButton.addEventListener("click", function () {
+      getFilteredAttachmentFiles().forEach(function (file) {
+        state.attachmentsMarkedForRemoval.delete(relativePath(file));
+      });
+      renderAttachmentCleanup();
+    });
+    el.attachmentCleanupList.addEventListener("change", function (event) {
+      var checkbox = event.target.closest("input[data-attachment-path]");
+      if (!checkbox) return;
+      var path = checkbox.getAttribute("data-attachment-path");
+      if (checkbox.checked) state.attachmentsMarkedForRemoval.add(path);
+      else state.attachmentsMarkedForRemoval.delete(path);
+      renderAttachmentCleanup();
+    });
+    el.exportCleanupPlanButton.addEventListener("click", exportAttachmentCleanupPlan);
+    el.exportCleanupTextButton.addEventListener("click", exportAttachmentCleanupInstructions);
+    el.buildImazingCandidateButton.addEventListener("click", buildImazingCandidatePackage);
+    el.runHealthButton.addEventListener("click", runBrowserHealth);
+    el.globalSearchButton.addEventListener("click", runGlobalSearch);
+    el.globalSearchInput.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") runGlobalSearch();
+    });
+    el.runTimelineButton.addEventListener("click", runTimelineAnalysis);
+    el.schemaTableSelect.addEventListener("change", function (event) {
+      renderSchemaTable(event.target.value);
+    });
+    el.scanAttachmentDuplicatesButton.addEventListener("click", scanAttachmentDuplicates);
+    el.duplicateResults.addEventListener("click", function (event) {
+      var button = event.target.closest("button[data-duplicate-group]");
+      if (!button) return;
+      markDuplicateAlternatives(Number(button.getAttribute("data-duplicate-group")));
+    });
+    el.runDiffButton.addEventListener("click", runBrowserDiff);
     window.addEventListener("resize", scheduleChatLayoutRefresh);
     updateSourceModeUi();
 
@@ -124,26 +273,32 @@
   }
 
   function switchSourceMode(mode) {
-    var nextMode = mode === "database" ? "database" : "folder";
+    var nextMode = mode === "database" || mode === "index" ? mode : "folder";
     clearWorkspace(true);
     state.sourceMode = nextMode;
     updateSourceModeUi();
-    setStatus(nextMode === "database" ? "請選取 Messages/Line.sqlite。" : "請選取完整 LINE 備份資料夾。", false);
+    setStatus(nextMode === "database" ? "請選取 Messages/Line.sqlite。" : (nextMode === "index" ? "請選取 CLI 產生的 line-reader-index 資料夾。" : "請選取完整 LINE 備份資料夾。"), false);
   }
 
   function updateSourceModeUi() {
     var databaseOnly = state.sourceMode === "database";
+    var indexOnly = state.sourceMode === "index";
+    el.sourceModeInputs.forEach(function (input) {
+      input.checked = input.value === state.sourceMode;
+    });
     if (el.folderSourcePicker) el.folderSourcePicker.classList.toggle("hidden", databaseOnly);
     if (el.databaseSourcePicker) el.databaseSourcePicker.classList.toggle("hidden", !databaseOnly);
+    if (el.indexSourcePicker) el.indexSourcePicker.classList.toggle("hidden", !indexOnly);
+    if (el.folderSourcePicker) el.folderSourcePicker.classList.toggle("hidden", databaseOnly || indexOnly);
   }
 
   async function loadSource(fileList, mode) {
-    var sourceMode = mode === "database" ? "database" : "folder";
+    var sourceMode = mode === "database" || mode === "index" ? mode : "folder";
     clearWorkspace(false);
     state.sourceMode = sourceMode;
     updateSourceModeUi();
     if (!fileList || !fileList.length) {
-      setStatus(sourceMode === "database" ? "尚未選取 Line.sqlite。" : "尚未選取備份資料夾。", false);
+      setStatus(sourceMode === "database" ? "尚未選取 Line.sqlite。" : (sourceMode === "index" ? "尚未選取大型備份索引。" : "尚未選取備份資料夾。"), false);
       return;
     }
 
@@ -154,9 +309,21 @@
       state.sourceSize = state.files.reduce(function (sum, file) { return sum + file.size; }, 0);
       state.fileByPath = new Map(state.files.map(function (file) { return [relativePath(file), file]; }));
       state.sourceRoot = sourceMode === "database" ? relativePath(state.files[0]) : inferRoot(state.files);
+      if (sourceMode === "index") {
+        await loadReaderIndex();
+        return;
+      }
+      state.attachmentCleanupPage = 1;
+      state.attachmentCleanupSearch = "";
+      state.attachmentCategoryFilter = "all";
+      state.attachmentSort = "recent";
+      state.attachmentsMarkedForRemoval = new Set();
+      if (el.attachmentSearch) el.attachmentSearch.value = "";
+      if (el.attachmentCategoryFilter) el.attachmentCategoryFilter.value = "all";
+      if (el.attachmentSort) el.attachmentSort.value = "recent";
       state.attachmentFiles = sourceMode === "folder" ? state.files.filter(function (file) {
         var path = relativePath(file);
-        return /\/Message Attachments\//.test(path) || /\/Message Thumbnails\//.test(path);
+        return ( /\/Message Attachments\//.test(path) || /\/Message Thumbnails\//.test(path) ) && !fileNameOf(path).startsWith(".");
       }) : [];
       buildAttachmentIndex();
 
@@ -168,6 +335,13 @@
         throw new Error("只讀訊息模式需要選取 Messages/Line.sqlite。");
       }
 
+      if (lineFile.size > MAX_IN_MEMORY_SQLITE_BYTES) {
+        throw new Error(
+          "這個 Line.sqlite 為 " + formatBytes(lineFile.size) + "，超過瀏覽器目前的安全記憶體載入上限（" +
+          formatBytes(MAX_IN_MEMORY_SQLITE_BYTES) + "）。請改用 CLI／本機 helper；瀏覽器 20 GB+ 分頁讀取仍需 SQLite WASM VFS 實驗。"
+        );
+      }
+
       setStatus("正在載入 SQLite 資料庫…", false);
       var buffer = await lineFile.arrayBuffer();
       setProgress(35);
@@ -177,12 +351,18 @@
       setProgress(60);
 
       loadReferenceData();
+      await loadUnifiedGroupReference(SQL);
       setProgress(78);
       loadChats();
+      populateSearchFilters();
+      buildAttachmentContextIndex();
       setProgress(92);
       renderAttachmentPreview();
+      renderAttachmentCleanup();
       updateStats();
+      initializeBrowserInsights();
       el.workspace.classList.remove("hidden");
+      if (el.diffPanel) el.diffPanel.classList.remove("hidden");
       setRuntime("已載入", false);
       setStatus(
         sourceMode === "database"
@@ -198,6 +378,121 @@
       setProgress(0);
       console.error(error);
     }
+  }
+
+  async function loadReaderIndex() {
+    var manifestFile = state.files.find(function (file) { return /(?:^|\/)manifest\.json$/i.test(relativePath(file)); });
+    var conversationsFile = state.files.find(function (file) { return /(?:^|\/)conversations\.jsonl$/i.test(relativePath(file)); });
+    if (!manifestFile || !conversationsFile) {
+      throw new Error("大型索引缺少 manifest.json 或 conversations.jsonl；請先用 CLI index 產生完整索引。");
+    }
+    var manifest = JSON.parse(await manifestFile.text());
+    var conversationRows = parseJsonLines(await conversationsFile.text());
+    var participantsFile = findIndexFile("participants.jsonl");
+    state.indexParticipants = participantsFile ? parseJsonLines(await participantsFile.text()) : [];
+    state.indexMode = true;
+    state.indexManifest = manifest;
+    state.indexConversations = conversationRows;
+    state.chats = conversationRows.map(function (row) {
+      var legacyMemberTitle = stringOrEmpty(row.titleSource) === "members";
+      return {
+        pk: numberOrNull(row.chatPk),
+        id: stringOrEmpty(row.id),
+        type: stringOrEmpty(row.type) || "unknown",
+        title: legacyMemberTitle ? firstNonEmpty(row.id, "未命名聊天室") : firstNonEmpty(row.title, row.id, "未命名聊天室"),
+        titleSource: legacyMemberTitle ? "unresolved" : (stringOrEmpty(row.titleSource) || "unresolved"),
+        titleEvidence: Array.isArray(row.titleEvidence) ? row.titleEvidence : [],
+        messageCount: Number(row.messageCount || 0),
+        lastMessage: stringOrEmpty(row.lastMessage),
+        lastTimestamp: normalizeTimestamp(row.lastTimestamp)
+      };
+    });
+    populateSearchFilters();
+    state.attachmentFiles = [];
+    state.capabilities = manifest.capabilities || {
+      source: "CLI 大型索引",
+      sqlite_version: "由 CLI 產生",
+      json_functions: "not_needed",
+      fts5: manifest.search_sidecar ? "available" : "not_built",
+      window_functions: "not_needed",
+      dbstat: "not_needed",
+      read_only: true,
+      warnings: ["目前使用分片 JSONL；未在瀏覽器開啟原始 Line.sqlite。"]
+    };
+    state.health = manifest.health || {
+      status: "not_checked",
+      checks: { message_rows: manifest.message_rows, conversation_count: manifest.conversation_count, source_sha256: manifest.database_sha256 },
+      warnings: ["大型索引只驗證 manifest 與分片格式；SQLite integrity_check 請使用 CLI health。"]
+    };
+    updateStats();
+    renderCapabilitySummary();
+    renderHealthSummary();
+    renderSchemaExplorerEmpty("大型索引模式不直接開啟 SQLite Schema；請用 CLI schema 查詢原始資料庫。");
+    renderAttachmentPreview();
+    renderAttachmentCleanup();
+    if (el.globalSearchButton) el.globalSearchButton.disabled = false;
+    if (el.searchEngineBadge) el.searchEngineBadge.textContent = "JSONL 分片掃描";
+    if (el.globalSearchResults) el.globalSearchResults.innerHTML = '<span class="empty-state">輸入關鍵字後搜尋所有聊天室。</span>';
+    el.workspace.classList.remove("hidden");
+    if (el.diffPanel) el.diffPanel.classList.remove("hidden");
+    setRuntime("大型索引已載入", false);
+    setStatus("大型索引載入完成；瀏覽器只讀取 manifest、聊天室清單與目前聊天室分片。", false);
+    setProgress(100);
+    renderChatList();
+  }
+
+  function parseJsonLines(text) {
+    return String(text || "").split(/\r?\n/).map(function (line) { return line.trim(); }).filter(Boolean).map(function (line) {
+      return JSON.parse(line);
+    });
+  }
+
+  async function loadUnifiedGroupReference(SQL) {
+    state.unifiedGroupsById.clear();
+    if (state.sourceMode !== "folder") return;
+    var file = findFileEnding("/Messages/UnifiedGroup.sqlite");
+    if (!file || file.size > MAX_IN_MEMORY_SQLITE_BYTES) return;
+    var companion = null;
+    try {
+      companion = new SQL.Database(new Uint8Array(await file.arrayBuffer()));
+      var statement = companion.prepare("SELECT ZID AS groupId, ZNAME AS name, ZTYPE AS groupType FROM ZUNIFIEDGROUP WHERE ZID IS NOT NULL AND ZNAME IS NOT NULL");
+      try {
+        while (statement.step()) {
+          var row = statement.getAsObject();
+          var groupId = stringOrEmpty(row.groupId);
+          var name = stringOrEmpty(row.name).trim();
+          if (groupId && name) state.unifiedGroupsById.set(groupId, { id: groupId, name: name, type: numberOrNull(row.groupType), source: "unified-group", sourceDatabase: "Messages/UnifiedGroup.sqlite", sourceTable: "ZUNIFIEDGROUP", sourceColumn: "ZNAME", confidence: "exact" });
+        }
+      } finally {
+        statement.free();
+      }
+    } catch (error) {
+      console.warn("UnifiedGroup.sqlite 讀取失敗", error);
+    } finally {
+      if (companion) companion.close();
+    }
+  }
+
+  function findIndexFile(path) {
+    var normalized = String(path || "").replace(/^\.?\//, "");
+    return state.files.find(function (file) {
+      var candidate = relativePath(file).replace(/^\.?\//, "");
+      return candidate === normalized || candidate.endsWith("/" + normalized);
+    }) || null;
+  }
+
+  function indexShardFiles(chatPk) {
+    var configured = state.indexManifest && Array.isArray(state.indexManifest.chat_shards) ? state.indexManifest.chat_shards.filter(function (shard) {
+      return numberOrNull(shard.chat_pk) === numberOrNull(chatPk);
+    }) : [];
+    if (configured.length) {
+      return configured.map(function (shard) { return findIndexFile(shard.path); }).filter(Boolean);
+    }
+    var prefix = "messages/chat-" + (chatPk === null || chatPk === undefined ? "unknown" : chatPk) + "-";
+    return state.files.filter(function (file) {
+      var path = relativePath(file).replace(/^.*?\//, "");
+      return path.indexOf(prefix) === 0 && path.endsWith(".jsonl");
+    }).sort(function (left, right) { return relativePath(left).localeCompare(relativePath(right)); });
   }
 
   function inferRoot(files) {
@@ -233,8 +528,8 @@
     state.users.clear();
     state.groupsById.clear();
     state.groupsByPk.clear();
+    state.unifiedGroupsById.clear();
     state.groupNamesByChatPk.clear();
-    state.groupMemberNamesByChatPk.clear();
 
     safeQuery("SELECT Z_PK, ZMID, ZNAME, ZADDRESSBOOKNAME, ZCUSTOMNAME, ZSTATUSMESSAGE FROM ZUSER", {}).forEach(function (row) {
       var user = {
@@ -268,11 +563,6 @@
   }
 
   function loadGroupTitleData() {
-    safeQuery("SELECT ZCHAT AS chatPk, ZMEMBERDATA AS memberData FROM ZCHATMETADATA WHERE ZMEMBERDATA IS NOT NULL", {}).forEach(function (row) {
-      var names = extractMemberNames(row.memberData);
-      if (names.length) state.groupMemberNamesByChatPk.set(Number(row.chatPk), names);
-    });
-
     safeQuery(
       "SELECT m.ZCHAT AS chatPk, m.Z_PK AS messagePk, m.ZTIMESTAMP AS timestamp, m.ZTEXT AS text " +
       "FROM ZMESSAGE m JOIN ZCHAT c ON c.Z_PK = m.ZCHAT " +
@@ -281,20 +571,8 @@
       {}
     ).forEach(function (row) {
       var name = extractGroupNameFromSystemText(row.text);
-      if (name) state.groupNamesByChatPk.set(Number(row.chatPk), { name: name, source: "rename" });
+      if (name) state.groupNamesByChatPk.set(Number(row.chatPk), { name: name, source: "rename", messagePk: numberOrNull(row.messagePk), sourceDatabase: "Messages/Line.sqlite", sourceTable: "ZMESSAGE", sourceColumn: "ZTEXT", confidence: "inferred" });
     });
-  }
-
-  function extractMemberNames(blob) {
-    var bytes = toUint8Array(blob);
-    if (!bytes || bytes.length < 16) return [];
-    var names = [];
-    for (var offset = 0; offset + 16 <= bytes.length; offset += 16) {
-      var user = state.users.get("u" + bytesToHex(bytes, offset, 16));
-      if (!user || !user.name || names.indexOf(user.name) !== -1) continue;
-      names.push(user.name);
-    }
-    return names;
   }
 
   function extractGroupNameFromSystemText(value) {
@@ -329,6 +607,7 @@
         type: titleInfo.type,
         title: titleInfo.title,
         titleSource: titleInfo.source,
+        titleEvidence: titleInfo.evidence || [],
         messageCount: Number(row.messageCount || 0),
         lastMessage: stringOrEmpty(row.lastMessage),
         lastTimestamp: normalizeTimestamp(row.lastMessageTimestamp || row.lastUpdated)
@@ -336,23 +615,138 @@
     });
   }
 
+  function populateSearchFilters() {
+    if (el.globalSearchChatSelect) {
+      el.globalSearchChatSelect.innerHTML = '<option value="">全部聊天室</option>' + state.chats.slice().sort(function (left, right) { return left.title.localeCompare(right.title); }).map(function (chat) {
+        return '<option value="' + escapeHtml(String(chat.pk)) + '">' + escapeHtml(chat.title) + '</option>';
+      }).join("");
+    }
+    if (el.globalSearchSenderSelect) {
+      var usersByPk = new Map();
+      Array.from(state.users.values()).forEach(function (user) { if (user && user.pk !== null && user.pk !== undefined) usersByPk.set(String(user.pk), user); });
+      (state.indexParticipants || []).forEach(function (user) { if (user && user.pk !== null && user.pk !== undefined) usersByPk.set(String(user.pk), user); });
+      var users = Array.from(usersByPk.values()).sort(function (left, right) { return String(left.name || "").localeCompare(String(right.name || "")); });
+      el.globalSearchSenderSelect.innerHTML = '<option value="">全部傳送者</option>' + users.map(function (user) {
+        return '<option value="' + escapeHtml(String(user.pk)) + '">' + escapeHtml(user.name || user.id || "未知使用者") + '</option>';
+      }).join("");
+    }
+    if (el.globalSearchContentType) {
+      var types = state.indexMode ? [{ value: 0, label: "一般文字／訊息" }, { value: 7, label: "貼圖／媒體" }, { value: 18, label: "系統訊息" }, { value: 96, label: "通話" }] : safeQuery("SELECT DISTINCT ZCONTENTTYPE AS value FROM ZMESSAGE WHERE ZCONTENTTYPE IS NOT NULL ORDER BY ZCONTENTTYPE", {}).map(function (row) { return { value: Number(row.value), label: "contentType " + row.value }; });
+      el.globalSearchContentType.innerHTML = '<option value="">全部種類</option>' + types.map(function (type) { return '<option value="' + escapeHtml(String(type.value)) + '">' + escapeHtml(type.label) + '</option>'; }).join("");
+    }
+  }
+
+  function buildAttachmentContextIndex() {
+    state.attachmentContextByPath = new Map();
+    if (state.sourceMode === "database" || !state.attachmentFiles.length || !state.database) return;
+
+    var messageIds = Array.from(new Set(state.attachmentFiles.map(attachmentMessageId).filter(Boolean)));
+    var messagesById = new Map();
+    var batchSize = 200;
+    for (var start = 0; start < messageIds.length; start += batchSize) {
+      var batch = messageIds.slice(start, start + batchSize);
+      var placeholders = batch.map(function (_value, index) { return "$attachmentId" + index; });
+      var params = {};
+      batch.forEach(function (value, index) { params["$attachmentId" + index] = value; });
+      safeQuery(
+        "SELECT m.ZID AS messageId, m.Z_PK AS messagePk, m.ZCHAT AS chatPk, " +
+        "m.ZSENDER AS senderPk, m.ZTIMESTAMP AS timestamp, m.ZSENDSTATUS AS sendStatus, " +
+        "m.ZCONTENTTYPE AS contentType, m.ZMESSAGETYPE AS messageType, m.ZTEXT AS text " +
+        "FROM ZMESSAGE m WHERE m.ZID IN (" + placeholders.join(",") + ")",
+        params
+      ).forEach(function (row) {
+        messagesById.set(stringOrEmpty(row.messageId), row);
+      });
+    }
+
+    var chatsByPk = new Map(state.chats.map(function (chat) { return [Number(chat.pk), chat]; }));
+    state.attachmentFiles.forEach(function (file) {
+      var path = relativePath(file);
+      var messageId = attachmentMessageId(file);
+      var row = messageId ? messagesById.get(messageId) : null;
+      var chat = row ? chatsByPk.get(Number(row.chatPk)) : null;
+      var sender = row ? state.users.get("pk:" + numberOrNull(row.senderPk)) : null;
+      var text = row ? stringOrEmpty(row.text).trim() : "";
+      var kind = row ? messageKind(row.contentType, row.messageType, text) : "";
+      var isSelf = Boolean(
+        sender && state.selfId && sender.id === state.selfId ||
+        row && Number(row.sendStatus) === 1
+      );
+      var scope = chat ? chat.type : "orphan";
+      if (scope === "direct") scope = "individual";
+      var context = {
+        messageId: messageId,
+        messagePk: row ? numberOrNull(row.messagePk) : null,
+        chatPk: chat ? chat.pk : null,
+        chatId: chat ? chat.id : "",
+        chatTitle: chat ? chat.title : "SQLite 未找到對應聊天室",
+        scope: scope,
+        relation: row ? "SQLite 訊息 ID 對應" : "SQLite 未引用／孤兒檔案",
+        sender: sender ? sender.name : (row ? "未知使用者" : "—"),
+        direction: row ? (isSelf ? "傳送" : "接收／其他") : "—",
+        timestamp: row ? normalizeTimestamp(row.timestamp) : null,
+        context: text || (kind ? "[" + kind + "]" : "沒有可用訊息文字"),
+        kind: kind,
+        status: row ? "exact" : "unlinked"
+      };
+      state.attachmentContextByPath.set(path, context);
+    });
+  }
+
+  function attachmentMessageId(file) {
+    var archivePath = archiveRelativePath(file);
+    var basename = fileNameOf(archivePath);
+    var match = basename.match(/^(\d{8,})(?:[_.-]|$)/);
+    if (match) return match[1];
+    match = archivePath.match(/(?:^|\/)(\d{8,})(?:[_.-]|\/|$)/);
+    return match ? match[1] : "";
+  }
+
+  function attachmentContext(file) {
+    return state.attachmentContextByPath.get(relativePath(file)) || {
+      messageId: attachmentMessageId(file),
+      messagePk: null,
+      chatPk: null,
+      chatId: "",
+      chatTitle: "SQLite 未找到對應聊天室",
+      scope: "orphan",
+      relation: "SQLite 未引用／孤兒檔案",
+      sender: "—",
+      direction: "—",
+      timestamp: null,
+      context: "沒有可用訊息脈絡",
+      kind: "",
+      status: "unlinked"
+    };
+  }
+
+  function attachmentScopeLabel(scope) {
+    return {
+      individual: "個人聊天室",
+      direct: "個人聊天室",
+      group: "群組聊天室",
+      community: "社群",
+      orphan: "孤兒檔案"
+    }[scope] || "未知分類";
+  }
+
   function resolveChatTitle(chatId, chatType, chatPk) {
     var id = stringOrEmpty(chatId);
     var normalizedType = Number(chatType);
     var group = state.groupsById.get(id);
+    var unifiedGroup = state.unifiedGroupsById.get(id);
     var user = state.users.get(id);
-    if (user && normalizedType === 0) return { title: user.name, type: "direct", source: "user" };
+    if (user && normalizedType === 0) return { title: user.name, type: "direct", source: "user", evidence: [{ sourceDatabase: "Messages/Line.sqlite", sourceTable: "ZUSER", sourceColumn: "ZCUSTOMNAME/ZADDRESSBOOKNAME/ZNAME", sourcePk: user.pk, confidence: "exact" }] };
+
+    if (unifiedGroup && normalizedType !== 0) return { title: unifiedGroup.name, type: chatTypeLabel(normalizedType), source: "unified-group", evidence: [{ sourceDatabase: unifiedGroup.sourceDatabase, sourceTable: unifiedGroup.sourceTable, sourceColumn: unifiedGroup.sourceColumn, confidence: unifiedGroup.confidence }] };
+
+    if (group) return { title: group.name, type: "group", source: "group", evidence: [{ sourceDatabase: "Messages/Line.sqlite", sourceTable: "ZGROUP", sourceColumn: "ZNAME", sourcePk: group.pk, confidence: "exact" }] };
 
     var groupName = state.groupNamesByChatPk.get(Number(chatPk));
-    if (groupName) return { title: groupName.name, type: chatTypeLabel(normalizedType), source: groupName.source };
-    if (group) return { title: group.name, type: "group", source: "group" };
+    if (groupName) return { title: groupName.name, type: chatTypeLabel(normalizedType), source: groupName.source, evidence: [{ sourceDatabase: groupName.sourceDatabase, sourceTable: groupName.sourceTable, sourceColumn: groupName.sourceColumn, sourcePk: groupName.messagePk, confidence: groupName.confidence }] };
 
-    var memberNames = state.groupMemberNamesByChatPk.get(Number(chatPk)) || [];
-    if (memberNames.length && normalizedType !== 0) {
-      return { title: formatMemberTitle(memberNames), type: chatTypeLabel(normalizedType), source: "members" };
-    }
-    if (user) return { title: user.name, type: "direct", source: "user" };
-    return { title: normalizedType === 0 ? "未命名聊天室" : "未命名群組", type: chatTypeLabel(normalizedType), source: "unresolved" };
+    if (user) return { title: user.name, type: "direct", source: "user", evidence: [{ sourceDatabase: "Messages/Line.sqlite", sourceTable: "ZUSER", sourceColumn: "ZCUSTOMNAME/ZADDRESSBOOKNAME/ZNAME", sourcePk: user.pk, confidence: "exact" }] };
+    return { title: id || (normalizedType === 0 ? "未命名聊天室" : "未命名群組"), type: chatTypeLabel(normalizedType), source: "unresolved", evidence: [{ sourceDatabase: "Messages/Line.sqlite", sourceTable: "ZCHAT", sourceColumn: "ZMID", sourcePk: numberOrNull(chatPk), confidence: "unresolved" }] };
   }
 
   function renderChatList() {
@@ -426,28 +820,120 @@
     state.currentChat = chat;
     state.currentMessages = [];
     state.currentOffset = 0;
+    state.currentAfterTimestamp = 0;
+    state.currentAfterPk = 0;
     el.selectedChatTitle.textContent = chat.title;
     el.selectedChatMeta.textContent = typeLabel(chat.type) + " · " + formatNumber(chat.messageCount) + " 則訊息 · 名稱來源：" + titleSourceLabel(chat.titleSource) + " · " + (chat.id || "無 ID");
+    renderChatEvidence(chat);
     el.exportHtmlButton.disabled = false;
     el.exportJsonButton.disabled = false;
+    el.runTimelineButton.disabled = false;
     renderChatList();
-    loadMoreMessages();
+    if (state.indexMode) loadIndexChatMessages(chat);
+    else loadMoreMessages();
+  }
+
+  function renderChatEvidence(chat) {
+    if (!el.selectedChatEvidence) return;
+    var evidence = Array.isArray(chat && chat.titleEvidence) ? chat.titleEvidence : [];
+    if (!evidence.length) {
+      el.selectedChatEvidence.innerHTML = '<details><summary>為什麼是這個聊天室名稱？</summary><p class="muted">目前沒有可追溯的 SQLite 名稱證據；已保留原始 ID，未使用成員資料猜測。</p></details>';
+      return;
+    }
+    el.selectedChatEvidence.innerHTML = '<details><summary>查看名稱來源證據</summary><ul>' + evidence.map(function (item) {
+      return '<li>' + escapeHtml([item.sourceDatabase, item.sourceTable, item.sourceColumn].filter(Boolean).join(" · ") || "SQLite 證據") + (item.sourcePk !== undefined && item.sourcePk !== null ? ' · PK ' + escapeHtml(String(item.sourcePk)) : '') + ' · ' + escapeHtml(item.confidence || "unknown") + '</li>';
+    }).join("") + '</ul></details>';
+  }
+
+  async function loadIndexChatMessages(chat) {
+    var files = indexShardFiles(chat.pk);
+    state.currentMessages = [];
+    state.currentOffset = 0;
+    if (!files.length) {
+      renderMessages();
+      el.loadMoreButton.classList.add("hidden");
+      return;
+    }
+    el.messageStatus.textContent = "正在讀取大型索引分片…";
+    try {
+      for (var index = 0; index < files.length; index += 1) {
+        var rows = parseJsonLines(await files[index].text());
+        state.currentMessages = state.currentMessages.concat(rows.map(mapIndexMessage));
+        await new Promise(function (resolve) { window.setTimeout(resolve, 0); });
+      }
+      state.currentOffset = state.currentMessages.length;
+      renderMessages();
+      el.loadMoreButton.classList.add("hidden");
+    } catch (error) {
+      el.messageStatus.textContent = "索引分片讀取失敗：" + (error && error.message ? error.message : String(error));
+      el.messageStatus.classList.add("error");
+    }
+  }
+
+  function mapIndexMessage(row) {
+    var text = stringOrEmpty(row.text);
+    var timestamp = normalizeTimestamp(row.timestamp_raw);
+    return {
+      pk: numberOrNull(row.pk),
+      id: stringOrEmpty(row.id),
+      timestampRaw: row.timestamp_raw,
+      timestamp: timestamp,
+      senderId: stringOrEmpty(row.sender_pk),
+      sender: firstNonEmpty(row.sender_name, "未知使用者"),
+      isSelf: Boolean(row.is_self),
+      isSystem: false,
+      sendStatus: numberOrNull(row.send_status),
+      contentType: row.content_type,
+      messageType: stringOrEmpty(row.message_type),
+      kind: text ? "text" : messageKind(row.content_type, row.message_type, text),
+      call: null,
+      text: text,
+      latitude: numberOrNull(row.latitude),
+      longitude: numberOrNull(row.longitude),
+      thumbnail: null,
+      linkPreviews: [],
+      attachmentHints: [],
+      attachments: [],
+      provenance: {
+        sourceMode: "index",
+        sourceShard: row.source_shard || "",
+        sourceTable: "ZMESSAGE",
+        sourcePk: numberOrNull(row.pk),
+        confidence: "exact"
+      }
+    };
   }
 
   function loadMoreMessages() {
     if (!state.currentChat) return;
+    if (state.indexMode) {
+      loadIndexChatMessages(state.currentChat);
+      return;
+    }
     var rows = safeQuery(
       "SELECT m.Z_PK AS messagePk, m.ZID AS messageId, m.ZTIMESTAMP AS timestamp, " +
       "m.ZSENDER AS senderPk, m.ZSENDSTATUS AS sendStatus, m.ZCONTENTTYPE AS contentType, m.ZTEXT AS text, " +
       "m.ZMESSAGETYPE AS messageType, m.ZLATITUDE AS latitude, m.ZLONGITUDE AS longitude, " +
-      "m.ZCONTENTMETADATA AS contentMetadata, m.ZTHUMBNAIL AS thumbnail " +
+      "m.ZCONTENTMETADATA AS contentMetadata, m.ZTHUMBNAIL AS thumbnail, m.ZCHAT AS chatPk " +
       "FROM ZMESSAGE m WHERE m.ZCHAT = $chatPk " +
-      "ORDER BY COALESCE(m.ZTIMESTAMP, 0) ASC, m.Z_PK ASC LIMIT $limit OFFSET $offset",
-      { $chatPk: state.currentChat.pk, $limit: MESSAGE_PAGE_SIZE, $offset: state.currentOffset }
+      "AND (COALESCE(m.ZTIMESTAMP, 0) > $afterTimestamp OR " +
+      "(COALESCE(m.ZTIMESTAMP, 0) = $afterTimestamp AND m.Z_PK > $afterPk)) " +
+      "ORDER BY COALESCE(m.ZTIMESTAMP, 0) ASC, m.Z_PK ASC LIMIT $limit",
+      {
+        $chatPk: state.currentChat.pk,
+        $limit: MESSAGE_PAGE_SIZE,
+        $afterTimestamp: state.currentAfterTimestamp,
+        $afterPk: state.currentAfterPk
+      }
     );
     var mapped = rows.map(mapMessage);
     state.currentMessages = state.currentMessages.concat(mapped);
     state.currentOffset += mapped.length;
+    if (mapped.length) {
+      var lastMessage = mapped[mapped.length - 1];
+      state.currentAfterTimestamp = Number(lastMessage.timestampRaw) || 0;
+      state.currentAfterPk = Number(lastMessage.pk) || state.currentAfterPk;
+    }
     renderMessages();
     el.loadMoreButton.classList.toggle("hidden", state.currentOffset >= state.currentChat.messageCount || mapped.length === 0);
   }
@@ -487,7 +973,16 @@
       thumbnail: toUint8Array(row.thumbnail),
       linkPreviews: linkPreviews,
       attachmentHints: attachmentHints,
-      attachments: resolveAttachments(row.contentMetadata, messageId, attachmentHints)
+      attachments: resolveAttachments(row.contentMetadata, messageId, attachmentHints),
+      provenance: {
+        sourceMode: state.sourceMode,
+        sourceDatabase: state.sourceMode === "database" ? "Messages/Line.sqlite" : "Messages/Line.sqlite",
+        sourceTable: "ZMESSAGE",
+        sourcePk: numberOrNull(row.messagePk),
+        sourceId: messageId,
+        chatPk: numberOrNull(row.chatPk),
+        confidence: "exact"
+      }
     };
   }
 
@@ -561,6 +1056,11 @@
       el.attachmentPreview.innerHTML = '<div class="empty-state">目前是只讀訊息模式；如需附件索引與下載連結，請切換為完整 LINE 備份。</div>';
       return;
     }
+    if (state.sourceMode === "index") {
+      el.exportAttachmentsButton.disabled = true;
+      el.attachmentPreview.innerHTML = '<div class="empty-state">大型索引只包含訊息分片，沒有複製附件；如需附件預覽與瘦身，請載入完整 LINE 備份資料夾。</div>';
+      return;
+    }
     el.exportAttachmentsButton.disabled = state.attachmentFiles.length === 0;
     if (!state.attachmentFiles.length) {
       el.attachmentPreview.innerHTML = '<div class="empty-state">沒有偵測到 Message Attachments 或 Message Thumbnails。</div>';
@@ -573,6 +1073,915 @@
       ? '<p class="muted">目前顯示前 ' + MAX_ATTACHMENT_PREVIEW + ' 筆，完整清單可匯出附件清單。</p>'
       : "";
     el.attachmentPreview.innerHTML = '<table class="attachment-table"><thead><tr><th>來源路徑</th><th>大小</th><th>MIME</th></tr></thead><tbody>' + rows + '</tbody></table>' + more;
+  }
+
+  function getFilteredAttachmentFiles() {
+    var search = state.attachmentCleanupSearch;
+    var filtered = state.attachmentFiles.filter(function (file) {
+      var context = attachmentContext(file);
+      if (state.attachmentCategoryFilter !== "all" && context.scope !== state.attachmentCategoryFilter) return false;
+      if (!search) return true;
+      var haystack = [
+        relativePath(file),
+        context.chatTitle,
+        context.sender,
+        context.context,
+        attachmentScopeLabel(context.scope)
+      ].join(" ").toLowerCase();
+      return haystack.indexOf(search) !== -1;
+    });
+    return filtered.sort(compareAttachmentFiles);
+  }
+
+  function compareAttachmentFiles(left, right) {
+    var leftContext = attachmentContext(left);
+    var rightContext = attachmentContext(right);
+    if (state.attachmentSort === "size") {
+      var sizeDifference = (Number(right.size) || 0) - (Number(left.size) || 0);
+      if (sizeDifference) return sizeDifference;
+    } else if (state.attachmentSort === "path") {
+      return archiveRelativePath(left).localeCompare(archiveRelativePath(right));
+    } else {
+      var leftTime = leftContext.timestamp ? leftContext.timestamp.getTime() : -Infinity;
+      var rightTime = rightContext.timestamp ? rightContext.timestamp.getTime() : -Infinity;
+      var timeDifference = state.attachmentSort === "oldest" ? leftTime - rightTime : rightTime - leftTime;
+      if (timeDifference) return timeDifference;
+    }
+    return archiveRelativePath(left).localeCompare(archiveRelativePath(right));
+  }
+
+  function getAttachmentCleanupTotalPages() {
+    return Math.max(1, Math.ceil(getFilteredAttachmentFiles().length / ATTACHMENT_CLEANUP_PAGE_SIZE));
+  }
+
+  function archiveRelativePath(file) {
+    var path = relativePath(file);
+    var root = state.sourceMode === "folder" ? state.sourceRoot : "";
+    if (root && path.indexOf(root + "/") === 0) return path.slice(root.length + 1);
+    return path;
+  }
+
+  function attachmentCategory(path) {
+    return /\/Message Thumbnails\//.test(path) ? "縮圖" : "原始附件";
+  }
+
+  function setCleanupPackageStatus(text, isError) {
+    if (!el.cleanupPackageStatus) return;
+    el.cleanupPackageStatus.textContent = text;
+    el.cleanupPackageStatus.classList.toggle("error", Boolean(isError));
+  }
+
+  function renderAttachmentCategorySummary() {
+    if (!el.attachmentCategorySummary) return;
+    var categories = [
+      { key: "all", label: "全部檔案" },
+      { key: "individual", label: "個人聊天室" },
+      { key: "group", label: "群組聊天室" },
+      { key: "community", label: "社群" },
+      { key: "orphan", label: "孤兒檔案" }
+    ];
+    var totals = new Map(categories.map(function (category) {
+      return [category.key, { count: 0, bytes: 0 }];
+    }));
+    state.attachmentFiles.forEach(function (file) {
+      var context = attachmentContext(file);
+      var record = totals.get(context.scope) || totals.get("orphan");
+      record.count += 1;
+      record.bytes += Number(file.size) || 0;
+      totals.get("all").count += 1;
+      totals.get("all").bytes += Number(file.size) || 0;
+    });
+    el.attachmentCategorySummary.innerHTML = categories.map(function (category) {
+      var total = totals.get(category.key);
+      var active = state.attachmentCategoryFilter === category.key ? " active" : "";
+      return '<button type="button" class="attachment-category-card' + active + '" data-attachment-category="' + category.key + '" aria-pressed="' + (active ? "true" : "false") + '"><strong>' + escapeHtml(category.label) + '</strong><span>' + formatNumber(total.count) + ' 個 · ' + formatBytes(total.bytes) + '</span></button>';
+    }).join("");
+  }
+
+  function getAttachmentPreviewUrl(file) {
+    var path = relativePath(file);
+    if (!isImageAttachment({ name: file.name, mime: file.type })) return "";
+    if (!state.attachmentPreviewUrls.has(path)) {
+      state.attachmentPreviewUrls.set(path, URL.createObjectURL(file));
+    }
+    return state.attachmentPreviewUrls.get(path);
+  }
+
+  function attachmentPreviewHtml(file) {
+    var url = getAttachmentPreviewUrl(file);
+    if (url) {
+      return '<img src="' + escapeHtml(url) + '" alt="" loading="lazy" decoding="async">';
+    }
+    var icon = /video|mp4|mov/i.test(file.type || file.name) ? "🎞️" : (/audio|mp3|m4a|caf/i.test(file.type || file.name) ? "🎵" : "📄");
+    return '<span class="attachment-preview-placeholder" aria-hidden="true">' + icon + '</span>';
+  }
+
+  function renderAttachmentCleanup() {
+    var databaseOnly = state.sourceMode === "database";
+    var indexOnly = state.sourceMode === "index";
+    var hasFiles = !databaseOnly && state.attachmentFiles.length > 0;
+    var filtered = getFilteredAttachmentFiles();
+    var totalPages = getAttachmentCleanupTotalPages();
+    state.attachmentCleanupPage = Math.min(state.attachmentCleanupPage, totalPages);
+    var start = (state.attachmentCleanupPage - 1) * ATTACHMENT_CLEANUP_PAGE_SIZE;
+    var pageFiles = filtered.slice(start, start + ATTACHMENT_CLEANUP_PAGE_SIZE);
+
+    renderAttachmentCategorySummary();
+    if (databaseOnly) {
+      el.attachmentCleanupList.innerHTML = '<div class="empty-state">只讀訊息模式沒有載入附件檔案；請切換為完整 LINE 備份後使用附件瘦身。</div>';
+    } else if (indexOnly) {
+      el.attachmentCleanupList.innerHTML = '<div class="empty-state">大型索引不複製附件檔案；請載入完整 LINE 備份資料夾後使用附件瘦身。</div>';
+    } else if (!hasFiles) {
+      el.attachmentCleanupList.innerHTML = '<div class="empty-state">沒有可供瘦身的附件或縮圖。</div>';
+    } else if (!filtered.length) {
+      el.attachmentCleanupList.innerHTML = '<div class="empty-state">找不到符合搜尋條件的附件。</div>';
+    } else {
+      var rows = pageFiles.map(function (file) {
+        var path = relativePath(file);
+        var archivePath = archiveRelativePath(file);
+        var context = attachmentContext(file);
+        var checked = state.attachmentsMarkedForRemoval.has(path) ? " checked" : "";
+        var timestamp = context.timestamp ? formatDate(context.timestamp, true) : "沒有時間";
+        var contextLine = context.chatTitle + " · " + context.direction + " · " + timestamp;
+        var evidence = '<details class="attachment-evidence"><summary>查看 SQLite 證據</summary><small>' + escapeHtml(context.relation + "；messageId=" + (context.messageId || "無") + "；messagePk=" + (context.messagePk === null ? "無" : context.messagePk) + "；chatPk=" + (context.chatPk === null ? "無" : context.chatPk) + "；confidence=" + context.status) + '</small></details>';
+        return '<label class="attachment-cleanup-row"><input type="checkbox" data-attachment-path="' + escapeHtml(path) + '"' + checked + '><span class="attachment-cleanup-thumb">' + attachmentPreviewHtml(file) + '</span><span class="attachment-cleanup-main"><span class="file-name">' + escapeHtml(archivePath) + '</span><span class="attachment-badges"><small class="attachment-scope-badge ' + escapeHtml(context.scope) + '">' + escapeHtml(attachmentScopeLabel(context.scope)) + '</small><small>' + escapeHtml(attachmentCategory(archivePath) + " · " + (file.type || "未知")) + '</small></span><small class="attachment-context-line">' + escapeHtml(contextLine) + '</small><small class="attachment-relation-line">' + escapeHtml(context.relation + " · confidence: " + context.status + " · " + context.context.slice(0, 160)) + '</small>' + evidence + '</span><span class="attachment-cleanup-size">' + escapeHtml(formatBytes(file.size)) + '</span></label>';
+      }).join("");
+      el.attachmentCleanupList.innerHTML = rows;
+    }
+
+    var markedFiles = getMarkedAttachmentFiles();
+    var markedSize = markedFiles.reduce(function (sum, file) { return sum + (Number(file.size) || 0); }, 0);
+    el.markedAttachmentCount.textContent = formatNumber(markedFiles.length);
+    el.markedAttachmentSize.textContent = formatBytes(markedSize);
+    el.attachmentPageInfo.textContent = hasFiles ? "第 " + state.attachmentCleanupPage + " / " + totalPages + " 頁" : "第 1 頁";
+    el.attachmentPrevButton.disabled = !hasFiles || state.attachmentCleanupPage <= 1;
+    el.attachmentNextButton.disabled = !hasFiles || state.attachmentCleanupPage >= totalPages;
+    el.markFilteredAttachmentsButton.disabled = !hasFiles || filtered.length === 0;
+    el.keepAllAttachmentsButton.disabled = !hasFiles || markedFiles.length === 0;
+    el.clearAttachmentSelectionButton.disabled = !hasFiles || markedFiles.length === 0;
+    el.exportCleanupPlanButton.disabled = !hasFiles;
+    el.exportCleanupTextButton.disabled = !hasFiles;
+    el.buildImazingCandidateButton.disabled = !hasFiles || packageInProgress;
+  }
+
+  function getMarkedAttachmentFiles() {
+    return state.attachmentFiles.filter(function (file) {
+      return state.attachmentsMarkedForRemoval.has(relativePath(file));
+    });
+  }
+
+  function buildAttachmentCleanupPlan() {
+    var markedFiles = getMarkedAttachmentFiles();
+    var markedSize = markedFiles.reduce(function (sum, file) { return sum + (Number(file.size) || 0); }, 0);
+    var lineFile = state.sourceMode === "folder" ? findFileEnding("/Messages/Line.sqlite") : state.files[0];
+    return {
+      schemaVersion: "0.1",
+      planType: "line-attachment-cleanup",
+      generatedAt: new Date().toISOString(),
+      source: {
+        mode: state.sourceMode,
+        selectedRoot: state.sourceRoot,
+        totalFiles: state.files.length,
+        totalBytes: state.sourceSize,
+        lineSqlitePath: lineFile ? archiveRelativePath(lineFile) : "",
+        lineSqliteLastModified: lineFile && lineFile.lastModified ? new Date(lineFile.lastModified).toISOString() : null
+      },
+      policy: {
+        originalFilesAreUntouched: true,
+        keepAllFilesNotListed: true,
+        estimatedReleaseBytes: markedSize,
+        estimatedRemainingBytes: Math.max(0, state.sourceSize - markedSize),
+        hashStatus: "未計算；此階段只輸出操作計畫"
+      },
+      markedForRemoval: markedFiles.map(function (file) {
+        var context = attachmentContext(file);
+        return {
+          path: archiveRelativePath(file),
+          category: attachmentCategory(archiveRelativePath(file)),
+          scope: context.scope,
+          scopeLabel: attachmentScopeLabel(context.scope),
+          relation: context.relation,
+          chatTitle: context.chatTitle,
+          messageId: context.messageId,
+          messageTimestamp: context.timestamp ? context.timestamp.toISOString() : null,
+          direction: context.direction,
+          context: context.context,
+          size: Number(file.size) || 0,
+          mime: file.type || "",
+          lastModified: file.lastModified ? new Date(file.lastModified).toISOString() : null
+        };
+      }),
+      warnings: [
+        "這不是已驗證可直接還原的 .imazingapp；請在副本上執行。",
+        "請保留 Container、Messages/Line.sqlite 與所有未列出的檔案。",
+        "刪除原始附件可能使 LINE 聊天中的媒體無法開啟；刪除縮圖通常只會移除預覽圖。",
+        "個人／群組／社群分類來自 SQLite 訊息與聊天室關聯；孤兒檔案未找到可靠訊息關聯，請人工確認後再處理。",
+        "瀏覽器無法保證保留或設定 macOS 檔案的 creation time；SQLite 內的訊息時間不會由本計畫改寫。"
+      ]
+    };
+  }
+
+  function exportAttachmentCleanupPlan() {
+    if (!state.attachmentFiles.length) return;
+    var plan = buildAttachmentCleanupPlan();
+    downloadText("line-attachment-cleanup-plan.json", JSON.stringify(plan, null, 2), "application/json;charset=utf-8");
+  }
+
+  function exportAttachmentCleanupInstructions() {
+    if (!state.attachmentFiles.length) return;
+    var plan = buildAttachmentCleanupPlan();
+    var lines = [
+      "LINE 附件瘦身操作說明",
+      "====================",
+      "產生時間：" + plan.generatedAt,
+      "來源根目錄：" + (plan.source.selectedRoot || "（單檔模式）"),
+      "標記移除：" + formatNumber(plan.markedForRemoval.length) + " 個檔案",
+      "預估釋放：" + formatBytes(plan.policy.estimatedReleaseBytes),
+      "",
+      "安全操作順序：",
+      "1. 保留原始 LINE.imazingapp，不要直接覆寫。",
+      "2. 複製一份工作副本，再將副本副檔名改成 .zip。",
+      "3. 使用支援原地編輯壓縮檔的工具，依下方路徑移除檔案。不要把整個封存檔解壓後重新壓縮。",
+      "4. 確認 Container、Messages/Line.sqlite 與未列出的檔案都保留。",
+      "5. 將工作副本改回 .imazingapp；在 iMazing 的 Manage Apps > Restore App Data 中先做 dry-run。",
+      "6. 只有在確認 iMazing 接受檔案後，才考慮於測試裝置還原；原始檔仍須保留。",
+      "",
+      "標記移除的檔案："
+    ];
+    if (!plan.markedForRemoval.length) lines.push("（目前沒有標記，所有檔案都應保留）");
+    plan.markedForRemoval.forEach(function (entry) {
+      lines.push("- " + entry.path + " · " + entry.scopeLabel + " · " + entry.chatTitle + " · " + (entry.messageTimestamp || "無時間") + " · " + entry.category + " · " + formatBytes(entry.size));
+    });
+    lines.push("", "注意：這份清單不會改寫 SQLite，也不能承諾保留 macOS creation time；LINE 訊息時間來自 SQLite。");
+    downloadText("line-attachment-cleanup-instructions.txt", lines.join("\n"), "text/plain;charset=utf-8");
+  }
+
+  function getCandidateBackupFiles() {
+    return state.files.filter(function (file) {
+      var path = archiveRelativePath(file);
+      return path === ".lock" || path === "iTunesArtwork" || path === "iTunesMetadata.plist" || path.indexOf("Container/") === 0 || path.indexOf("Payload/") === 0;
+    });
+  }
+
+  function safeArchivePath(path) {
+    return String(path || "").replace(/\\/g, "/").split("/").filter(function (part) {
+      return part && part !== "." && part !== "..";
+    }).join("/");
+  }
+
+  function candidateFilename() {
+    return "LINE-slimmed-" + new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z") + ".imazingapp.candidate";
+  }
+
+  async function openCandidateOutput(filename) {
+    if (typeof window.showSaveFilePicker === "function") {
+      var handle = await window.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: "iMazing 候選封裝", accept: { "application/octet-stream": [".imazingapp.candidate", ".imazingapp"] } }]
+      });
+      return { writable: await handle.createWritable(), chunks: [], bytes: 0, pending: Promise.resolve(), error: null, closed: false };
+    }
+    return { writable: null, chunks: [], bytes: 0, pending: Promise.resolve(), error: null, closed: false };
+  }
+
+  function queueCandidateChunk(output, chunk) {
+    if (!chunk || !chunk.length) return;
+    output.bytes += chunk.length;
+    if (output.writable) {
+      output.pending = output.pending.then(function () { return output.writable.write(chunk); });
+    } else {
+      output.chunks.push(chunk);
+    }
+  }
+
+  async function flushCandidateOutput(output) {
+    await output.pending;
+    if (output.error) throw output.error;
+  }
+
+  function updateCandidateProgress(processedBytes, totalBytes, processedFiles, totalFiles) {
+    var percent = totalBytes ? Math.round(processedBytes / totalBytes * 100) : 100;
+    setCleanupPackageStatus("正在建立候選封裝… " + percent + "%（" + formatNumber(processedFiles) + " / " + formatNumber(totalFiles) + " 個檔案）", false);
+  }
+
+  async function writeCandidateZip(files, output) {
+    var zipApi = window.fflate;
+    if (!zipApi || typeof zipApi.Zip !== "function" || typeof zipApi.ZipPassThrough !== "function") {
+      throw new Error("無法載入 ZIP 封裝引擎；請確認網路連線後重新整理頁面。");
+    }
+    var totalBytes = files.reduce(function (sum, file) { return sum + (Number(file.size) || 0); }, 0);
+    var processedBytes = 0;
+    var processedFiles = 0;
+    var zip = new zipApi.Zip(function (error, chunk) {
+      if (error) {
+        output.error = error;
+        return;
+      }
+      queueCandidateChunk(output, chunk);
+    });
+
+    for (var index = 0; index < files.length; index += 1) {
+      var file = files[index];
+      var archivePath = safeArchivePath(archiveRelativePath(file));
+      if (!archivePath) continue;
+      var entry = new zipApi.ZipPassThrough(archivePath);
+      if (file.lastModified) entry.mtime = new Date(file.lastModified);
+      zip.add(entry);
+      if (typeof file.stream === "function") {
+        var reader = file.stream().getReader();
+        try {
+          while (true) {
+            var result = await reader.read();
+            if (result.done) break;
+            entry.push(result.value, false);
+            await flushCandidateOutput(output);
+          }
+        } finally {
+          reader.releaseLock();
+        }
+      } else {
+        entry.push(new Uint8Array(await file.arrayBuffer()), false);
+        await flushCandidateOutput(output);
+      }
+      entry.push(new Uint8Array(0), true);
+      await flushCandidateOutput(output);
+      processedBytes += Number(file.size) || 0;
+      processedFiles += 1;
+      updateCandidateProgress(processedBytes, totalBytes, processedFiles, files.length);
+    }
+    zip.end();
+    await flushCandidateOutput(output);
+    if (output.writable && !output.closed) {
+      await output.writable.close();
+      output.closed = true;
+    }
+    return output;
+  }
+
+  async function buildImazingCandidatePackage() {
+    if (packageInProgress || state.sourceMode !== "folder" || !state.attachmentFiles.length) return;
+    var allCandidateFiles = getCandidateBackupFiles();
+    var markedPaths = new Set(getMarkedAttachmentFiles().map(function (file) { return relativePath(file); }));
+    var packageFiles = allCandidateFiles.filter(function (file) { return !markedPaths.has(relativePath(file)); });
+    var packageInputBytes = packageFiles.reduce(function (sum, file) { return sum + (Number(file.size) || 0); }, 0);
+    var canStreamToFile = typeof window.showSaveFilePicker === "function";
+    var hasContainer = packageFiles.some(function (file) { return archiveRelativePath(file).indexOf("Container/") === 0; });
+    var lineFile = findFileEnding("/Messages/Line.sqlite");
+    var hasLineSqlite = Boolean(lineFile && packageFiles.indexOf(lineFile) !== -1);
+    var hasLock = packageFiles.some(function (file) { return archiveRelativePath(file) === ".lock"; });
+    if (!hasContainer) {
+      setCleanupPackageStatus("無法建立候選封裝：選取的資料夾沒有 Container/；請選取包含 Container 與 Payload 的完整 iMazing 備份資料夾。", true);
+      return;
+    }
+    if (!hasLineSqlite) {
+      setCleanupPackageStatus("無法建立候選封裝：Messages/Line.sqlite 不在保留檔案中。", true);
+      return;
+    }
+    if (!canStreamToFile && packageInputBytes > MAX_BLOB_CANDIDATE_BYTES) {
+      setCleanupPackageStatus("目前瀏覽器不支援直接寫入大型檔案；候選封裝預估超過 256 MB，請改用支援 File System Access API 的 Chrome／Edge 桌面版，以避免 Blob 下載造成記憶體峰值。", true);
+      return;
+    }
+
+    packageInProgress = true;
+    renderAttachmentCleanup();
+    setCleanupPackageStatus("準備建立候選封裝…", false);
+    var output = null;
+    try {
+      var filename = candidateFilename();
+      output = await openCandidateOutput(filename);
+      await writeCandidateZip(packageFiles, output);
+      if (!output.writable) {
+        downloadBlob(filename, new Blob(output.chunks, { type: "application/octet-stream" }));
+      }
+      var warnings = [];
+      if (!hasLock) warnings.push("來源沒有 .lock，無法視為正式 iMazing 封裝");
+      if (!packageFiles.some(function (file) { return archiveRelativePath(file).indexOf("Payload/") === 0; })) warnings.push("來源沒有 Payload/，請以 iMazing dry-run 驗證");
+      warnings.push("此候選封裝由瀏覽器重新建立，尚未通過 iMazing 實機還原");
+      setCleanupPackageStatus("候選封裝已建立：" + formatBytes(output.bytes) + "，保留 " + formatNumber(packageFiles.length) + " 個檔案。" + (warnings.length ? " 警告：" + warnings.join("；") + "。" : ""), Boolean(warnings.length));
+    } catch (error) {
+      if (output && output.writable && !output.closed) {
+        try { await output.writable.abort(); } catch (abortError) { console.warn(abortError); }
+      }
+      if (error && error.name === "AbortError") setCleanupPackageStatus("已取消候選封裝輸出。", false);
+      else setCleanupPackageStatus("候選封裝失敗：" + (error && error.message ? error.message : String(error)), true);
+      console.error(error);
+    } finally {
+      packageInProgress = false;
+      renderAttachmentCleanup();
+    }
+  }
+
+  function initializeBrowserInsights() {
+    state.capabilities = probeBrowserCapabilities();
+    renderCapabilitySummary();
+    populateSchemaTables();
+    runBrowserHealth();
+    if (el.runHealthButton) el.runHealthButton.disabled = false;
+    if (el.globalSearchButton) el.globalSearchButton.disabled = false;
+    if (el.searchEngineBadge) el.searchEngineBadge.textContent = state.capabilities.fts5 === "available" ? "SQLite FTS5 capability" : "LIKE fallback";
+    if (el.scanAttachmentDuplicatesButton) el.scanAttachmentDuplicatesButton.disabled = state.sourceMode !== "folder" || !state.attachmentFiles.length;
+  }
+
+  function probeBrowserCapabilities() {
+    var version = safeQuery("SELECT sqlite_version() AS value", {})[0];
+    var json = safeQuery("SELECT json_valid($value) AS value", { $value: "{}" })[0];
+    var fts = safeQuery("SELECT sqlite_compileoption_used('ENABLE_FTS5') AS value", {})[0];
+    var windowResult = safeQuery("SELECT row_number() OVER (ORDER BY 1) AS value", {})[0];
+    var dbstat = safeQuery("SELECT name FROM dbstat LIMIT 1", {})[0];
+    return {
+      sqlite_version: version ? stringOrEmpty(version.value) : "unknown",
+      json_functions: json && Number(json.value) === 1 ? "available" : "unavailable",
+      fts5: fts && Number(fts.value) === 1 ? "available" : "unavailable",
+      window_functions: windowResult && Number(windowResult.value) === 1 ? "available" : "unavailable",
+      dbstat: dbstat ? "available" : "unavailable",
+      read_only: true,
+      warnings: []
+    };
+  }
+
+  function renderCapabilitySummary() {
+    if (!el.capabilitySummary || !state.capabilities) return;
+    if (state.indexMode) {
+      el.capabilitySummary.textContent = "大型索引 · 不開啟原始 SQLite";
+      return;
+    }
+    var capability = state.capabilities;
+    el.capabilitySummary.textContent = "SQLite " + capability.sqlite_version + " · JSON " + capability.json_functions + " · FTS5 " + capability.fts5;
+  }
+
+  function runBrowserHealth() {
+    if (state.indexMode) {
+      renderHealthSummary();
+      return;
+    }
+    if (!state.database) return;
+    var quick = [];
+    var quickError = "";
+    try {
+      quick = query("PRAGMA quick_check", {}).map(function (row) { return firstNonEmpty(row.quick_check, row["quick_check"], Object.values(row)[0]); });
+    } catch (error) {
+      quickError = error && error.message ? error.message : String(error);
+    }
+    var warnings = [];
+    var lineFile = state.sourceMode === "database" ? state.files[0] : findFileEnding("/Messages/Line.sqlite");
+    var walFile = state.sourceMode === "folder" ? findFileEnding("/Messages/Line.sqlite-wal") : null;
+    var shmFile = state.sourceMode === "folder" ? findFileEnding("/Messages/Line.sqlite-shm") : null;
+    if (state.sourceMode === "folder" && Boolean(walFile) !== Boolean(shmFile)) warnings.push("WAL／SHM 只找到其中一個檔案，請確認 staging 是否完整。");
+    if (quickError) warnings.push("quick_check 無法完成：" + quickError);
+    if (quick.length && quick.some(function (value) { return value !== "ok"; })) warnings.push("SQLite quick_check 回報非 ok 結果。");
+    var messageCount = safeQuery("SELECT count(*) AS value FROM ZMESSAGE", {})[0];
+    var chatCount = safeQuery("SELECT count(*) AS value FROM ZCHAT", {})[0];
+    var tableCount = safeQuery("SELECT count(*) AS value FROM sqlite_master WHERE type='table'", {})[0];
+    var pageCount = safeQuery("PRAGMA page_count", {})[0];
+    var pageSize = safeQuery("PRAGMA page_size", {})[0];
+    var timestampRange = safeQuery("SELECT min(ZTIMESTAMP) AS minimum, max(ZTIMESTAMP) AS maximum FROM ZMESSAGE WHERE ZTIMESTAMP IS NOT NULL", {})[0];
+    var status = warnings.length ? "warning" : "pass";
+    state.health = {
+      status: status,
+      read_only: true,
+      checks: {
+        quick_check: quick.length ? quick : "not_checked",
+        line_sqlite: lineFile ? { name: lineFile.name, bytes: lineFile.size } : "missing",
+        wal: walFile ? { name: walFile.name, bytes: walFile.size } : "not_present",
+        shm: shmFile ? { name: shmFile.name, bytes: shmFile.size } : "not_present",
+        chat_count: chatCount ? Number(Object.values(chatCount)[0]) : state.chats.length,
+        message_count: messageCount ? Number(Object.values(messageCount)[0]) : 0,
+        table_count: tableCount ? Number(Object.values(tableCount)[0]) : 0,
+        page_count: pageCount ? Number(Object.values(pageCount)[0]) : null,
+        page_size: pageSize ? Number(Object.values(pageSize)[0]) : null,
+        timestamp_unit: detectBrowserTimestampUnit(),
+        timestamp_range: timestampRange ? { min: timestampRange.minimum, max: timestampRange.maximum } : null,
+        attachment_count: state.attachmentFiles.length,
+        unlinked_attachment_count: state.attachmentFiles.filter(function (file) { return attachmentContext(file).status === "unlinked"; }).length
+      },
+      warnings: warnings
+    };
+    renderHealthSummary();
+  }
+
+  function renderHealthSummary() {
+    if (!el.healthSummary || !state.health) return;
+    var health = state.health;
+    var checks = health.checks || {};
+    var statusLabel = { pass: "通過", warning: "需要注意", error: "錯誤", not_checked: "未檢查" }[health.status] || "未檢查";
+    var quick = Array.isArray(checks.quick_check) ? checks.quick_check.join(", ") : stringOrEmpty(checks.quick_check || "not_checked");
+    var sourceHash = checks.source_sha256 ? stringOrEmpty(checks.source_sha256).slice(0, 16) + "…" : "—";
+    var items = [
+      ["狀態", statusLabel],
+      ["quick_check", quick],
+      ["聊天室／訊息", formatNumber(checks.chat_count || checks.conversation_count || 0) + " / " + formatNumber(checks.message_count || checks.message_rows || 0)],
+      ["附件／未關聯", formatNumber(checks.attachment_count || 0) + " / " + formatNumber(checks.unlinked_attachment_count || 0)],
+      ["訊息時間", checks.timestamp_range ? formatDate(normalizeTimestamp(checks.timestamp_range.min), false) + " ～ " + formatDate(normalizeTimestamp(checks.timestamp_range.max), false) : "—"],
+      ["來源 hash", sourceHash]
+    ];
+    el.healthSummary.innerHTML = '<dl class="health-list">' + items.map(function (item) { return '<div><dt>' + escapeHtml(item[0]) + '</dt><dd>' + escapeHtml(item[1]) + '</dd></div>'; }).join("") + '</dl>' + ((health.warnings || []).length ? '<p class="health-warning">' + escapeHtml(health.warnings.join("；")) + '</p>' : "");
+  }
+
+  async function runGlobalSearch() {
+    var term = (el.globalSearchInput.value || "").trim();
+    if (!term) {
+      el.globalSearchResults.innerHTML = '<span class="empty-state">請先輸入搜尋文字。</span>';
+      return;
+    }
+    el.globalSearchResults.innerHTML = '<span class="empty-state">搜尋中…</span>';
+    try {
+      var results = state.indexMode ? await searchReaderIndex(term, getSearchFilters()) : searchDatabase(term, getSearchFilters());
+      renderGlobalSearchResults(results, term);
+    } catch (error) {
+      el.globalSearchResults.innerHTML = '<span class="empty-state">搜尋失敗：' + escapeHtml(error && error.message ? error.message : String(error)) + '</span>';
+    }
+  }
+
+  function getSearchFilters() {
+    var filters = {
+      chatPk: el.globalSearchChatSelect && el.globalSearchChatSelect.value ? Number(el.globalSearchChatSelect.value) : null,
+      senderPk: el.globalSearchSenderSelect && el.globalSearchSenderSelect.value ? Number(el.globalSearchSenderSelect.value) : null,
+      contentType: el.globalSearchContentType && el.globalSearchContentType.value !== "" ? Number(el.globalSearchContentType.value) : null,
+      fromTimestamp: null,
+      toTimestamp: null
+    };
+    var unit = state.indexMode ? stringOrEmpty(state.indexManifest && state.indexManifest.timestamp_unit) : detectBrowserTimestampUnit();
+    if (el.globalSearchFrom && el.globalSearchFrom.value) filters.fromTimestamp = dateInputToRaw(el.globalSearchFrom.value, unit, false);
+    if (el.globalSearchTo && el.globalSearchTo.value) filters.toTimestamp = dateInputToRaw(el.globalSearchTo.value, unit, true);
+    return filters;
+  }
+
+  function detectBrowserTimestampUnit() {
+    var row = safeQuery("SELECT max(abs(ZTIMESTAMP)) AS value FROM ZMESSAGE", {})[0];
+    var value = row ? Number(row.value) : 0;
+    if (value >= 1e14) return "microseconds";
+    if (value >= 1e11) return "milliseconds";
+    if (value >= 1e8) return "seconds";
+    return "seconds";
+  }
+
+  function dateInputToRaw(value, unit, endOfDay) {
+    var millis = Date.parse(String(value) + (endOfDay ? "T23:59:59.999" : "T00:00:00.000"));
+    if (!Number.isFinite(millis)) return null;
+    if (unit === "microseconds") return millis * 1000;
+    if (unit === "milliseconds") return millis;
+    return Math.floor(millis / 1000);
+  }
+
+  function searchDatabase(term, filters) {
+    filters = filters || {};
+    var conditions = ["COALESCE(ZTEXT, '') LIKE $pattern ESCAPE '\\'"];
+    var params = { $pattern: "%" + term.replace(/[\\%_]/g, "\\$&") + "%" };
+    if (filters.chatPk !== null && filters.chatPk !== undefined) { conditions.push("ZCHAT = $chatPk"); params.$chatPk = filters.chatPk; }
+    if (filters.senderPk !== null && filters.senderPk !== undefined) { conditions.push("ZSENDER = $senderPk"); params.$senderPk = filters.senderPk; }
+    if (filters.contentType !== null && filters.contentType !== undefined) { conditions.push("ZCONTENTTYPE = $contentType"); params.$contentType = filters.contentType; }
+    if (filters.fromTimestamp !== null && filters.fromTimestamp !== undefined) { conditions.push("COALESCE(ZTIMESTAMP, 0) >= $fromTimestamp"); params.$fromTimestamp = filters.fromTimestamp; }
+    if (filters.toTimestamp !== null && filters.toTimestamp !== undefined) { conditions.push("COALESCE(ZTIMESTAMP, 0) <= $toTimestamp"); params.$toTimestamp = filters.toTimestamp; }
+    var rows = safeQuery(
+      "SELECT Z_PK AS messagePk, ZID AS messageId, ZCHAT AS chatPk, ZSENDER AS senderPk, ZCONTENTTYPE AS contentType, ZTIMESTAMP AS timestamp, ZTEXT AS text " +
+      "FROM ZMESSAGE WHERE " + conditions.join(" AND ") + " ORDER BY COALESCE(ZTIMESTAMP, 0) DESC, Z_PK DESC LIMIT 100",
+      params
+    );
+    return rows.map(function (row) { return makeSearchResult(row, term, "exact"); });
+  }
+
+  async function searchReaderIndex(term, filters) {
+    filters = filters || {};
+    var results = [];
+    var files = state.files.filter(function (file) { return /(?:^|\/)messages\/.*\.jsonl$/i.test(relativePath(file)); }).sort(function (left, right) { return relativePath(left).localeCompare(relativePath(right)); });
+    for (var index = 0; index < files.length && results.length < 100; index += 1) {
+      var rows = parseJsonLines(await files[index].text());
+      rows.forEach(function (row) {
+        var rawTimestamp = row.timestamp !== undefined ? row.timestamp : row.timestamp_raw;
+        if (results.length >= 100 || stringOrEmpty(row.text).toLocaleLowerCase().indexOf(term.toLocaleLowerCase()) === -1) return;
+        if (filters.chatPk !== null && filters.chatPk !== undefined && Number(row.chatPk !== undefined ? row.chatPk : row.chat_pk) !== filters.chatPk) return;
+        if (filters.senderPk !== null && filters.senderPk !== undefined && Number(row.sender_pk) !== filters.senderPk) return;
+        if (filters.contentType !== null && filters.contentType !== undefined && Number(row.content_type) !== filters.contentType) return;
+        if (filters.fromTimestamp !== null && filters.fromTimestamp !== undefined && Number(rawTimestamp || 0) < filters.fromTimestamp) return;
+        if (filters.toTimestamp !== null && filters.toTimestamp !== undefined && Number(rawTimestamp || 0) > filters.toTimestamp) return;
+        row.source_shard = relativePath(files[index]);
+        results.push(makeSearchResult({
+          pk: row.pk,
+          id: row.id,
+          chatPk: row.chatPk !== undefined ? row.chatPk : row.chat_pk,
+          timestamp: rawTimestamp,
+          senderPk: row.sender_pk,
+          sender: row.sender_name,
+          contentType: row.content_type,
+          text: row.text,
+          source_shard: row.source_shard
+        }, term, "exact"));
+      });
+      if (index % 8 === 0) await new Promise(function (resolve) { window.setTimeout(resolve, 0); });
+    }
+    return results.sort(function (left, right) { return (right.timestampRaw || 0) - (left.timestampRaw || 0); });
+  }
+
+  function makeSearchResult(row, term, confidence) {
+    var chatPk = row.chatPk !== undefined ? row.chatPk : row.chat_pk;
+    var timestampRaw = row.timestamp !== undefined ? row.timestamp : row.timestamp_raw;
+    var chat = state.chats.find(function (item) { return Number(item.pk) === Number(chatPk); });
+    var text = stringOrEmpty(row.text);
+    var lowerText = text.toLocaleLowerCase();
+    var index = lowerText.indexOf(term.toLocaleLowerCase());
+    var start = index < 0 ? 0 : Math.max(0, index - 48);
+    var snippet = (start ? "…" : "") + text.slice(start, start + 140) + (text.length > start + 140 ? "…" : "");
+    return {
+      pk: numberOrNull(row.messagePk || row.pk),
+      id: stringOrEmpty(row.messageId || row.id),
+      chatPk: numberOrNull(chatPk),
+      chatTitle: chat ? chat.title : "未知聊天室",
+      text: text,
+      snippet: snippet,
+      timestampRaw: timestampRaw,
+      timestamp: normalizeTimestamp(timestampRaw),
+      sender: stringOrEmpty(row.sender || row.sender_name),
+      confidence: confidence,
+      source: row.source_shard || "ZMESSAGE"
+    };
+  }
+
+  function renderGlobalSearchResults(results, term) {
+    if (!results.length) {
+      el.globalSearchResults.innerHTML = '<span class="empty-state">找不到「' + escapeHtml(term) + '」的訊息。</span>';
+      return;
+    }
+    el.globalSearchResults.innerHTML = results.map(function (result) {
+      return '<button type="button" class="search-result" data-search-chat-pk="' + escapeHtml(String(result.chatPk)) + '"><strong>' + escapeHtml(result.chatTitle) + '</strong><span>' + escapeHtml(result.snippet) + '</span><small>' + escapeHtml((result.sender ? result.sender + " · " : "") + formatDate(result.timestamp, true) + " · " + result.confidence + " · " + result.source) + '</small></button>';
+    }).join("");
+    el.globalSearchResults.querySelectorAll("button[data-search-chat-pk]").forEach(function (button) {
+      button.addEventListener("click", function () {
+        var chat = state.chats.find(function (item) { return Number(item.pk) === Number(button.getAttribute("data-search-chat-pk")); });
+        if (chat) selectChat(chat);
+      });
+    });
+  }
+
+  function runTimelineAnalysis() {
+    if (!state.currentChat) return;
+    var rows;
+    if (state.indexMode) {
+      rows = state.currentMessages.map(function (message) { return { timestamp: message.timestampRaw, pk: message.pk }; });
+    } else {
+      rows = safeQuery("SELECT ZTIMESTAMP AS timestamp, Z_PK AS pk FROM ZMESSAGE WHERE ZCHAT = $chatPk ORDER BY COALESCE(ZTIMESTAMP, 0), Z_PK", { $chatPk: state.currentChat.pk });
+    }
+    var events = [];
+    var previous = null;
+    rows.forEach(function (row) {
+      var currentRaw = Number(row.timestamp) || 0;
+      var current = timestampToSeconds(currentRaw);
+      if (!Number.isFinite(current)) return;
+      if (previous) {
+        var gap = Math.max(0, current - previous.seconds);
+        if (gap >= 7200 || gap <= 300) events.push({ type: gap >= 7200 ? "gap" : "burst", gap: gap, from: previous.raw, to: currentRaw, fromSeconds: previous.seconds, toSeconds: current });
+      }
+      previous = { raw: currentRaw, seconds: current, pk: row.pk };
+    });
+    renderTimelineSummary(events, rows.length);
+  }
+
+  function timestampToSeconds(value) {
+    var number = Number(value);
+    if (!Number.isFinite(number)) return null;
+    var magnitude = Math.abs(number);
+    if (magnitude >= 1e14) return number / 1000000;
+    if (magnitude >= 1e11) return number / 1000;
+    if (magnitude >= 1e8) return number;
+    return number || null;
+  }
+
+  function renderTimelineSummary(events, rowCount) {
+    if (!events.length) {
+      el.timelineSummary.innerHTML = '<span class="empty-state">目前沒有超過門檻的長間隔或訊息高峰（推測規則：間隔 ≥ 2 小時／≤ 5 分鐘）。</span>';
+      return;
+    }
+    el.timelineSummary.innerHTML = '<p class="timeline-note">共 ' + formatNumber(rowCount) + ' 則訊息；以下是啟發式事件，不是 LINE 原始章節。</p>' + events.slice(0, 40).map(function (event, index) {
+      var label = event.type === "gap" ? "長間隔 · 推測新章節" : "短間隔 · 訊息高峰";
+      return '<div class="timeline-event"><span class="timeline-dot ' + event.type + '"></span><div><strong>' + escapeHtml(label) + '</strong><small>' + escapeHtml(formatDate(normalizeTimestamp(event.from), true) + " → " + formatDate(normalizeTimestamp(event.to), true) + " · 間隔 " + formatDurationSeconds(event.gap)) + '</small><em>confidence: heuristic</em></div></div>';
+    }).join("");
+  }
+
+  function formatDurationSeconds(seconds) {
+    var value = Math.max(0, Number(seconds) || 0);
+    if (value < 60) return Math.round(value) + " 秒";
+    if (value < 3600) return Math.round(value / 60) + " 分鐘";
+    return (value / 3600).toFixed(value >= 86400 ? 0 : 1) + " 小時";
+  }
+
+  function populateSchemaTables() {
+    if (!el.schemaTableSelect) return;
+    if (state.indexMode || !state.database) {
+      el.schemaTableSelect.innerHTML = '<option value="">CLI schema 可查看原始資料庫</option>';
+      return;
+    }
+    var tables = safeQuery("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name", {});
+    el.schemaTableSelect.innerHTML = '<option value="">選取資料表</option>' + tables.map(function (row) { return '<option value="' + escapeHtml(row.name) + '">' + escapeHtml(row.name) + '</option>'; }).join("");
+  }
+
+  function renderSchemaTable(tableName) {
+    if (!tableName) {
+      renderSchemaExplorerEmpty("選取資料表後顯示欄位與限量範例。");
+      return;
+    }
+    if (state.indexMode || !state.database || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(tableName)) return;
+    var quoted = '"' + tableName.replace(/"/g, '""') + '"';
+    var columns = safeQuery("PRAGMA table_info(" + quoted + ")", {});
+    var indexes = safeQuery("PRAGMA index_list(" + quoted + ")", {});
+    var foreignKeys = safeQuery("PRAGMA foreign_key_list(" + quoted + ")", {});
+    var rows = safeQuery("SELECT * FROM " + quoted + " LIMIT 5", {});
+    var headers = columns.map(function (column) { return '<th>' + escapeHtml(column.name) + '</th>'; }).join("");
+    var body = rows.map(function (row) {
+      return '<tr>' + columns.map(function (column) { return '<td>' + escapeHtml(maskSchemaValue(row[column.name], column.name)) + '</td>'; }).join("") + '</tr>';
+    }).join("");
+    var foreignKeyText = foreignKeys.length
+      ? foreignKeys.map(function (key) { return key.from + " → " + key.table + "." + (key.to || "（rowid）"); }).join("、")
+      : "無（以下候選關聯僅依欄名推測）";
+    var candidateRelations = columns.filter(function (column) { return /_PK$/.test(column.name) || ["ZCHAT", "ZSENDER", "ZMID", "ZID"].indexOf(column.name) !== -1; }).map(function (column) { return column.name; });
+    el.schemaExplorer.innerHTML = '<div class="schema-meta">欄位 ' + formatNumber(columns.length) + ' · 索引 ' + formatNumber(indexes.length) + ' · 範例最多 5 筆</div><div class="schema-scroll"><table class="schema-table"><thead><tr>' + headers + '</tr></thead><tbody>' + (body || '<tr><td colspan="' + Math.max(1, columns.length) + '">沒有資料列</td></tr>') + '</tbody></table></div><p class="schema-indexes">索引：' + escapeHtml(indexes.map(function (index) { return index.name; }).join("、") || "無") + '</p><p class="schema-indexes">Declared foreign key：' + escapeHtml(foreignKeyText) + '</p><p class="schema-indexes">Inferred candidate relation：' + escapeHtml(candidateRelations.join("、") || "無") + '</p>';
+  }
+
+  function renderSchemaExplorerEmpty(text) {
+    if (el.schemaExplorer) el.schemaExplorer.innerHTML = '<span class="empty-state">' + escapeHtml(text) + '</span>';
+  }
+
+  function maskSchemaValue(value, columnName) {
+    if (value === null || value === undefined) return "NULL";
+    if (value instanceof Uint8Array || Array.isArray(value)) return "[BLOB " + formatNumber(value.length) + " bytes]";
+    var name = String(columnName || "").toUpperCase();
+    if (/TEXT|NAME|ADDRESS|STATUS|MID|ZID|SENDER/.test(name)) return "[已遮罩 " + String(value).length + " 字元]";
+    return String(value).slice(0, 120);
+  }
+
+  async function scanAttachmentDuplicates() {
+    if (state.sourceMode !== "folder" || !state.attachmentFiles.length) return;
+    if (!window.crypto || !window.crypto.subtle) {
+      el.duplicateStatus.textContent = "目前瀏覽器沒有 Web Crypto SHA-256；請改用 CLI duplicates。";
+      return;
+    }
+    el.scanAttachmentDuplicatesButton.disabled = true;
+    el.duplicateStatus.textContent = "正在依檔案大小分組並計算 SHA-256…";
+    try {
+      var bySize = new Map();
+      state.attachmentFiles.forEach(function (file) {
+        var size = Number(file.size) || 0;
+        if (!bySize.has(size)) bySize.set(size, []);
+        bySize.get(size).push(file);
+      });
+      var byDigest = new Map();
+      for (var entries of bySize.values()) {
+        if (entries.length < 2) continue;
+        for (var index = 0; index < entries.length; index += 1) {
+          var digest = await digestFile(entries[index]);
+          var key = entries[index].size + ":" + digest;
+          if (!byDigest.has(key)) byDigest.set(key, { sha256: digest, size: entries[index].size, files: [] });
+          byDigest.get(key).files.push(entries[index]);
+        }
+      }
+      state.attachmentDuplicateGroups = Array.from(byDigest.values()).filter(function (group) { return group.files.length > 1; }).map(function (group) {
+        var hasThumbnail = group.files.some(function (file) { return /\/Message Thumbnails\//.test(archiveRelativePath(file)); });
+        var hasOriginal = group.files.some(function (file) { return !/\/Message Thumbnails\//.test(archiveRelativePath(file)); });
+        return { sha256: group.sha256, size: group.size, files: group.files, classification: hasThumbnail && hasOriginal ? "thumbnail_of_attachment" : "exact_duplicate" };
+      });
+      renderDuplicateResults();
+      el.duplicateStatus.textContent = "完成：掃描 " + formatNumber(state.attachmentFiles.length) + " 個候選檔案，找到 " + formatNumber(state.attachmentDuplicateGroups.length) + " 組 exact duplicate。";
+    } catch (error) {
+      el.duplicateStatus.textContent = "重複掃描失敗：" + (error && error.message ? error.message : String(error));
+    } finally {
+      el.scanAttachmentDuplicatesButton.disabled = false;
+    }
+  }
+
+  async function digestFile(file) {
+    var digest = await window.crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+    return Array.from(new Uint8Array(digest)).map(function (value) { return value.toString(16).padStart(2, "0"); }).join("");
+  }
+
+  function renderDuplicateResults() {
+    if (!el.duplicateResults) return;
+    if (!state.attachmentDuplicateGroups.length) {
+      el.duplicateResults.innerHTML = '<span class="empty-state">尚未找到 exact duplicate；相似檔案不會被自動視為重複。</span>';
+      return;
+    }
+    el.duplicateResults.innerHTML = state.attachmentDuplicateGroups.map(function (group, index) {
+      var files = group.files.map(function (file) { return '<li>' + escapeHtml(archiveRelativePath(file)) + ' · ' + escapeHtml(formatBytes(file.size)) + '</li>'; }).join("");
+      return '<article class="duplicate-group"><div><strong>群組 ' + (index + 1) + ' · ' + escapeHtml(group.sha256.slice(0, 16)) + '…</strong><button type="button" class="button button-quiet" data-duplicate-group="' + index + '">標記除第一個外</button></div><ul>' + files + '</ul><small>' + escapeHtml(group.classification) + ' · 預設保留第一個，仍需人工確認路徑與附件脈絡。</small></article>';
+    }).join("");
+  }
+
+  function markDuplicateAlternatives(index) {
+    var group = state.attachmentDuplicateGroups[index];
+    if (!group) return;
+    group.files.slice(1).forEach(function (file) { state.attachmentsMarkedForRemoval.add(relativePath(file)); });
+    renderAttachmentCleanup();
+    renderDuplicateResults();
+  }
+
+  async function runBrowserDiff() {
+    var leftFile = el.diffLeftInput.files && el.diffLeftInput.files[0];
+    var rightFile = el.diffRightInput.files && el.diffRightInput.files[0];
+    if (!leftFile || !rightFile) {
+      el.diffStatus.textContent = "請先選取左側與右側兩份 Line.sqlite。";
+      return;
+    }
+    if (leftFile.size > 256 * 1024 * 1024 || rightFile.size > 256 * 1024 * 1024) {
+      el.diffStatus.textContent = "其中一份資料庫超過瀏覽器差異比較安全門檻，請改用 CLI diff。";
+      return;
+    }
+    el.runDiffButton.disabled = true;
+    el.diffStatus.textContent = "正在唯讀載入兩份 SQLite…";
+    try {
+      var SQL = await initSqlJs({ locateFile: function (file) { return SQL_WASM_CDN + file; } });
+      var leftDatabase = new SQL.Database(new Uint8Array(await leftFile.arrayBuffer()));
+      var rightDatabase = new SQL.Database(new Uint8Array(await rightFile.arrayBuffer()));
+      try {
+        var leftRows = externalDatabaseRows(leftDatabase);
+        var rightRows = externalDatabaseRows(rightDatabase);
+        var changes = compareBrowserRows(leftRows, rightRows);
+        renderBrowserDiff(changes, leftRows.length, rightRows.length);
+        el.diffStatus.textContent = "比較完成：左側 " + formatNumber(leftRows.length) + " 則、右側 " + formatNumber(rightRows.length) + " 則；原始檔案未修改。";
+      } finally {
+        leftDatabase.close();
+        rightDatabase.close();
+      }
+    } catch (error) {
+      el.diffStatus.textContent = "差異比較失敗：" + (error && error.message ? error.message : String(error));
+      el.diffResults.innerHTML = "";
+    } finally {
+      el.runDiffButton.disabled = false;
+    }
+  }
+
+  function externalDatabaseRows(database) {
+    var statement = database.prepare("SELECT Z_PK AS messagePk, ZID AS messageId, ZCHAT AS chatPk, ZSENDER AS senderPk, ZTIMESTAMP AS timestamp, ZCONTENTTYPE AS contentType, ZTEXT AS text FROM ZMESSAGE ORDER BY COALESCE(ZTIMESTAMP, 0), Z_PK");
+    var rows = [];
+    try {
+      while (statement.step()) rows.push(statement.getAsObject());
+    } finally {
+      statement.free();
+    }
+    return rows;
+  }
+
+  function browserDiffKey(row, includeText) {
+    var id = stringOrEmpty(row.messageId).trim();
+    if (id) return "id:" + id;
+    var key = [row.chatPk, row.senderPk, row.timestamp, row.contentType].map(stringOrEmpty).join("|");
+    if (includeText) key += "|" + stringOrEmpty(row.text).trim();
+    return "inferred:" + key;
+  }
+
+  function compareBrowserRows(leftRows, rightRows) {
+    var changes = [];
+    var leftUsed = new Set();
+    var rightUsed = new Set();
+    var leftById = new Map();
+    var rightById = new Map();
+    leftRows.forEach(function (row, index) { var id = stringOrEmpty(row.messageId).trim(); if (id) leftById.set(id, { row: row, index: index }); });
+    rightRows.forEach(function (row, index) { var id = stringOrEmpty(row.messageId).trim(); if (id) rightById.set(id, { row: row, index: index }); });
+    leftById.forEach(function (entry, id) {
+      var other = rightById.get(id);
+      if (!other) return;
+      leftUsed.add(entry.index);
+      rightUsed.add(other.index);
+      if (JSON.stringify([entry.row.chatPk, entry.row.senderPk, entry.row.timestamp, entry.row.contentType, stringOrEmpty(entry.row.text)]) !== JSON.stringify([other.row.chatPk, other.row.senderPk, other.row.timestamp, other.row.contentType, stringOrEmpty(other.row.text)])) {
+        changes.push({ status: "changed", confidence: "exact", key: "id:" + id, left: entry.row, right: other.row });
+      }
+    });
+
+    function pairByKey(includeText, confidence) {
+      var leftMap = new Map();
+      var rightMap = new Map();
+      leftRows.forEach(function (row, index) { if (!leftUsed.has(index)) { var key = browserDiffKey(row, includeText); if (!leftMap.has(key)) leftMap.set(key, []); leftMap.get(key).push({ row: row, index: index }); } });
+      rightRows.forEach(function (row, index) { if (!rightUsed.has(index)) { var key = browserDiffKey(row, includeText); if (!rightMap.has(key)) rightMap.set(key, []); rightMap.get(key).push({ row: row, index: index }); } });
+      leftMap.forEach(function (leftEntries, key) {
+        var rightEntries = rightMap.get(key) || [];
+        if (!rightEntries.length) return;
+        if (leftEntries.length !== 1 || rightEntries.length !== 1) {
+          changes.push({ status: "ambiguous", confidence: "ambiguous", key: key, left: leftEntries[0].row, right: rightEntries[0].row });
+          return;
+        }
+        leftUsed.add(leftEntries[0].index);
+        rightUsed.add(rightEntries[0].index);
+        if (!includeText && stringOrEmpty(leftEntries[0].row.text) !== stringOrEmpty(rightEntries[0].row.text)) {
+          changes.push({ status: "changed", confidence: confidence, key: key, left: leftEntries[0].row, right: rightEntries[0].row });
+        }
+      });
+    }
+
+    // A regenerated message ID can still be aligned when the stable fields and
+    // text agree; only the identity confidence changes from exact to inferred.
+    pairByKey(true, "inferred");
+    pairByKey(false, "inferred");
+    leftRows.forEach(function (row, index) { if (!leftUsed.has(index)) changes.push({ status: "present_only_in_left", confidence: "unresolved", key: browserDiffKey(row, true), left: row }); });
+    rightRows.forEach(function (row, index) { if (!rightUsed.has(index)) changes.push({ status: "added", confidence: "unresolved", key: browserDiffKey(row, true), right: row }); });
+    return changes.slice(0, 100);
+  }
+
+  function renderBrowserDiff(changes, leftCount, rightCount) {
+    if (!changes.length) {
+      el.diffResults.innerHTML = '<span class="empty-state">兩份資料庫目前沒有可辨識的差異。</span>';
+      return;
+    }
+    el.diffResults.innerHTML = '<div class="diff-summary">顯示前 ' + formatNumber(changes.length) + ' 項差異 · left ' + formatNumber(leftCount) + ' · right ' + formatNumber(rightCount) + '</div>' + changes.map(function (change) {
+      var row = change.right || change.left;
+      var text = stringOrEmpty(row && row.text).slice(0, 120);
+      return '<article class="diff-item"><strong>' + escapeHtml({ added: "右側新增", present_only_in_left: "左側存在", changed: "內容變更" }[change.status] || change.status) + '</strong><span>' + escapeHtml(text || "（沒有文字內容）") + '</span><small>' + escapeHtml(change.confidence + " · " + formatDate(normalizeTimestamp(row && row.timestamp), true)) + '</small></article>';
+    }).join("");
   }
 
   function updateStats() {
@@ -595,7 +2004,7 @@
     var payload = {
       schemaVersion: "0.1",
       exportedAt: new Date().toISOString(),
-      source: state.sourceMode === "database" ? "LINE Messages/Line.sqlite" : "LINE iOS App Container",
+      source: state.sourceMode === "database" ? "LINE Messages/Line.sqlite" : (state.indexMode ? "LINE CLI reader index" : "LINE iOS App Container"),
       sourceMode: state.sourceMode,
       conversation: state.currentChat,
       messages: messages.map(sanitizeMessageForExport)
@@ -604,11 +2013,12 @@
   }
 
   function loadAllMessagesForExport() {
+    if (state.indexMode) return state.currentMessages.slice();
     var rows = safeQuery(
       "SELECT m.Z_PK AS messagePk, m.ZID AS messageId, m.ZTIMESTAMP AS timestamp, " +
       "m.ZSENDER AS senderPk, m.ZSENDSTATUS AS sendStatus, m.ZCONTENTTYPE AS contentType, m.ZTEXT AS text, " +
       "m.ZMESSAGETYPE AS messageType, m.ZLATITUDE AS latitude, m.ZLONGITUDE AS longitude, " +
-      "m.ZCONTENTMETADATA AS contentMetadata " +
+      "m.ZCONTENTMETADATA AS contentMetadata, m.ZCHAT AS chatPk " +
       "FROM ZMESSAGE m WHERE m.ZCHAT = $chatPk ORDER BY COALESCE(m.ZTIMESTAMP, 0) ASC, m.Z_PK ASC",
       { $chatPk: state.currentChat.pk }
     );
@@ -633,7 +2043,7 @@
     }).join("\n");
     var note = state.sourceMode === "database"
       ? "這份封存來自 Line.sqlite 只讀訊息模式；未載入附件檔案。"
-      : "附件在目前閱讀器中提供本機下載連結；匯出的單一 HTML 會保留附件名稱與大小。";
+      : (state.indexMode ? "這份封存來自 CLI 分片索引；瀏覽器沒有開啟原始大型 Line.sqlite。" : "附件在目前閱讀器中提供本機下載連結；匯出的單一 HTML 會保留附件名稱與大小。");
     return '<!doctype html><html lang="zh-Hant-TW"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>' + escapeHtml(chat.title) + '</title><style>' + exportCss() + '</style><main><h1>' + escapeHtml(chat.title) + '</h1><p class="meta">' + escapeHtml(typeLabel(chat.type) + " · " + formatNumber(messages.length) + " 則訊息") + '</p><p class="note">' + escapeHtml(note) + '</p><section>' + body + '</section></main></html>';
   }
 
@@ -657,37 +2067,90 @@
     state.sqlReady = false;
     state.files = [];
     state.fileByPath = new Map();
+    state.indexFiles = [];
+    state.indexManifest = null;
+    state.indexConversations = [];
+    state.indexParticipants = [];
+    state.indexMode = false;
+    state.capabilities = null;
+    state.health = null;
     state.chats = [];
     state.chatPage = 1;
     state.users.clear();
     state.groupsById.clear();
     state.groupsByPk.clear();
+    state.unifiedGroupsById.clear();
     state.groupNamesByChatPk.clear();
-    state.groupMemberNamesByChatPk.clear();
     state.currentChat = null;
     state.currentMessages = [];
     state.currentOffset = 0;
+    state.currentAfterTimestamp = 0;
+    state.currentAfterPk = 0;
     state.attachmentFiles = [];
     state.attachmentByBasename = new Map();
     state.attachmentByMessageId = new Map();
     state.attachmentByToken = new Map();
+    state.attachmentContextByPath = new Map();
+    revokeAttachmentPreviewUrls();
+    state.attachmentPreviewUrls = new Map();
+    state.attachmentCleanupPage = 1;
+    state.attachmentCleanupSearch = "";
+    state.attachmentCategoryFilter = "all";
+    state.attachmentSort = "recent";
+    state.attachmentsMarkedForRemoval = new Set();
+    state.attachmentDuplicateGroups = [];
     revokeObjectUrls();
     state.selfId = "";
     state.sourceSize = 0;
     if (resetInput !== false && el.folderInput) el.folderInput.value = "";
     if (resetInput !== false && el.databaseInput) el.databaseInput.value = "";
+    if (resetInput !== false && el.indexInput) el.indexInput.value = "";
     if (el.workspace) el.workspace.classList.add("hidden");
+    if (el.diffPanel) el.diffPanel.classList.add("hidden");
     if (el.chatList) el.chatList.innerHTML = "";
     if (el.chatPageInfo) el.chatPageInfo.textContent = "第 1 頁";
     if (el.chatPrevButton) el.chatPrevButton.disabled = true;
     if (el.chatNextButton) el.chatNextButton.disabled = true;
     if (el.messageList) el.messageList.innerHTML = '<div class="empty-state">尚未選取聊天室。</div>';
     if (el.attachmentPreview) el.attachmentPreview.innerHTML = "";
+    if (el.attachmentSearch) el.attachmentSearch.value = "";
+    if (el.attachmentCategoryFilter) el.attachmentCategoryFilter.value = "all";
+    if (el.attachmentSort) el.attachmentSort.value = "recent";
+    if (el.attachmentCategorySummary) el.attachmentCategorySummary.innerHTML = "";
+    if (el.attachmentCleanupList) el.attachmentCleanupList.innerHTML = "";
+    if (el.attachmentPageInfo) el.attachmentPageInfo.textContent = "第 1 頁";
+    if (el.attachmentPrevButton) el.attachmentPrevButton.disabled = true;
+    if (el.attachmentNextButton) el.attachmentNextButton.disabled = true;
+    if (el.markFilteredAttachmentsButton) el.markFilteredAttachmentsButton.disabled = true;
+    if (el.keepAllAttachmentsButton) el.keepAllAttachmentsButton.disabled = true;
+    if (el.clearAttachmentSelectionButton) el.clearAttachmentSelectionButton.disabled = true;
+    if (el.exportCleanupPlanButton) el.exportCleanupPlanButton.disabled = true;
+    if (el.exportCleanupTextButton) el.exportCleanupTextButton.disabled = true;
+    if (el.buildImazingCandidateButton) el.buildImazingCandidateButton.disabled = true;
+    packageInProgress = false;
+    setCleanupPackageStatus("候選封裝會保留未標記的 Container／Payload 檔案，但尚未經 iMazing 實機驗證。", false);
+    if (el.markedAttachmentCount) el.markedAttachmentCount.textContent = "0";
+    if (el.markedAttachmentSize) el.markedAttachmentSize.textContent = "0 B";
     if (el.exportHtmlButton) el.exportHtmlButton.disabled = true;
     if (el.exportJsonButton) el.exportJsonButton.disabled = true;
     if (el.exportAttachmentsButton) el.exportAttachmentsButton.disabled = true;
+    if (el.runHealthButton) el.runHealthButton.disabled = true;
+    if (el.globalSearchButton) el.globalSearchButton.disabled = true;
+    if (el.globalSearchInput) el.globalSearchInput.value = "";
+    if (el.searchEngineBadge) el.searchEngineBadge.textContent = "未啟用";
+    if (el.globalSearchResults) el.globalSearchResults.innerHTML = '<span class="empty-state">輸入關鍵字後搜尋所有聊天室。</span>';
+    if (el.runTimelineButton) el.runTimelineButton.disabled = true;
+    if (el.timelineSummary) el.timelineSummary.innerHTML = '<span class="empty-state">選取聊天室後分析長間隔與訊息高峰。</span>';
+    if (el.schemaTableSelect) el.schemaTableSelect.innerHTML = '<option value="">載入後選取</option>';
+    if (el.schemaExplorer) el.schemaExplorer.innerHTML = '<span class="empty-state">顯示欄位、索引與遮罩後的範例資料。</span>';
+    if (el.capabilitySummary) el.capabilitySummary.textContent = "尚未探測 SQLite 功能";
+    if (el.healthSummary) el.healthSummary.innerHTML = '<span class="empty-state">載入資料後顯示健檢結果。</span>';
+    if (el.scanAttachmentDuplicatesButton) el.scanAttachmentDuplicatesButton.disabled = true;
+    if (el.duplicateStatus) el.duplicateStatus.textContent = "只會對相同大小的候選檔案計算 SHA-256；不會自動刪除。";
+    if (el.duplicateResults) el.duplicateResults.innerHTML = "";
     if (el.selectedChatTitle) el.selectedChatTitle.textContent = "選取聊天室";
     if (el.selectedChatMeta) el.selectedChatMeta.textContent = "請從左側選取聊天室開始。";
+    if (el.selectedChatEvidence) el.selectedChatEvidence.innerHTML = "";
     if (el.messageStatus) el.messageStatus.textContent = "";
     if (el.chatCount) el.chatCount.textContent = "—";
     if (el.messageCount) el.messageCount.textContent = "—";
@@ -1388,7 +2851,7 @@
   }
 
   function isImageAttachment(attachment) {
-    return /^image\/(?:jpe?g|png|gif|webp|bmp|avif)$/i.test(attachment.mime || "") || /\.(?:jpe?g|png|gif|webp|bmp|avif)$/i.test(attachment.name || "");
+    return /^image\/(?:jpe?g|png|gif|webp|bmp|avif)$/i.test(attachment.mime || "") || /\.(?:jpe?g|png|gif|webp|bmp|avif|thumb)$/i.test(attachment.name || "");
   }
 
   function isThumbnailAttachment(attachment) {
@@ -1433,6 +2896,11 @@
     state.objectUrls.clear();
   }
 
+  function revokeAttachmentPreviewUrls() {
+    state.attachmentPreviewUrls.forEach(function (url) { URL.revokeObjectURL(url); });
+    state.attachmentPreviewUrls.clear();
+  }
+
   function sanitizeMessageForExport(message) {
     return {
       pk: message.pk,
@@ -1453,7 +2921,8 @@
       longitude: message.longitude,
       linkPreviews: message.linkPreviews,
       attachmentHints: message.attachmentHints,
-      attachments: message.attachments
+      attachments: message.attachments,
+      provenance: message.provenance || null
     };
   }
 
@@ -1493,19 +2962,13 @@
   function titleSourceLabel(source) {
     return {
       user: "LINE 使用者資料",
+      "unified-group": "UnifiedGroup.sqlite 目前名稱",
       rename: "群組改名系統訊息",
       group: "LINE 群組資料",
-      members: "群組成員名稱",
       unresolved: "尚未找到可靠名稱"
     }[source] || "未知來源";
   }
 
-  function formatMemberTitle(names) {
-    var visibleNames = names.slice(0, 8);
-    var title = visibleNames.join("、");
-    if (names.length > visibleNames.length) title += "…（共" + names.length + "位）";
-    return title || "未命名群組";
-  }
 
   function toUint8Array(value) {
     if (value instanceof Uint8Array) return value;

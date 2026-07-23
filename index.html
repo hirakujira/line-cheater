@@ -42,6 +42,10 @@
             <input type="radio" name="sourceMode" value="database">
             <span><strong>只讀訊息</strong><small class="path-hint">從備份根目錄找出並選取：<code>Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_&lt;account-id&gt;/Messages/Line.sqlite</code>其中 <code>P_&lt;account-id&gt;</code> 是備份中實際存在的 P_ 開頭資料夾。</small></span>
           </label>
+          <label class="mode-option">
+            <input type="radio" name="sourceMode" value="index">
+            <span><strong>大型備份索引</strong><small>載入 CLI 產生的分片索引，不直接開啟大型 Line.sqlite。</small></span>
+          </label>
         </fieldset>
 
         <div id="folderSourcePicker">
@@ -50,7 +54,7 @@
             <span class="picker-detail">請選取包含 Container 與 Payload 的完整 line 資料夾</span>
             <input id="folderInput" type="file" webkitdirectory directory multiple>
           </label>
-          <p class="helper-text">支援 Chrome、Edge 與 Safari 等可選取資料夾的瀏覽器。來源檔案只會被讀取，不會移動或修改。</p>
+          <p class="helper-text">支援 Safari、Firefox、Chrome 與 Edge 等可選取資料夾的瀏覽器。若 Firefox 版本無法選取資料夾，可改用「只讀訊息」選取 <code>Messages/Line.sqlite</code>，或用 CLI 產生大型索引。來源檔案只會被讀取，不會移動或修改。</p>
         </div>
 
         <div id="databaseSourcePicker" class="hidden">
@@ -60,6 +64,31 @@
             <input id="databaseInput" type="file" accept=".sqlite,application/vnd.sqlite3,application/octet-stream">
           </label>
           <p class="helper-text">備份檔案可透過 iMazing 備份軟體取得。只讀訊息模式不會載入附件；若備份另有同名 WAL／SHM 檔案，請改用完整備份模式以確保資料較完整。</p>
+        </div>
+        <div id="indexSourcePicker" class="hidden">
+          <label class="folder-picker">
+            <span class="picker-title">選取 line-reader-index 資料夾</span>
+            <span class="picker-detail">請選取 CLI 產生且包含 manifest.json、conversations.jsonl 與 messages/ 的索引資料夾</span>
+            <input id="indexInput" type="file" webkitdirectory directory multiple>
+          </label>
+          <p class="helper-text">大型索引只讀取分片資料；來源 SQLite 不會被瀏覽器重新載入。索引必須先由 CLI 驗證，若來源雜湊改變會標示為過期。</p>
+          <div class="cli-help" aria-label="建立大型備份索引的 CLI 說明">
+            <strong>如何用 CLI 建立</strong>
+            <p>請在專案資料夾的 Terminal 執行；<code>--snapshot</code> 指向包含 <code>Container</code> 與 <code>Payload</code> 的完整 LINE 備份資料夾。</p>
+            <pre><code>python3 cli/line_migrator.py index \
+  --snapshot "/path/to/line-backup" \
+  --out "./line-reader-index" \
+  --batch-size 5000
+
+python3 cli/line_migrator.py verify-index \
+  --index "./line-reader-index" \
+  --source "/path/to/line-backup"</code></pre>
+            <p>驗證通過後，回到這裡選取 <code>line-reader-index</code> 資料夾即可。完整參數與大型備份建議請查看 <a href="CLI.md" target="_blank" rel="noreferrer">CLI.md</a>。</p>
+          </div>
+        </div>
+        <div class="workflow-note">
+          <strong>建議使用流程</strong>
+          <span>先用完整 LINE 備份查看聊天室、附件分類與來源關聯；需要搜尋大量訊息、執行瘦身／差異／Schema 等細部操作時，再用本機 CLI。若 <code>Line.sqlite</code> 接近或超過 1 GB，請直接使用 CLI 產生大型分片索引，避免瀏覽器整檔載入造成記憶體壓力。</span>
         </div>
         <div id="loadStatus" class="status-area" role="status" aria-live="polite">尚未選取備份資料夾。</div>
         <div class="progress-track" aria-hidden="true"><span id="progressBar"></span></div>
@@ -100,6 +129,7 @@
                 <p class="section-kicker">3 / 閱讀與匯出</p>
                 <h2 id="selectedChatTitle">選取聊天室</h2>
                 <p id="selectedChatMeta" class="muted">請從左側選取聊天室開始。</p>
+                <div id="selectedChatEvidence" class="chat-evidence" aria-live="polite"></div>
               </div>
               <div class="button-row">
                 <button id="exportHtmlButton" class="button button-primary" type="button" disabled>匯出 HTML 封存</button>
@@ -126,6 +156,128 @@
           <div id="attachmentPreview" class="attachment-preview"></div>
         </section>
 
+        <section class="panel cleanup-panel">
+          <div class="panel-heading compact">
+            <div>
+              <p class="section-kicker">5 / 附件瘦身</p>
+              <h2>標記不需要的附件</h2>
+              <p class="muted">先依 SQLite 關聯選擇個人、群組、社群或孤兒檔案，再查看預覽、脈絡與時間，最後才勾選要移除的檔案；原始備份不會被刪除或修改。</p>
+            </div>
+            <div class="button-row cleanup-actions">
+              <button id="markFilteredAttachmentsButton" class="button button-quiet" type="button" disabled>標記目前搜尋結果</button>
+              <button id="keepAllAttachmentsButton" class="button button-quiet" type="button" disabled>全部保留</button>
+              <button id="clearAttachmentSelectionButton" class="button button-quiet" type="button" disabled>清除勾選</button>
+            </div>
+          </div>
+          <div class="cleanup-warning">
+            <strong>還原前請保留原始檔</strong>
+            <span>此頁面目前輸出的是人工操作計畫，不是已驗證可直接還原的 iMazing 封裝。請先複製原始 <code>.imazingapp</code>，再依計畫在 ZIP 編輯工具中處理。</span>
+          </div>
+          <div class="cleanup-toolbar">
+            <label class="search-box cleanup-search">
+              <span class="sr-only">搜尋附件</span>
+              <input id="attachmentSearch" type="search" placeholder="搜尋附件路徑或檔名">
+            </label>
+            <label class="cleanup-select">
+              <span>顯示</span>
+              <select id="attachmentCategoryFilter">
+                <option value="all">全部檔案</option>
+                <option value="individual">個人聊天室</option>
+                <option value="group">群組聊天室</option>
+                <option value="community">社群</option>
+                <option value="orphan">孤兒檔案</option>
+              </select>
+            </label>
+            <label class="cleanup-select">
+              <span>排序</span>
+              <select id="attachmentSort">
+                <option value="recent">最近傳送／接收</option>
+                <option value="oldest">最早傳送／接收</option>
+                <option value="size">檔案大小</option>
+                <option value="path">來源路徑</option>
+              </select>
+            </label>
+            <div class="cleanup-summary" aria-live="polite">
+              <span>已標記 <strong id="markedAttachmentCount">0</strong> 個</span>
+              <span>預估釋放 <strong id="markedAttachmentSize">0 B</strong></span>
+            </div>
+          </div>
+          <div id="attachmentCategorySummary" class="attachment-category-summary" aria-label="附件分類摘要"></div>
+          <div id="attachmentCleanupList" class="attachment-cleanup-list"></div>
+          <nav class="chat-pagination attachment-pagination" aria-label="附件瘦身清單分頁">
+            <button id="attachmentPrevButton" class="button button-secondary" type="button">上一頁</button>
+            <span id="attachmentPageInfo" class="page-info">第 1 頁</span>
+            <button id="attachmentNextButton" class="button button-secondary" type="button">下一頁</button>
+          </nav>
+          <div class="button-row cleanup-export-row">
+            <button id="exportCleanupPlanButton" class="button button-primary" type="button" disabled>匯出瘦身操作計畫</button>
+            <button id="exportCleanupTextButton" class="button button-secondary" type="button" disabled>匯出操作說明</button>
+            <button id="buildImazingCandidateButton" class="button button-secondary" type="button" disabled>建立 .imazingapp 候選封裝</button>
+          </div>
+          <p id="cleanupPackageStatus" class="helper-text" role="status">候選封裝會保留未標記的 Container／Payload 檔案，但尚未經 iMazing 實機驗證。</p>
+          <div class="duplicate-tools">
+            <div class="insight-card-heading"><h3>附件重複掃描</h3><button id="scanAttachmentDuplicatesButton" class="button button-secondary" type="button" disabled>掃描 exact duplicate</button></div>
+            <p id="duplicateStatus" class="helper-text">只會對相同大小的候選檔案計算 SHA-256；不會自動刪除。</p>
+            <div id="duplicateResults" class="insight-results"></div>
+          </div>
+        </section>
+
+        <section class="panel insight-panel">
+          <div class="panel-heading compact">
+            <div>
+              <p class="section-kicker">6 / 備份理解工具</p>
+              <h2>完整性、證據與搜尋</h2>
+              <p class="muted">所有判斷都保留來源與可信度；推測章節不代表 LINE 原始分類。</p>
+            </div>
+            <span id="capabilitySummary" class="status-pill">尚未探測 SQLite 功能</span>
+          </div>
+          <div class="insight-grid">
+            <article class="insight-card">
+              <div class="insight-card-heading"><h3>備份完整性</h3><button id="runHealthButton" class="button button-secondary" type="button">重新檢查</button></div>
+              <div id="healthSummary" class="health-summary"><span class="empty-state">載入資料後顯示健檢結果。</span></div>
+            </article>
+            <article class="insight-card">
+              <div class="insight-card-heading"><h3>全域訊息搜尋</h3><span id="searchEngineBadge" class="mini-badge">未啟用</span></div>
+              <div class="insight-controls"><input id="globalSearchInput" type="search" placeholder="搜尋訊息文字"><button id="globalSearchButton" class="button button-primary" type="button">搜尋</button></div>
+              <div class="insight-filter-grid">
+                <label><span>聊天室</span><select id="globalSearchChatSelect"><option value="">全部聊天室</option></select></label>
+                <label><span>傳送者</span><select id="globalSearchSenderSelect"><option value="">全部傳送者</option></select></label>
+                <label><span>訊息種類</span><select id="globalSearchContentType"><option value="">全部種類</option></select></label>
+                <label><span>開始日期</span><input id="globalSearchFrom" type="date"></label>
+                <label><span>結束日期</span><input id="globalSearchTo" type="date"></label>
+              </div>
+              <div id="globalSearchResults" class="insight-results"><span class="empty-state">輸入關鍵字後搜尋所有聊天室。</span></div>
+            </article>
+            <article class="insight-card">
+              <div class="insight-card-heading"><h3>對話時間軸／章節</h3><button id="runTimelineButton" class="button button-secondary" type="button" disabled>分析目前聊天室</button></div>
+              <div id="timelineSummary" class="insight-results"><span class="empty-state">選取聊天室後分析長間隔與訊息高峰。</span></div>
+            </article>
+            <article class="insight-card">
+              <div class="insight-card-heading"><h3>SQLite Schema Explorer</h3><span id="schemaStatus" class="mini-badge">唯讀</span></div>
+              <label class="schema-select"><span>資料表</span><select id="schemaTableSelect"><option value="">載入後選取</option></select></label>
+              <div id="schemaExplorer" class="insight-results"><span class="empty-state">顯示欄位、索引與遮罩後的範例資料。</span></div>
+            </article>
+          </div>
+        </section>
+
+      </section>
+
+      <section id="diffPanel" class="panel diff-panel hidden">
+        <div class="panel-heading compact">
+          <div>
+            <p class="section-kicker">7 / 備份差異</p>
+            <h2>比較兩份 LINE SQLite</h2>
+            <p class="muted">只適合小型／中型資料庫快速核對；大型備份請使用 CLI diff。結果會區分 exact 與 unresolved，不把缺席直接稱為刪除。</p>
+          </div>
+          <span class="status-pill">瀏覽器限量</span>
+        </div>
+        <div class="diff-controls">
+          <label class="folder-picker file-picker"><span class="picker-title">左側備份</span><input id="diffLeftInput" type="file" accept=".sqlite,application/vnd.sqlite3,application/octet-stream"></label>
+          <label class="folder-picker file-picker"><span class="picker-title">右側備份</span><input id="diffRightInput" type="file" accept=".sqlite,application/vnd.sqlite3,application/octet-stream"></label>
+          <button id="runDiffButton" class="button button-primary" type="button">開始比較</button>
+        </div>
+        <p id="diffStatus" class="helper-text">尚未選取兩份資料庫。</p>
+        <div id="diffResults" class="insight-results"></div>
       </section>
     </main>
 
@@ -136,6 +288,8 @@
 
     <!-- sql.js is used only for local, read-only SQLite parsing. -->
     <script src="https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/sql-wasm.js"></script>
+    <!-- fflate provides streaming ZIP output for the local candidate package. -->
+    <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
     <script src="app.js"></script>
   </body>
 </html>
