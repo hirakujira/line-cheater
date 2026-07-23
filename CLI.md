@@ -1,4 +1,4 @@
-# LINE 備份閱讀器 CLI
+# LINE Cheater CLI
 
 CLI 位於 `cli/line_migrator.py`，適合大量 SQLite、批次搜尋、附件重複掃描、備份差異與 `.imazingapp` 候選封裝測試。它以 Python 標準函式庫執行，來源 SQLite 使用唯讀連線；所有 `--out` 輸出都應放在來源外部的新資料夾。
 

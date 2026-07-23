@@ -1087,16 +1087,6 @@
     };
   }
 
-  function attachmentScopeLabel(scope) {
-    return {
-      individual: "個人聊天室",
-      direct: "個人聊天室",
-      group: "群組聊天室",
-      community: "社群",
-      orphan: "孤兒檔案"
-    }[scope] || "未知分類";
-  }
-
   function resolveChatTitle(chatId, chatType, chatPk) {
     var id = stringOrEmpty(chatId);
     var idKey = lookupId(id);
@@ -1746,24 +1736,11 @@
     return left.chat.title.localeCompare(right.chat.title, "zh-Hant");
   }
 
-  function getFilteredAttachmentFiles() {
-    return getFilteredAttachmentReviewRows().reduce(function (files, row) {
-      return files.concat(row.files.map(function (descriptor) { return descriptor.file; }));
-    }, []);
-  }
-
   function getAttachmentCleanupTotalPages() {
     var items = state.selectedAttachmentCleanupGroup
       ? getFilteredAttachmentReviewRows()
       : getFilteredAttachmentCleanupGroups();
     return Math.max(1, Math.ceil(items.length / ATTACHMENT_CLEANUP_PAGE_SIZE));
-  }
-
-  function getCurrentAttachmentReviewRows() {
-    if (!state.selectedAttachmentCleanupGroup) return [];
-    var rows = getFilteredAttachmentReviewRows();
-    var start = (state.attachmentCleanupPage - 1) * ATTACHMENT_CLEANUP_PAGE_SIZE;
-    return rows.slice(start, start + ATTACHMENT_CLEANUP_PAGE_SIZE);
   }
 
   function archiveRelativePath(file) {
@@ -4203,12 +4180,6 @@
     }
     if (Array.isArray(value)) return new Uint8Array(value);
     return null;
-  }
-
-  function bytesToHex(bytes, offset, length) {
-    var hex = "";
-    for (var i = offset; i < offset + length; i += 1) hex += bytes[i].toString(16).padStart(2, "0");
-    return hex;
   }
 
   function normalizeTimestamp(value) {

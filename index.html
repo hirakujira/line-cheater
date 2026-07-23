@@ -4,14 +4,15 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="description" content="在瀏覽器本機閱讀、搜尋與匯出 iOS LINE 聊天備份">
-    <title>LINE 備份閱讀器</title>
+    <title>LINE Cheater</title>
     <link rel="stylesheet" href="styles.css">
   </head>
   <body>
     <main class="app-shell">
       <header class="hero">
         <p class="eyebrow">本機解析 · 支援 GitHub Pages</p>
-        <h1>LINE 備份閱讀器</h1>
+        <h1>LINE Cheater</h1>
+        <p class="hero-tagline">你的 LINE 清得乾乾淨淨</p>
         <p class="hero-copy">
           在瀏覽器中讀取 iOS LINE App Container 備份，搜尋聊天室、閱讀訊息並整理附件。
         </p>
@@ -318,7 +319,7 @@ python3 cli/line_migrator.py verify-index \
     <div id="packageModal" class="package-modal is-processing hidden" role="dialog" aria-modal="true" aria-labelledby="packageModalTitle" aria-describedby="packageModalMessage">
       <div class="package-modal-backdrop" aria-hidden="true"></div>
       <section class="package-modal-card" role="document" tabindex="-1">
-        <div id="packageModalState" class="package-modal-state" aria-hidden="true">
+        <div class="package-modal-state" aria-hidden="true">
           <span class="package-modal-spinner"></span>
         </div>
         <p class="section-kicker">瘦身封裝</p>
@@ -342,8 +343,12 @@ python3 cli/line_migrator.py verify-index \
     </div>
 
     <footer class="app-footer">
-      <span>LINE 備份閱讀器 · 僅在本機處理</span>
-      <span>閱讀、搜尋與附件瘦身</span>
+      <span>LINE Cheater · 僅在本機處理</span>
+      <span class="app-footer-credits">
+        Powered by <a href="https://github.com/zeuikli" target="_blank" rel="noopener noreferrer">zeuikli</a>
+        &amp; <a href="https://github.com/hirakujira" target="_blank" rel="noopener noreferrer">hirakujira</a>
+        · <a href="https://github.com/zeuikli/line-cheater" target="_blank" rel="noopener noreferrer">GitHub repo</a>
+      </span>
     </footer>
 
     <!-- sql.js is used only for local, read-only SQLite parsing. -->
