@@ -58,6 +58,7 @@ h1, h2, p { margin-top: 0; }
 h1 { margin-bottom: 12px; font-size: clamp(2rem, 5vw, 4.2rem); line-height: 1.05; letter-spacing: -0.04em; }
 h2 { margin-bottom: 4px; font-size: 1.25rem; line-height: 1.2; }
 h3 { margin: 0; font-size: 1.05rem; line-height: 1.25; }
+.hero-tagline { margin: 0 0 10px; color: var(--accent-strong); font-size: 1.35rem; font-weight: 800; letter-spacing: -0.01em; }
 .hero-copy { max-width: 650px; color: var(--muted); font-size: 1.05rem; }
 
 .privacy-note {
@@ -230,9 +231,6 @@ h3 { margin: 0; font-size: 1.05rem; line-height: 1.25; }
 .insight-filter-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
 .insight-filter-grid label { display: grid; gap: 4px; color: var(--muted); font-size: .76rem; font-weight: 700; }
 .insight-filter-grid select, .insight-filter-grid input { width: 100%; min-width: 0; box-sizing: border-box; }
-.attachment-evidence { margin-top: 5px; color: var(--muted); font-size: .74rem; }
-.attachment-evidence summary { cursor: pointer; color: var(--accent-strong); font-weight: 700; }
-.attachment-evidence small { display: block; margin-top: 4px; line-height: 1.45; }
 .insight-results { max-height: 260px; overflow: auto; }
 .health-list { display: grid; gap: 5px; margin: 0; font-size: 0.8rem; }
 .health-list div { display: flex; justify-content: space-between; gap: 10px; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; }
@@ -618,6 +616,8 @@ body.image-modal-open { overflow: hidden; }
 
 
 .app-footer { display: flex; justify-content: space-between; gap: 16px; width: min(1440px, calc(100% - 32px)); margin: 0 auto; padding: 0 0 30px; color: var(--muted); font-size: 0.8rem; }
+.app-footer-credits a { color: var(--accent-strong); text-decoration: none; font-weight: 600; }
+.app-footer-credits a:hover { text-decoration: underline; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 
 @media (max-width: 900px) {
