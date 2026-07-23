@@ -1,6 +1,6 @@
 # LINE Cheater｜GitHub Pages 部署包
 
-**直接使用：<https://zeuikli.github.io/line-cheater/>**
+**直接使用：<https://line-cheater.gginin.de>**
 
 這個資料夾包含可直接上傳到 GitHub Pages 的純前端版本，以及供本機使用的 CLI。GitHub Pages 只會發布 HTML／CSS／JavaScript，不會執行 `cli/`。
 
