@@ -25,6 +25,15 @@ LINE iOS App Container 備份檔案可透過 iMazing 備份軟體取得；本工
 
 ### 2. 附件瘦身
 
+附件清單會先依 `Line.sqlite` 的訊息關聯分組，再讓你逐一檢查：
+
+- **個人聊天室**：附件可對應到一對一聊天室。
+- **群組聊天室**：附件可對應到群組聊天室。
+- **社群**：附件可對應到社群／公開聊天室。
+- **孤兒檔案**：檔名或內部識別資訊找不到目前 `Line.sqlite` 訊息關聯，必須人工確認後才能選取。
+
+每筆附件會盡可能顯示縮圖、聊天室名稱、傳送者、傳送／接收時間、訊息內容摘要與「SQLite 已關聯／未引用」狀態。聊天室名稱優先讀取 `UnifiedGroup.sqlite` 的目前名稱，再使用 `ZGROUP` 或最新改名系統訊息；不使用成員名單拼接名稱。只有在完成脈絡確認後，才透過勾選框加入刪除計畫；未勾選的檔案預設保留。
+
 附件瘦身區分為兩種輸出：
 
 | 輸出 | 用途 | 安全狀態 |
@@ -54,45 +63,11 @@ LINE iOS App Container 備份檔案可透過 iMazing 備份軟體取得；本工
 
 參考：[Hiraku Dev 的 LINE 瘦身說明](https://hiraku.dev/2025/09/7802/)、[iMazing App Data 備份與還原說明](https://imazing.com/guides/how-to-export-backup-and-transfer-ios-apps-data-and-settings)。
 
-### 3. 本機 CLI（開發中）
+### 3. 本機 CLI 與大型備份
 
-CLI 位於 repository 的 `cli/`，需要在本機執行；目前提供安全探測、staging、SQLite schema 檢查，以及 `.imazingapp` 候選封裝測試：
+完整命令、從完整備份到大型分片索引的建議流程、搜尋／差異／瘦身操作與安全限制，請看獨立文件：[CLI.md](CLI.md)。
 
-```bash
-cd /path/to/line-github-pages
-
-# 掃描來源，不讀取訊息內容
-python3 -m cli.line_migrator inspect \
-  --source /path/to/line-backup \
-  --format text
-
-# 建立來源外部的 staging 副本，不修改來源
-python3 -m cli.line_migrator snapshot \
-  --source /path/to/line-backup \
-  --out /path/to/line-work/snapshot
-
-# 以唯讀 SQLite 連線檢查 schema
-python3 -m cli.line_migrator parse \
-  --snapshot /path/to/line-work/snapshot \
-  --out /path/to/line-work/schema-output
-
-# 在副本上移除指定縮圖，產生候選封裝並驗證 ZIP／核心檔案雜湊
-python3 -m cli.line_migrator slim-test \
-  --source /path/to/LINE.imazingapp \
-  --out /path/to/line-work/LINE-slim.imazingapp.candidate \
-  --entry 'Container/.../Message Thumbnails/<thumbnail-file>' \
-  --report /path/to/line-work/slim-test-report.json
-```
-
-CLI 安全限制：
-
-- `--out` 不得放在來源資料夾本身或其子目錄。
-- `snapshot` 只複製 `.lock`、`iTunesArtwork`、`iTunesMetadata.plist`、`Container/` 與 `Payload/`。
-- SQLite 使用唯讀 URI；目前不會執行 `INSERT`、`UPDATE`、`DELETE` 或 `VACUUM`。
-- `slim-test` 永遠先複製來源，輸出必須是新的 `.imazingapp.candidate`，不會覆寫原始檔。
-- `slim-test` 預設只允許移除 `Message Thumbnails`；移除 `Message Attachments` 原檔必須明確加上 `--allow-original-attachments`。
-- CLI 會用 macOS 的 `zip`／`unzip` 以 `LC_ALL=C` 讀取原始 ZIP entry，驗證來源未變更、指定 entry 確實移除、核心 entry SHA-256 未變更與 ZIP CRC 通過。
-- 候選封裝尚未代表 iMazing dry-run 或測試 iPhone 還原成功；正式使用前仍須在副本上逐階段驗證。
+簡化判斷：先在網頁讀完整備份做初步確認；需要批次或細部操作時使用 CLI。若 `Line.sqlite` 接近或超過瀏覽器安全記憶體門檻，直接使用 CLI 產生 `line-reader-index`，再回到網頁選取「大型備份索引」。
 
 ### 4. 隱私與網路
 
