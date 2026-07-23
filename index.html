@@ -13,8 +13,7 @@
         <p class="eyebrow">本機解析 · 支援 GitHub Pages</p>
         <h1>LINE 備份閱讀器</h1>
         <p class="hero-copy">
-          在瀏覽器中讀取 iOS LINE App Container 備份，搜尋聊天室、閱讀訊息並整理附件。<br>
-          資料只在目前分頁處理，不會上傳到伺服器。
+          在瀏覽器中讀取 iOS LINE App Container 備份，搜尋聊天室、閱讀訊息並整理附件。
         </p>
       </header>
 
@@ -26,7 +25,7 @@
       <section class="panel source-panel">
         <div class="panel-heading">
           <div>
-            <p class="section-kicker">1 / 載入來源</p>
+            <p class="section-kicker">載入來源</p>
             <h2>選擇 LINE 資料來源</h2>
           </div>
           <span id="runtimeBadge" class="status-pill">等待選取</span>
@@ -34,19 +33,32 @@
 
         <fieldset class="source-modes">
           <legend>載入方式</legend>
-          <label class="mode-option">
+          <label class="mode-option recommended">
             <input type="radio" name="sourceMode" value="folder" checked>
-            <span><strong>完整 LINE 備份</strong><small>可閱讀訊息，也會建立附件索引與下載連結。</small></span>
+            <span>
+              <span class="mode-option-title"><strong>完整 LINE 備份</strong><span class="mode-recommended">推薦</span></span>
+              <small>一般情況直接選這個。</small>
+            </span>
           </label>
           <label class="mode-option">
             <input type="radio" name="sourceMode" value="database">
-            <span><strong>只讀訊息</strong><small class="path-hint">從備份根目錄找出並選取：<code>Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_&lt;account-id&gt;/Messages/Line.sqlite</code>其中 <code>P_&lt;account-id&gt;</code> 是備份中實際存在的 P_ 開頭資料夾。</small></span>
+            <span><strong>只讀訊息</strong><small>只選取 <code>Line.sqlite</code>。</small></span>
           </label>
           <label class="mode-option">
             <input type="radio" name="sourceMode" value="index">
-            <span><strong>大型備份索引</strong><small>載入 CLI 產生的分片索引，不直接開啟大型 Line.sqlite。</small></span>
+            <span><strong>大型備份索引</strong><small>載入 CLI 產生的索引資料夾。</small></span>
           </label>
         </fieldset>
+        <div class="source-mode-guidance" aria-label="其他載入方式適用時機">
+          <article>
+            <strong>何時用「只讀訊息」？</strong>
+            <span>只想查閱訊息，或瀏覽器無法選取完整資料夾時使用。此模式沒有附件、縮圖與附件瘦身功能。</span>
+          </article>
+          <article>
+            <strong>何時用「大型備份索引」？</strong>
+            <span><code>Line.sqlite</code> 接近或超過 1 GB，或要處理大型備份時，先用 CLI 產生並驗證索引，再回來載入。</span>
+          </article>
+        </div>
 
         <div id="folderSourcePicker">
           <label class="folder-picker">
@@ -54,7 +66,7 @@
             <span class="picker-detail">請選取包含 Container 與 Payload 的完整 line 資料夾</span>
             <input id="folderInput" type="file" webkitdirectory directory multiple>
           </label>
-          <p class="helper-text">支援 Safari、Firefox、Chrome 與 Edge 等可選取資料夾的瀏覽器。若 Firefox 版本無法選取資料夾，可改用「只讀訊息」選取 <code>Messages/Line.sqlite</code>，或用 CLI 產生大型索引。來源檔案只會被讀取，不會移動或修改。</p>
+          <p class="helper-text">支援 Safari、Firefox、Chrome 與 Edge 等可選取資料夾的瀏覽器。若 Firefox 版本無法選取資料夾，可改用「只讀訊息」選取 <code>Messages/Line.sqlite</code>，或用 CLI 產生大型索引。</p>
         </div>
 
         <div id="databaseSourcePicker" class="hidden">
@@ -86,10 +98,6 @@ python3 cli/line_migrator.py verify-index \
             <p>驗證通過後，回到這裡選取 <code>line-reader-index</code> 資料夾即可。完整參數與大型備份建議請查看 <a href="CLI.md" target="_blank" rel="noreferrer">CLI.md</a>。</p>
           </div>
         </div>
-        <div class="workflow-note">
-          <strong>建議使用流程</strong>
-          <span>先用完整 LINE 備份查看聊天室、附件分類與來源關聯；需要搜尋大量訊息、執行瘦身／差異／Schema 等細部操作時，再用本機 CLI。若 <code>Line.sqlite</code> 接近或超過 1 GB，請直接使用 CLI 產生大型分片索引，避免瀏覽器整檔載入造成記憶體壓力。</span>
-        </div>
         <div id="loadStatus" class="status-area" role="status" aria-live="polite">尚未選取備份資料夾。</div>
         <div class="progress-track" aria-hidden="true"><span id="progressBar"></span></div>
       </section>
@@ -102,12 +110,18 @@ python3 cli/line_migrator.py verify-index \
           <article class="stat-card"><span>來源大小</span><strong id="sourceSize">—</strong></article>
         </div>
 
-        <div class="content-grid">
+        <section class="feature-section browse-feature-section" aria-labelledby="browseFeatureHeading">
+          <div class="feature-section-heading">
+            <div>
+              <p class="section-kicker">主要操作</p>
+              <h2 id="browseFeatureHeading">瀏覽功能</h2>
+            </div>
+          </div>
+          <div class="content-grid">
           <aside class="panel chat-panel">
             <div class="panel-heading compact">
               <div>
-                <p class="section-kicker">2 / 瀏覽聊天室</p>
-                <h2>聊天室</h2>
+                <h3>聊天室</h3>
               </div>
               <button id="clearButton" class="button button-quiet" type="button">清除資料</button>
             </div>
@@ -126,8 +140,7 @@ python3 cli/line_migrator.py verify-index \
           <section class="panel messages-panel">
             <div class="panel-heading compact">
               <div>
-                <p class="section-kicker">3 / 閱讀與匯出</p>
-                <h2 id="selectedChatTitle">選取聊天室</h2>
+                <h3 id="selectedChatTitle">選取聊天室</h3>
                 <p id="selectedChatMeta" class="muted">請從左側選取聊天室開始。</p>
                 <div id="selectedChatEvidence" class="chat-evidence" aria-live="polite"></div>
               </div>
@@ -142,41 +155,39 @@ python3 cli/line_migrator.py verify-index \
             </div>
             <button id="loadMoreButton" class="button button-secondary load-more hidden" type="button">載入更多訊息</button>
           </section>
-        </div>
-
-        <section class="panel attachment-panel">
-          <div class="panel-heading compact">
-            <div>
-              <p class="section-kicker">4 / 附件檔案</p>
-              <h2>附件索引</h2>
-              <p class="muted">依訊息 metadata 建立附件關聯；無法完全確認時，會標示為可能附件供你核對。</p>
-            </div>
-            <button id="exportAttachmentsButton" class="button button-secondary" type="button" disabled>匯出附件清單</button>
           </div>
-          <div id="attachmentPreview" class="attachment-preview"></div>
         </section>
 
         <section class="panel cleanup-panel">
           <div class="panel-heading compact">
             <div>
-              <p class="section-kicker">5 / 附件瘦身</p>
-              <h2>標記不需要的附件</h2>
-              <p class="muted">先依 SQLite 關聯選擇個人、群組、社群或孤兒檔案，再查看預覽、脈絡與時間，最後才勾選要移除的檔案；原始備份不會被刪除或修改。</p>
-            </div>
-            <div class="button-row cleanup-actions">
-              <button id="markFilteredAttachmentsButton" class="button button-quiet" type="button" disabled>標記目前搜尋結果</button>
-              <button id="keepAllAttachmentsButton" class="button button-quiet" type="button" disabled>全部保留</button>
-              <button id="clearAttachmentSelectionButton" class="button button-quiet" type="button" disabled>清除勾選</button>
+              <p class="section-kicker">保留空間管理</p>
+              <h2>瘦身功能</h2>
+              <p class="muted">先選取聊天室或特殊分類，再查看附件內容並勾選要刪除的原始附件或縮圖。建立瘦身 .imazingapp 時，會輸出一份刪除標記附件的新封裝。</p>
             </div>
           </div>
+          <ol class="cleanup-guide" aria-label="附件審核步驟">
+            <li><span>1</span><strong>選取聊天室</strong><small>先從列表選擇單人、群組、社群或孤兒檔案分類</small></li>
+            <li><span>2</span><strong>看預覽與脈絡</strong><small>用縮圖、傳送者、時間與訊息摘要辨識內容</small></li>
+            <li><span>3</span><strong>勾選要刪除的檔案</strong><small>原始附件與縮圖可以分開決定</small></li>
+          </ol>
           <div class="cleanup-warning">
             <strong>還原前請保留原始檔</strong>
-            <span>此頁面目前輸出的是人工操作計畫，不是已驗證可直接還原的 iMazing 封裝。請先複製原始 <code>.imazingapp</code>，再依計畫在 ZIP 編輯工具中處理。</span>
+            <span>「孤兒檔案」表示附件未被路徑所屬聊天室的目前 <code>Line.sqlite</code> 訊息引用，仍需人工確認。此頁面輸出的是操作計畫，不是已驗證可直接還原的 iMazing 封裝。</span>
           </div>
           <div class="cleanup-toolbar">
             <label class="search-box cleanup-search">
               <span class="sr-only">搜尋附件</span>
-              <input id="attachmentSearch" type="search" placeholder="搜尋附件路徑或檔名">
+              <input id="attachmentSearch" type="search" placeholder="搜尋聊天室、傳送者、訊息內容或檔名">
+            </label>
+            <label class="cleanup-filter">
+              <span>顯示</span>
+              <select id="attachmentKindFilter">
+                <option value="all">全部檔案</option>
+                <option value="original">只看原始附件</option>
+                <option value="thumbnail">只看縮圖</option>
+                <option value="marked">只看已標記刪除</option>
+              </select>
             </label>
             <label class="cleanup-select">
               <span>顯示</span>
@@ -185,7 +196,8 @@ python3 cli/line_migrator.py verify-index \
                 <option value="individual">個人聊天室</option>
                 <option value="group">群組聊天室</option>
                 <option value="community">社群</option>
-                <option value="orphan">孤兒檔案</option>
+                <option value="unreferenced">SQLite 未引用</option>
+                <option value="unconfirmed">無法確認</option>
               </select>
             </label>
             <label class="cleanup-select">
@@ -203,7 +215,8 @@ python3 cli/line_migrator.py verify-index \
             </div>
           </div>
           <div id="attachmentCategorySummary" class="attachment-category-summary" aria-label="附件分類摘要"></div>
-          <div id="attachmentCleanupList" class="attachment-cleanup-list"></div>
+          <p id="cleanupResultInfo" class="cleanup-result-info" aria-live="polite"></p>
+          <div id="attachmentCleanupList" class="attachment-cleanup-list" aria-label="依聊天室分類的附件"></div>
           <nav class="chat-pagination attachment-pagination" aria-label="附件瘦身清單分頁">
             <button id="attachmentPrevButton" class="button button-secondary" type="button">上一頁</button>
             <span id="attachmentPageInfo" class="page-info">第 1 頁</span>
@@ -212,9 +225,9 @@ python3 cli/line_migrator.py verify-index \
           <div class="button-row cleanup-export-row">
             <button id="exportCleanupPlanButton" class="button button-primary" type="button" disabled>匯出瘦身操作計畫</button>
             <button id="exportCleanupTextButton" class="button button-secondary" type="button" disabled>匯出操作說明</button>
-            <button id="buildImazingCandidateButton" class="button button-secondary" type="button" disabled>建立 .imazingapp 候選封裝</button>
+            <button id="buildImazingCandidateButton" class="button button-secondary" type="button" disabled>建立瘦身 .imazingapp</button>
           </div>
-          <p id="cleanupPackageStatus" class="helper-text" role="status">候選封裝會保留未標記的 Container／Payload 檔案，但尚未經 iMazing 實機驗證。</p>
+          <p id="cleanupPackageStatus" class="helper-text" role="status">瘦身 .imazingapp 會保留未標記的 Container／Payload 檔案，尚未經 iMazing 實機驗證。</p>
           <div class="duplicate-tools">
             <div class="insight-card-heading"><h3>附件重複掃描</h3><button id="scanAttachmentDuplicatesButton" class="button button-secondary" type="button" disabled>掃描 exact duplicate</button></div>
             <p id="duplicateStatus" class="helper-text">只會對相同大小的候選檔案計算 SHA-256；不會自動刪除。</p>
@@ -222,11 +235,17 @@ python3 cli/line_migrator.py verify-index \
           </div>
         </section>
 
+        <section class="feature-section advanced-feature-section" aria-labelledby="advancedFeatureHeading">
+          <div class="feature-section-heading">
+            <div>
+              <p class="section-kicker">延伸工具</p>
+              <h2 id="advancedFeatureHeading">進階功能</h2>
+            </div>
+          </div>
         <section class="panel insight-panel">
           <div class="panel-heading compact">
             <div>
-              <p class="section-kicker">6 / 備份理解工具</p>
-              <h2>完整性、證據與搜尋</h2>
+              <h3>完整性、證據與搜尋</h3>
               <p class="muted">所有判斷都保留來源與可信度；推測章節不代表 LINE 原始分類。</p>
             </div>
             <span id="capabilitySummary" class="status-pill">尚未探測 SQLite 功能</span>
@@ -260,13 +279,10 @@ python3 cli/line_migrator.py verify-index \
           </div>
         </section>
 
-      </section>
-
-      <section id="diffPanel" class="panel diff-panel hidden">
+        <section id="diffPanel" class="panel diff-panel hidden">
         <div class="panel-heading compact">
           <div>
-            <p class="section-kicker">7 / 備份差異</p>
-            <h2>比較兩份 LINE SQLite</h2>
+            <h3>比較兩份 LINE SQLite</h3>
             <p class="muted">只適合小型／中型資料庫快速核對；大型備份請使用 CLI diff。結果會區分 exact 與 unresolved，不把缺席直接稱為刪除。</p>
           </div>
           <span class="status-pill">瀏覽器限量</span>
@@ -279,17 +295,59 @@ python3 cli/line_migrator.py verify-index \
         <p id="diffStatus" class="helper-text">尚未選取兩份資料庫。</p>
         <div id="diffResults" class="insight-results"></div>
       </section>
+        </section>
+      </section>
     </main>
+
+    <div id="loadModal" class="package-modal load-modal is-processing hidden" role="dialog" aria-modal="true" aria-labelledby="loadModalTitle" aria-describedby="loadModalMessage">
+      <div class="package-modal-backdrop" aria-hidden="true"></div>
+      <section class="package-modal-card" role="document" tabindex="-1">
+        <div class="package-modal-state" aria-hidden="true">
+          <span class="package-modal-spinner"></span>
+        </div>
+        <p class="section-kicker">LINE 備份</p>
+        <h2 id="loadModalTitle">正在讀取備份</h2>
+        <p id="loadModalMessage" class="package-modal-message" role="status" aria-live="polite">正在準備選取的檔案，請勿關閉此頁面。</p>
+        <div class="package-modal-progress-track">
+          <div id="loadModalProgress" class="package-modal-progress" role="progressbar" aria-label="讀取進度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+        </div>
+        <p id="loadModalProgressLabel" class="package-modal-progress-label">0%</p>
+      </section>
+    </div>
+
+    <div id="packageModal" class="package-modal is-processing hidden" role="dialog" aria-modal="true" aria-labelledby="packageModalTitle" aria-describedby="packageModalMessage">
+      <div class="package-modal-backdrop" aria-hidden="true"></div>
+      <section class="package-modal-card" role="document" tabindex="-1">
+        <div id="packageModalState" class="package-modal-state" aria-hidden="true">
+          <span class="package-modal-spinner"></span>
+        </div>
+        <p class="section-kicker">瘦身封裝</p>
+        <h2 id="packageModalTitle">正在建立 .imazingapp</h2>
+        <p id="packageModalMessage" class="package-modal-message" role="status" aria-live="polite">正在整理保留的檔案，請勿關閉此頁面。</p>
+        <div class="package-modal-progress-track">
+          <div id="packageModalProgress" class="package-modal-progress" role="progressbar" aria-label="封裝進度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+        </div>
+        <p id="packageModalProgressLabel" class="package-modal-progress-label">0%</p>
+        <button id="packageModalClose" class="button button-primary package-modal-close hidden" type="button">完成</button>
+      </section>
+    </div>
+
+    <div id="imageModal" class="image-modal hidden" role="dialog" aria-modal="true" aria-labelledby="imageModalCaption">
+      <div class="image-modal-backdrop" aria-hidden="true"></div>
+      <section class="image-modal-card" role="document" tabindex="-1">
+        <button id="imageModalClose" class="image-modal-close" type="button" aria-label="關閉圖片預覽">關閉</button>
+        <img id="imageModalImage" alt="">
+        <p id="imageModalCaption" class="image-modal-caption"></p>
+      </section>
+    </div>
 
     <footer class="app-footer">
       <span>LINE 備份閱讀器 · 僅在本機處理</span>
-      <span>來源檔案只讀，不會被修改</span>
+      <span>閱讀、搜尋與附件瘦身</span>
     </footer>
 
     <!-- sql.js is used only for local, read-only SQLite parsing. -->
     <script src="https://cdn.jsdelivr.net/npm/sql.js@1.12.0/dist/sql-wasm.js"></script>
-    <!-- fflate provides streaming ZIP output for the local candidate package. -->
-    <script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
     <script src="app.js"></script>
   </body>
 </html>
