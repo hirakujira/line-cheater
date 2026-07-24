@@ -90,8 +90,8 @@ signature, verifies the bundle, and produces:
 
 ```text
 native/electron/dist/mac-<arch>/LINE Cheater.app
-native/electron/dist/LINE-Cheater-0.1.0-macOS-<arch>.zip
-native/electron/dist/LINE-Cheater-0.1.0-macOS-<arch>.dmg
+native/electron/dist/LINE-Cheater-0.1.1-macOS-<arch>.zip
+native/electron/dist/LINE-Cheater-0.1.1-macOS-<arch>.dmg
 native/electron/dist/SHA256SUMS.txt
 ```
 

@@ -1,91 +1,123 @@
-# LINE Cheater｜GitHub Pages 部署包
+# LINE Cheater
 
-> 超大型備份與桌面版 Rust core 的架構、目前進度、驗證紀錄及接手說明請見
-> [NATIVE.md](NATIVE.md)。
+LINE iOS App Container 備份的本機瀏覽、分析與保守瘦身工具。支援純網頁版、Python CLI、Rust CLI 與 Electron 桌面版。所有來源備份都以唯讀方式開啟，候選輸出必須另存，不會覆寫原始檔。
 
-> 可執行的 Electron + Rust 開發預覽、啟動方式與安全邊界請見
-> [native/electron/README.md](native/electron/README.md)。
+**網頁版：<https://line-cheater.gginin.de>**
 
-**直接使用：<https://line-cheater.gginin.de>**
+## 選擇使用方式
 
-Apple Silicon macOS 測試版可用
-`native/electron/scripts/package-dmg.sh` 產生並驗證 `.app`、ZIP 與 DMG；
-已有依賴時可設定 `SKIP_NPM_CI=1` 加速執行。
-目前為 ad-hoc 簽章、尚未 Apple Developer ID 簽署或 notarize；公開散布與
-Intel Mac 支援狀態請見 [macOS package 說明](native/electron/README.md#macos-package)。
-
-這個資料夾包含可直接上傳到 GitHub Pages 的純前端版本，以及供本機使用的 CLI。GitHub Pages 只會發布 HTML／CSS／JavaScript，不會執行 `cli/`。
-
-## 上傳方式
-
-將本資料夾內的所有檔案放到 GitHub repository 的根目錄，或放到你設定給 GitHub Pages 的發布目錄。
-
-不要把原始 LINE 備份資料夾、`Container`、`Payload`、SQLite 檔案或個人聊天內容放進 repository。
-
-## 使用方式
-
-LINE iOS App Container 備份檔案可透過 iMazing 備份軟體取得；本工具不會直接操作 iMazing，只讀取你選取的備份檔案。
-
-### 1. 閱讀與匯出
-
-1. 開啟 GitHub Pages 網址。
-2. 選擇載入方式：
-   - **完整 LINE 備份**：選取整個備份資料夾，可使用附件索引、圖片預覽與本機附件連結。
-   - **只讀訊息**：只選取 `Messages/Line.sqlite`。完整路徑為：
-     `Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_<account-id>/Messages/Line.sqlite`
-     其中 `P_<account-id>` 是備份中實際存在的 `P_` 開頭資料夾。
-3. 搜尋聊天室、閱讀訊息，或匯出 HTML／JSON／附件清單。
-4. 若備份另有 `Line.sqlite-wal`／`Line.sqlite-shm`，建議使用完整備份模式，以降低遺漏最近資料的風險。
-
-### 2. 附件瘦身
-
-附件清單會先依 `Line.sqlite` 的訊息關聯分組，再讓你逐一檢查：
-
-- **個人聊天室**：附件可對應到一對一聊天室。
-- **群組聊天室**：附件可對應到群組聊天室。
-- **社群**：附件可對應到社群／公開聊天室。
-- **孤兒檔案**：檔名或內部識別資訊找不到目前 `Line.sqlite` 訊息關聯，必須人工確認後才能選取。
-
-每筆附件會盡可能顯示縮圖、聊天室名稱、傳送者、傳送／接收時間、訊息內容摘要與「SQLite 已關聯／未引用」狀態。聊天室名稱優先讀取 `UnifiedGroup.sqlite` 的目前名稱，再使用 `ZGROUP` 或最新改名系統訊息；不使用成員名單拼接名稱。只有在完成脈絡確認後，才透過勾選框加入刪除計畫；未勾選的檔案預設保留。
-
-附件瘦身區分為兩種輸出：
-
-| 輸出 | 用途 | 安全狀態 |
+| 工具 | 適合情況 | 說明 |
 |---|---|---|
-| 瘦身操作計畫 | 匯出要移除的附件清單、容量與警告 | 可直接產生，原始檔不會變更 |
-| 瘦身 `.imazingapp` | 以未標記檔案重新建立 ZIP，輸出檔名為 `LINE-slimmed-<時間戳>.imazingapp` | 已成功透過 iMazing 還原到手機；仍建議保留原始檔並先用測試裝置驗證 |
+| 網頁版 | 快速查看、匯出與附件審核 | 在瀏覽器本機讀取完整備份、單一 SQLite 或大型備份索引。 |
+| Python CLI | 大型 SQLite、批次分析與可驗證的索引輸出 | 使用 Python 標準函式庫，支援 snapshot、health、index、search、diff 與 slim-test。 |
+| Rust CLI | 有界記憶體的本機資料處理 | 提供聊天、訊息、搜尋、catalog、標記與候選檔建立能力。 |
+| Electron 桌面版 | 大型備份的圖形介面與進階清理 | 以 Rust sidecar 處理 `.imazingapp` 或解開的備份資料夾，目前提供 macOS arm64 測試封裝。 |
 
-安全操作順序：
+詳細命令與架構文件：
 
-1. 永遠保留原始 `.imazingapp`，不要直接覆寫。
-2. 在附件瘦身區依聊天室審核附件：先看聊天室名稱，再用縮圖、傳送者、時間與訊息摘要辨識內容。原始附件與縮圖可以分開勾選；未勾選檔案預設保留。
-3. 優先只測試一個 `Message Thumbnails` 縮圖，不要第一輪刪除 `Message Attachments` 原始附件。
-4. 使用「匯出瘦身操作計畫」保存 JSON／純文字清單。
-5. 按下「建立瘦身 .imazingapp」，輸出檔名為 `LINE-slimmed-<時間戳>.imazingapp`。
-6. 保留原始 `.imazingapp`，將瘦身輸出於 iMazing 的 **Manage Apps → Restore App Data** 還原。
-7. 建議先用測試裝置驗證還原結果，確認無誤後再於主力手機還原。
+- [Python CLI](CLI.md)
+- [原生 core 架構、限制與驗證紀錄](NATIVE.md)
+- [Electron 開發、封裝與安全邊界](native/electron/README.md)
 
-瘦身 `.imazingapp` 限制：
+## 網頁版快速開始
 
-- 只保留未標記的 `Container/`、`Payload/` 與必要根目錄檔案（`.lock`、`iTunesArtwork`、`iTunesMetadata.plist`）。
-- 選取的資料夾若沒有 `Container/`，或 `Messages/Line.sqlite` 不在保留集合中，封裝會中止。
-- 支援 File System Access API 的瀏覽器（桌面版 Chrome／Edge）會直接寫入檔案；其他瀏覽器對超過 256 MB 的輸出會阻止 Blob 下載，以避免記憶體峰值。
-- 重新建立 ZIP 可能改變 ZIP metadata；已成功透過 iMazing 還原到手機，但仍請保留原始 `.imazingapp` 備份以防意外。
-- 刪除縮圖通常只會移除預覽；刪除原始附件可能導致 LINE 無法開啟媒體。
-- 「只保留縮圖」只會標記 SQLite 已確認為圖片、且同一訊息確實有非空縮圖的原檔；PDF、影片、無縮圖、空縮圖與無法確認類型的附件都會保留。
-- 部分舊附件在目前的 `Line.sqlite` 中已找不到對應訊息；介面仍會依路徑中的聊天室 ID 分組並顯示縮圖，但會明確標示「找不到對應訊息」，不會把檔案修改時間誤稱為傳送時間。
-- JSON 與純文字操作計畫會附上可辨識的聊天室、訊息時間、傳送者與摘要，實際刪除目標仍以完整封存路徑為準。
+LINE iOS App Container 備份可透過 iMazing 取得。本工具不會控制 iMazing，只讀取你選擇的本機檔案。
 
-目前已透過網頁建立瘦身 `.imazingapp`，並用 iMazing 的 **Manage Apps → Restore App Data** 成功還原到手機，LINE 可正常開啟。建議先只移除少量 `Message Thumbnails` 縮圖驗證流程，並保留原始 `.imazingapp`；不同備份規模與附件組合仍建議先在測試裝置驗證。若需要雜湊與 ZIP CRC 驗證的安全瘦身測試（CLI 會輸出 `.imazingapp.candidate`），請見 [CLI.md](CLI.md)。
+1. 開啟網頁版。
+2. 選擇一種來源：
+   - **完整 LINE 備份**：選取整個備份資料夾，可使用附件索引、圖片預覽與本機附件連結。
+   - **只讀訊息**：選取 `Messages/Line.sqlite`。典型路徑為 `Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_<account-id>/Messages/Line.sqlite`。
+   - **大型備份索引**：使用 Python CLI 產生 `line-reader-index` 後選取其資料夾，避免把超大 SQLite 載入瀏覽器記憶體。
+3. 瀏覽聊天室與訊息、搜尋、匯出 HTML／JSON／附件清單，或進行附件審核。
+
+若備份包含 `Line.sqlite-wal` 與 `Line.sqlite-shm`，請優先選擇完整備份模式，以降低遺漏最近資料的風險。
+
+網頁版也提供完整性檢查、時間軸、Schema Explorer、SQLite 差異比較、附件 exact duplicate 掃描與進階搜尋篩選。
+
+## 附件瘦身
+
+附件會依訊息與路徑證據分組，並交叉讀取 `Line.sqlite`、`LineSquare.sqlite` 與 `UnifiedGroup.sqlite`。聊天室名稱優先使用資料庫中的名稱與改名系統訊息，不會用成員名單拼接名稱。
+
+| 狀態 | 意義 | 建議 |
+|---|---|---|
+| `referenced` | 附件路徑中的聊天室 ID 與 SQLite 訊息唯一相符 | 審核縮圖、傳送者、時間與摘要後再決定。 |
+| `unreferenced` | 路徑 ID 有效，但主資料庫與社群資料庫都沒有對應訊息 | 人工確認後才可標記。 |
+| `unconfirmed` | 路徑、訊息 ID 或聊天室的對應關係不可靠 | 預設保留，不應視為孤兒檔案。 |
+
+原始附件與縮圖可以分別標記，未勾選的檔案會保留。「只保留縮圖」只會標記已確認為圖片、且同一訊息有非空縮圖的原檔。PDF、影片、缺少縮圖、空縮圖與無法確認類型的附件都會保留。
+
+### 安全操作順序
+
+1. 保留原始 `.imazingapp`，不要直接覆寫。
+2. 先匯出瘦身操作計畫，保存 JSON 或純文字清單。
+3. 第一次僅測試少量 `Message Thumbnails`，不要直接移除 `Message Attachments` 原始附件。
+4. 建立新的 `LINE-slimmed-<時間戳>.imazingapp`。
+5. 在測試裝置以 iMazing 的 **Manage Apps → Restore App Data** 驗證後，再考慮主力裝置。
+
+網頁版候選檔曾成功透過 iMazing 還原並正常開啟 LINE，但不同備份規模與附件組合都應自行先在測試裝置驗證。重新建立 ZIP 可能改變 ZIP metadata；來源備份必須持續保留。
+
+支援 File System Access API 的桌面版 Chrome／Edge 會直接寫入輸出檔。其他瀏覽器對超過 256 MB 的輸出會阻止 Blob 下載，避免記憶體峰值。
+
+## CLI 與大型備份
+
+Python CLI 不需額外套件，適合建立備份外部的 snapshot、唯讀 health 檢查與可驗證的分片索引：
+
+```bash
+python3 cli/line_migrator.py inspect --source /path/to/line-backup --format text
+python3 cli/line_migrator.py snapshot --source /path/to/line-backup --out /path/to/line-work/snapshot
+python3 cli/line_migrator.py index --snapshot /path/to/line-work/snapshot --out /path/to/line-work/line-reader-index
+python3 cli/line_migrator.py verify-index --index /path/to/line-work/line-reader-index --source /path/to/line-work/snapshot
+```
+
+完整流程、`search`、`timeline`、`schema`、`duplicates`、`diff`、`messages` 與 `slim-test` 說明請見 [CLI.md](CLI.md)。所有 `--out` 輸出應放在來源備份以外的新資料夾。
+
+Rust CLI 可從專案根目錄建置：
+
+```bash
+cargo build -p line-cheater
+```
+
+它是 Electron 桌面版使用的 sidecar，也可直接在本機執行。命令與行為細節請見 [NATIVE.md](NATIVE.md)。
+
+## Electron 桌面版
+
+桌面版適合處理大型 `.imazingapp` 或解開的備份資料夾。它以 sandboxed renderer、受限 IPC 與 Rust sidecar 分離介面和檔案處理，來源保持唯讀。
+
+```bash
+cargo build -p line-cheater
+npm --prefix native/electron ci
+npm --prefix native/electron test
+npm --prefix native/electron run dev
+```
+
+目前可重複建立的是 macOS 12 以上的 Apple Silicon 測試封裝：
+
+```bash
+native/electron/scripts/package-dmg.sh
+```
+
+已有依賴時可設定 `SKIP_NPM_CI=1`。輸出為 ad-hoc 簽章，尚未使用 Apple Developer ID 簽署或 notarize；Intel Mac、Windows 與 Linux 尚未有已驗證套件。請參考 [macOS package 說明](native/electron/README.md#macos-package)。
+
+桌面版提供聊天與訊息瀏覽、受限原圖預覽、附件清理，以及受保護的進階模式。進階模式可規劃移除選定聊天室及其附件，或掃描空聊天室、僅含系統訊息的聊天室與沒有對應聊天列的 `LineSquare` 訊息。SQLite 只會在新建候選檔中重寫與 `VACUUM`，原始資料庫不會被修改。
+
+原生候選檔尚未完成實際 iMazing 還原驗證，不能視為正式可還原輸出。
+
+## 隱私與網路
+
+- 網頁版在目前瀏覽器分頁解析資料，不會將備份上傳到本站伺服器。首次使用會從 jsDelivr 載入 sql.js。
+- 開啟 LINE CDN、原網站圖片或連結預覽時，瀏覽器會向該網址發出請求。
+- Electron 會在本機使用者資料目錄建立 session staging SQLite、`catalog.sqlite` 與聊天 metadata。它們屬於私密資料，請保護本機帳號與磁碟。
+- 不要把備份、`Container`、`Payload`、SQLite、候選檔、工作目錄、聊天室內容或帳號識別資訊提交到 Git repository。
+
+## GitHub Pages 部署
+
+只部署追蹤中的網頁靜態檔，例如 `index.html`、`app.js`、`styles.css`、圖片與需要的 Pages 設定。不要把整個本機工作目錄直接上傳，也不要把備份、封裝檔或建置輸出放到發布目錄。
+
+## 限制
+
+- 超大 SQLite 不應使用網頁版的「只讀訊息」模式，請先建立大型備份索引或使用桌面版。
+- 原生搜尋目前是有界的 `LIKE` 掃描，尚未提供可續跑的 FTS 索引。
+- ZIP 媒體處理採串流，但 central directory metadata 仍會隨檔案數量增加。
+- catalog 建立、雜湊與候選檔建立目前沒有取消工作機制。
 
 參考：[Hiraku Dev 的 LINE 瘦身說明](https://hiraku.dev/2025/09/7802/)、[iMazing App Data 備份與還原說明](https://imazing.com/guides/how-to-export-backup-and-transfer-ios-apps-data-and-settings)。
-
-### 3. 本機 CLI 與大型備份
-
-完整命令、從完整備份到大型分片索引的建議流程、搜尋／差異／瘦身操作與安全限制，請看獨立文件：[CLI.md](CLI.md)。
-
-簡化判斷：先在網頁讀完整備份做初步確認；需要批次或細部操作時使用 CLI。若 `Line.sqlite` 接近或超過瀏覽器安全記憶體門檻，直接使用 CLI 產生 `line-reader-index`，再回到網頁選取「大型備份索引」。
-
-### 4. 隱私與網路
-
-資料只會在目前瀏覽器分頁內解析，不會上傳到這個網站的伺服器。sql.js（唯讀 SQLite 解析）由 jsDelivr 載入，因此首次使用需要網路連線；瘦身 `.imazingapp` 的 ZIP 由瀏覽器本機建立，不需額外套件。連結預覽圖片若來自 LINE CDN 或原網站，瀏覽器顯示圖片時也會向該圖片網址發出請求。
