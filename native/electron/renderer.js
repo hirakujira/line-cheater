@@ -27,6 +27,9 @@ let cleanupSearchTimer = null;
 let cleanupResizeTimer = null;
 let cleanupRenderGeneration = 0;
 let cleanupAlbumSession = null;
+let advancedMode = false;
+let advancedReport = null;
+let advancedLoading = false;
 const CLEANUP_ALBUM_PAGE_SIZE = 24;
 const CLEANUP_ALBUM_MAX_PAGES = 3;
 const cleanupState = {
@@ -54,6 +57,22 @@ const elements = {
   workspaceStatus: document.querySelector("#workspace-status"),
   browseView: document.querySelector("#browse-view"),
   cleanupView: document.querySelector("#cleanup-view"),
+  advancedView: document.querySelector("#advanced-view"),
+  advancedMode: document.querySelector("#advanced-mode"),
+  advancedModeState: document.querySelector("#advanced-mode-state"),
+  advancedLocked: document.querySelector("#advanced-locked"),
+  advancedContent: document.querySelector("#advanced-content"),
+  advancedLineEmpty: document.querySelector("#advanced-line-empty"),
+  advancedLineSystem: document.querySelector("#advanced-line-system"),
+  advancedSquareEmpty: document.querySelector("#advanced-square-empty"),
+  advancedSquareSystem: document.querySelector("#advanced-square-system"),
+  advancedOrphanMessages: document.querySelector("#advanced-orphan-messages"),
+  advancedPlannedChats: document.querySelector("#advanced-planned-chats"),
+  advancedPlannedMessages: document.querySelector("#advanced-planned-messages"),
+  advancedPlannedFiles: document.querySelector("#advanced-planned-files"),
+  advancedPlannedBytes: document.querySelector("#advanced-planned-bytes"),
+  refreshAdvancedReport: document.querySelector("#refresh-advanced-report"),
+  planAutomaticCleanup: document.querySelector("#plan-automatic-cleanup"),
   status: document.querySelector("#status"),
   sessionSummary: document.querySelector("#session-summary"),
   chats: document.querySelector("#chats"),
@@ -68,6 +87,7 @@ const elements = {
   nextMessages: document.querySelector("#next-messages"),
   scanCatalog: document.querySelector("#scan-catalog"),
   buildCandidate: document.querySelector("#build-candidate"),
+  advancedBuildCandidate: document.querySelector("#advanced-build-candidate"),
   searchForm: document.querySelector("#search-form"),
   searchQuery: document.querySelector("#search-query"),
   searchButton: document.querySelector("#search-form button"),
@@ -76,6 +96,7 @@ const elements = {
   cleanupSearch: document.querySelector("#cleanup-search"),
   cleanupKind: document.querySelector("#cleanup-kind"),
   cleanupCategory: document.querySelector("#cleanup-category"),
+  cleanupNoAttachments: document.querySelector("#cleanup-no-attachments"),
   cleanupSort: document.querySelector("#cleanup-sort"),
   markedCount: document.querySelector("#marked-count"),
   markedSize: document.querySelector("#marked-size"),
@@ -110,7 +131,8 @@ const categoryLabels = {
   group: "群組聊天室",
   community: "社群",
   unreferenced: "SQLite 未引用",
-  unconfirmed: "無法確認"
+  unconfirmed: "無法確認",
+  no_attachments: "沒有附件的對話"
 };
 
 function setStatus(message, error) {
@@ -156,21 +178,25 @@ function renderSessionSummary(info) {
 }
 
 function setWorkspaceView(view) {
-  if (!["browse", "cleanup"].includes(view)) return;
+  if (!["browse", "cleanup", "advanced"].includes(view)) return;
   activeWorkspaceView = view;
-  const browse = view === "browse";
-  elements.browseView.classList.toggle("hidden", !browse);
-  elements.cleanupView.classList.toggle("hidden", browse);
-  elements.workspaceTitle.textContent = browse ? "瀏覽" : "清理";
-  elements.workspaceSubtitle.textContent = browse
-    ? "查看聊天室與訊息內容"
-    : "審核附件並建立瘦身備份";
+  const labels = {
+    browse: ["瀏覽", "查看聊天室與訊息內容"],
+    cleanup: ["清理", "審核附件並建立瘦身備份"],
+    advanced: ["進階", "清理 SQLite 與隱藏聊天室"]
+  };
+  elements.browseView.classList.toggle("hidden", view !== "browse");
+  elements.cleanupView.classList.toggle("hidden", view !== "cleanup");
+  elements.advancedView.classList.toggle("hidden", view !== "advanced");
+  elements.workspaceTitle.textContent = labels[view][0];
+  elements.workspaceSubtitle.textContent = labels[view][1];
   for (const button of document.querySelectorAll("[data-view]")) {
     const active = button.dataset.view === view;
     button.classList.toggle("active", active);
     button.toggleAttribute("aria-current", active);
   }
-  if (!browse && provider && !cleanupPage) void loadCleanupPage();
+  if (view === "cleanup" && provider && !cleanupPage) void loadCleanupPage();
+  if (view === "advanced" && provider && advancedMode) void loadAdvancedReport();
 }
 
 function enterWorkspace() {
@@ -334,7 +360,8 @@ function cleanupStatusLabel(status) {
   return {
     referenced: "聊天室附件",
     unreferenced: "SQLite 未引用",
-    unconfirmed: "無法確認"
+    unconfirmed: "無法確認",
+    no_attachments: "沒有附件"
   }[status] || "附件";
 }
 
@@ -344,6 +371,9 @@ function cleanupStatusSummary(status) {
   }
   if (status === "unconfirmed") {
     return "路徑或訊息 ID 無法可靠比對，未列為孤兒檔案。";
+  }
+  if (status === "no_attachments") {
+    return "沒有已索引附件，可加入清理計畫以完整刪除聊天室。";
   }
   return {
     direct: "個人聊天室",
@@ -390,6 +420,7 @@ async function openSource(kind) {
     chatPageNumber = messagePageNumber = 1;
     chatLoading = messageLoading = false;
     selectedChatPk = activeSearch = selectedChat = null;
+    advancedReport = null;
     messageRenderGeneration += 1;
     disposeCleanupAlbum();
     cleanupPage = cleanupOverview = null;
@@ -401,6 +432,7 @@ async function openSource(kind) {
       sort: "recent",
       groupKey: null
     });
+    setAdvancedMode(false);
     elements.cleanupSearch.value = "";
     elements.cleanupKind.value = "all";
     elements.cleanupCategory.value = "all";
@@ -421,7 +453,7 @@ async function openSource(kind) {
     updateLoadModalProgress(20, "正在整理聊天室名稱與附件索引…");
     elements.scanCatalog.disabled = false;
     elements.searchButton.disabled = false;
-    elements.buildCandidate.disabled = true;
+    setCandidateBuildDisabled(true);
     if (kind !== "sqlite" &&
         (info.catalog.scanStatus !== "complete" || info.catalog.attachmentCount === 0)) {
       await scanCatalog({ keepLoadModal: true });
@@ -429,7 +461,7 @@ async function openSource(kind) {
       const overview = await provider.cleanupOverview();
       if (overview.contextStatus === "complete") {
         await loadCleanupPage();
-        elements.buildCandidate.disabled = false;
+        setCandidateBuildDisabled(false);
       } else {
         await scanCatalog({ keepLoadModal: true });
       }
@@ -456,6 +488,8 @@ async function openSource(kind) {
     elements.enterWorkspace.focus();
   } catch (error) {
     provider = null;
+    advancedReport = null;
+    setAdvancedMode(false);
     elements.enterWorkspace.disabled = true;
     elements.sourceReadyCard.classList.add("hidden");
     elements.sessionSummary.classList.add("hidden");
@@ -481,6 +515,38 @@ function messageCursorFor(message) {
   };
 }
 
+function renderChatItem(chat) {
+  const button = document.createElement("button");
+  button.type = "button";
+  const selected = selectedChatPk === chat.pk &&
+    (selectedChat ? selectedChat.source : "line") === (chat.source || "line");
+  button.className = `chat-item${selected ? " selected" : ""}`;
+  button.classList.toggle("planned-removal", Boolean(chat.plannedForRemoval));
+  button.dataset.chatPk = String(chat.pk);
+  button.dataset.chatSource = chat.source || "line";
+  button.setAttribute("role", "option");
+  button.setAttribute("aria-selected", String(selected));
+  const title = document.createElement("span");
+  title.className = "chat-item-title";
+  title.textContent = chat.title;
+  if (chat.plannedForRemoval) {
+    const badge = document.createElement("small");
+    badge.className = "chat-removal-badge";
+    badge.textContent = "將刪除";
+    title.append(" ", badge);
+  }
+  const meta = document.createElement("span");
+  meta.className = "chat-item-meta";
+  const count = document.createElement("span");
+  count.textContent = `${chat.humanMessageCount.toLocaleString()} 則`;
+  const date = document.createElement("span");
+  date.textContent = formatTimestamp(chat.lastUpdated);
+  meta.append(count, date);
+  button.append(title, meta);
+  button.addEventListener("click", () => void selectChat(chat));
+  return button;
+}
+
 async function loadChats(direction = "initial") {
   if (chatLoading || !provider) return;
   chatLoading = true;
@@ -488,30 +554,7 @@ async function loadChats(direction = "initial") {
   const beforeCursor = direction === "previous" ? chatBeforeCursor : null;
   try {
     const page = await provider.listChats({ limit: 100, cursor, beforeCursor });
-    replaceChildren(elements.chats, page.items, (chat) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      const selected = selectedChatPk === chat.pk &&
-        (selectedChat ? selectedChat.source : "line") === (chat.source || "line");
-      button.className = `chat-item${selected ? " selected" : ""}`;
-      button.dataset.chatPk = String(chat.pk);
-      button.dataset.chatSource = chat.source || "line";
-      button.setAttribute("role", "option");
-      button.setAttribute("aria-selected", String(selected));
-      const title = document.createElement("span");
-      title.className = "chat-item-title";
-      title.textContent = chat.title;
-      const meta = document.createElement("span");
-      meta.className = "chat-item-meta";
-      const count = document.createElement("span");
-      count.textContent = `${chat.humanMessageCount.toLocaleString()} 則`;
-      const date = document.createElement("span");
-      date.textContent = formatTimestamp(chat.lastUpdated);
-      meta.append(count, date);
-      button.append(title, meta);
-      button.addEventListener("click", () => void selectChat(chat));
-      return button;
-    });
+    replaceChildren(elements.chats, page.items, renderChatItem);
     chatBeforeCursor = chatCursorFor(page.items[0]);
     chatCursor = page.nextCursor;
     if (direction === "previous") chatPageNumber = Math.max(1, chatPageNumber - 1);
@@ -581,9 +624,10 @@ function renderMessagePage(page, direction = "initial") {
   const renderGeneration = ++messageRenderGeneration;
   replaceChildren(elements.messages, page.items, renderMessage);
   if (!page.items.length) {
-    elements.messages.replaceChildren(emptyState("這個聊天室沒有可顯示的訊息。"));
+    if (direction === "initial") elements.messages.append(emptyState("這個聊天室沒有可顯示的訊息。"));
+  } else {
+    void hydrateMessagePreviews(elements.messages, renderGeneration);
   }
-  void hydrateMessagePreviews(elements.messages, renderGeneration);
   messageBeforeCursor = messageCursorFor(page.items[0]);
   messageCursor = page.nextCursor;
   if (direction === "previous") messagePageNumber = Math.max(1, messagePageNumber - 1);
@@ -901,7 +945,7 @@ async function scanCatalog(options) {
   try {
     setStatus("正在建立磁碟附件索引…");
     elements.scanCatalog.disabled = true;
-    elements.buildCandidate.disabled = true;
+    setCandidateBuildDisabled(true);
     const stats = await provider.scanCatalog();
     elements.progress.max = 1;
     elements.progress.value = 1;
@@ -909,8 +953,9 @@ async function scanCatalog(options) {
       `${stats.attachmentCount.toLocaleString()} 個附件，${formatBytes(stats.attachmentBytes)}`;
     cleanupState.page = 1;
     cleanupState.groupKey = null;
+    cleanupPage = cleanupOverview = null;
     await loadCleanupPage();
-    elements.buildCandidate.disabled = stats.attachmentCount === 0;
+    setCandidateBuildDisabled(false);
     setStatus("附件索引與聊天室關聯完成。");
     if (ownsModal) {
       updateLoadModalProgress(100, "附件索引與聊天室關聯完成。");
@@ -949,11 +994,17 @@ async function loadCleanupPage() {
   cleanupLoading = true;
   elements.cleanupList.setAttribute("aria-busy", "true");
   try {
-    const [overview, page] = await Promise.all([
-      provider.cleanupOverview(),
-      provider.listCleanupGroups(cleanupOptions())
-    ]);
-    cleanupOverview = overview;
+    let page;
+    if (cleanupOverview) {
+      page = await provider.listCleanupGroups(cleanupOptions());
+    } else {
+      const [overview, loadedPage] = await Promise.all([
+        provider.cleanupOverview(),
+        provider.listCleanupGroups(cleanupOptions())
+      ]);
+      cleanupOverview = overview;
+      page = loadedPage;
+    }
     cleanupPage = page;
     renderCleanupOverview();
     renderCleanupPage();
@@ -1023,10 +1074,11 @@ function renderCleanupGroup(group) {
   }
   const row = document.createElement("div");
   row.className = "cleanup-group-row";
-  const open = document.createElement("button");
-  open.type = "button";
+  const canOpen = group.referenceStatus !== "no_attachments";
+  const open = document.createElement(canOpen ? "button" : "div");
+  if (canOpen) open.type = "button";
   open.className = "cleanup-group-open-button";
-  open.dataset.openGroup = group.key;
+  if (canOpen) open.dataset.openGroup = group.key;
   const avatar = document.createElement("span");
   avatar.className = "cleanup-chat-avatar";
   avatar.setAttribute("aria-hidden", "true");
@@ -1042,11 +1094,15 @@ function renderCleanupGroup(group) {
   badge.textContent = cleanupStatusLabel(group.referenceStatus);
   heading.append(title, badge);
   const summary = document.createElement("small");
-  summary.textContent = group.referenceStatus === "referenced"
+  summary.textContent = group.referenceStatus === "no_attachments"
+    ? cleanupStatusSummary(group.referenceStatus)
+    : group.referenceStatus === "referenced"
     ? cleanupStatusSummary(group.chatKind)
     : cleanupStatusSummary(group.referenceStatus);
   const counts = document.createElement("span");
-  counts.textContent = `${group.fileCount.toLocaleString()} 個檔案 · ${formatBytes(group.totalBytes)}`;
+  counts.textContent = group.referenceStatus === "no_attachments"
+    ? "沒有已索引附件"
+    : `${group.fileCount.toLocaleString()} 個檔案 · ${formatBytes(group.totalBytes)}`;
   if (group.markedCount) {
     const marked = document.createElement("b");
     marked.textContent = ` · 已標記 ${group.markedCount.toLocaleString()} 個`;
@@ -1057,33 +1113,60 @@ function renderCleanupGroup(group) {
 
   const actions = document.createElement("div");
   actions.className = "cleanup-group-actions";
-  const toggleAll = document.createElement("button");
-  const fullyMarked = group.fileCount > 0 && group.markedCount === group.fileCount;
-  toggleAll.type = "button";
-  toggleAll.className = `cleanup-group-action ${fullyMarked ? "is-cancel" : "is-delete"}`;
-  toggleAll.dataset.groupAction = "toggle_all";
-  toggleAll.dataset.groupKey = group.key;
-  toggleAll.textContent = fullyMarked ? "取消刪除全部" : "刪除全部";
-  actions.append(toggleAll);
-  if (group.thumbnailBackedImageCount > 0) {
+  if (advancedMode &&
+      ["referenced", "no_attachments"].includes(group.referenceStatus) &&
+      group.chatSource &&
+      Number.isInteger(Number(group.chatPk))) {
+    const removeChat = document.createElement("button");
+    removeChat.type = "button";
+    removeChat.className =
+      `cleanup-group-action ${group.plannedForChatRemoval ? "is-cancel" : "is-delete"}`;
+    removeChat.dataset.chatRemoval = "true";
+    removeChat.dataset.chatSource = group.chatSource;
+    removeChat.dataset.chatPk = String(group.chatPk);
+    removeChat.dataset.chatTitle = group.chatTitle;
+    removeChat.dataset.planned = String(Boolean(group.plannedForChatRemoval));
+    removeChat.textContent = group.plannedForChatRemoval ? "保留聊天室" : "刪除聊天室";
+    actions.append(removeChat);
+  }
+  if (canOpen) {
+    const toggleAll = document.createElement("button");
+    const fullyMarked = group.fileCount > 0 && group.markedCount === group.fileCount;
+    toggleAll.type = "button";
+    toggleAll.className = `cleanup-group-action ${fullyMarked ? "is-cancel" : "is-delete"}`;
+    toggleAll.dataset.groupAction = "toggle_all";
+    toggleAll.dataset.groupKey = group.key;
+    toggleAll.disabled = Boolean(group.plannedForChatRemoval);
+    toggleAll.title = group.plannedForChatRemoval
+      ? "附件會隨聊天室一起刪除；請先取消聊天室清理計畫"
+      : "";
+    toggleAll.textContent = group.plannedForChatRemoval
+      ? "隨聊天室刪除"
+      : fullyMarked ? "取消刪除所有附件" : "刪除所有附件";
+    actions.append(toggleAll);
+  }
+  if (canOpen && group.thumbnailBackedImageCount > 0) {
     const keepThumbnail = document.createElement("button");
     keepThumbnail.type = "button";
     keepThumbnail.className =
       `cleanup-group-action ${group.keepingThumbnails ? "is-cancel" : "is-delete"}`;
     keepThumbnail.dataset.groupAction = "keep_thumbnail";
     keepThumbnail.dataset.groupKey = group.key;
+    keepThumbnail.disabled = Boolean(group.plannedForChatRemoval);
     keepThumbnail.title = group.keepingThumbnails
       ? "還原具有對應縮圖的圖片原檔"
       : "只標記已有非空縮圖的圖片原檔；PDF、影片與無縮圖附件會保留";
     keepThumbnail.textContent = group.keepingThumbnails ? "還原原始圖片" : "只保留縮圖";
     actions.append(keepThumbnail);
   }
-  const view = document.createElement("button");
-  view.type = "button";
-  view.className = "cleanup-group-action";
-  view.dataset.openGroup = group.key;
-  view.textContent = "查看";
-  actions.append(view);
+  if (canOpen) {
+    const view = document.createElement("button");
+    view.type = "button";
+    view.className = "cleanup-group-action";
+    view.dataset.openGroup = group.key;
+    view.textContent = "查看";
+    actions.append(view);
+  }
   row.append(open, actions);
   card.append(row);
   return card;
@@ -1558,14 +1641,21 @@ function renderEvidence(review) {
 function renderFileChoice(file) {
   const choice = document.createElement("label");
   choice.className = "cleanup-file-choice";
-  const impactText = file.kind === "thumbnail"
-    ? "刪除縮圖可能讓聊天紀錄失去預覽，即使原始附件仍存在。"
-    : "刪除後 LINE 可能無法顯示原始畫質；保留縮圖時仍可能看到低畫質預覽。";
+  const plannedByChat = Boolean(cleanupPage &&
+    cleanupPage.group &&
+    cleanupPage.group.plannedForChatRemoval);
+  const impactText = plannedByChat
+    ? "這個檔案已由聊天室清理計畫鎖定；取消聊天室刪除後才能單獨調整。"
+    : file.kind === "thumbnail"
+      ? "刪除縮圖可能讓聊天紀錄失去預覽，即使原始附件仍存在。"
+      : "刪除後 LINE 可能無法顯示原始畫質；保留縮圖時仍可能看到低畫質預覽。";
   choice.title = impactText;
   choice.setAttribute("aria-description", impactText);
+  choice.classList.toggle("planned-by-chat", plannedByChat);
   const checkbox = document.createElement("input");
   checkbox.type = "checkbox";
   checkbox.checked = file.markedForRemoval;
+  checkbox.disabled = plannedByChat;
   checkbox.dataset.attachmentPath = file.path;
   const main = document.createElement("span");
   main.className = "cleanup-file-choice-main";
@@ -1592,7 +1682,7 @@ function renderFileChoice(file) {
   main.append(title, size, impact, path);
   const deleteLabel = document.createElement("span");
   deleteLabel.className = "cleanup-delete-label";
-  deleteLabel.textContent = "刪除此檔";
+  deleteLabel.textContent = plannedByChat ? "隨聊天室刪除" : "刪除此檔";
   choice.append(checkbox, main, deleteLabel);
   return choice;
 }
@@ -1603,11 +1693,13 @@ async function changeAttachmentMark(checkbox) {
   try {
     await provider.setAttachmentMarked(path, checkbox.checked);
     if (cleanupState.kind === "marked") {
+      cleanupOverview = null;
       await loadCleanupPage();
     } else {
       cleanupOverview = await provider.cleanupOverview();
       renderCleanupOverview();
     }
+    await refreshAdvancedPlanSummary();
   } catch (error) {
     checkbox.checked = !checkbox.checked;
     setStatus(error.message, true);
@@ -1619,13 +1711,158 @@ async function changeAttachmentMark(checkbox) {
 async function applyGroupAction(groupKey, action, button) {
   button.disabled = true;
   try {
-    await provider.applyCleanupGroupAction(groupKey, action);
+    cleanupOverview = await provider.applyCleanupGroupAction(groupKey, action);
     await loadCleanupPage();
+    await refreshAdvancedPlanSummary();
   } catch (error) {
     setStatus(error.message, true);
   } finally {
     button.disabled = false;
   }
+}
+
+function setAdvancedMode(enabled) {
+  advancedMode = Boolean(enabled);
+  elements.advancedMode.checked = advancedMode;
+  elements.cleanupNoAttachments.hidden = !advancedMode;
+  elements.cleanupNoAttachments.disabled = !advancedMode;
+  if (!advancedMode && cleanupState.category === "no_attachments") {
+    cleanupState.category = "all";
+    cleanupState.page = 1;
+    cleanupOverview = null;
+    elements.cleanupCategory.value = "all";
+  }
+  elements.cleanupKind.disabled = cleanupState.category === "no_attachments";
+  elements.advancedModeState.textContent = advancedMode ? "進階模式已開啟" : "進階模式未開啟";
+  elements.advancedModeState.classList.toggle("enabled", advancedMode);
+  elements.advancedLocked.classList.toggle("hidden", advancedMode);
+  elements.advancedContent.classList.toggle("hidden", !advancedMode);
+  if (cleanupPage) {
+    if (cleanupState.groupKey) {
+      void loadCleanupPage();
+    } else {
+      renderCleanupPage();
+    }
+  }
+  if (advancedMode && provider) void loadAdvancedReport();
+}
+
+function renderAdvancedReport(report) {
+  advancedReport = report;
+  elements.advancedLineEmpty.textContent = report.lineEmptyChats.toLocaleString();
+  elements.advancedLineSystem.textContent = report.lineSystemOnlyChats.toLocaleString();
+  elements.advancedSquareEmpty.textContent = report.squareAvailable
+    ? report.squareEmptyChats.toLocaleString()
+    : "未提供";
+  elements.advancedSquareSystem.textContent = report.squareAvailable
+    ? report.squareSystemOnlyChats.toLocaleString()
+    : "未提供";
+  elements.advancedOrphanMessages.textContent = report.squareAvailable
+    ? report.orphanCommunityMessages.toLocaleString()
+    : "未提供";
+  elements.advancedPlannedChats.textContent = report.plannedChats.toLocaleString();
+  elements.advancedPlannedMessages.textContent =
+    report.plannedDatabaseMessages.toLocaleString();
+  elements.advancedPlannedFiles.textContent = report.plannedFiles.toLocaleString();
+  elements.advancedPlannedBytes.textContent = formatBytes(report.plannedBytes);
+  elements.planAutomaticCleanup.textContent = report.automaticCleanupPlanned
+    ? "取消清理所有偵測項目"
+    : "清理所有偵測項目";
+  elements.planAutomaticCleanup.classList.toggle(
+    "danger-button",
+    !report.automaticCleanupPlanned
+  );
+}
+
+async function refreshAdvancedPlanSummary() {
+  if (!provider || !advancedMode) return;
+  try {
+    renderAdvancedReport(await provider.advancedCleanupReport());
+  } catch (error) {
+    setStatus(error.message, true);
+  }
+}
+
+async function loadAdvancedReport() {
+  if (!provider || !advancedMode || advancedLoading) return;
+  advancedLoading = true;
+  elements.refreshAdvancedReport.disabled = true;
+  elements.planAutomaticCleanup.disabled = true;
+  try {
+    renderAdvancedReport(await provider.advancedCleanupReport());
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    advancedLoading = false;
+    elements.refreshAdvancedReport.disabled = false;
+    elements.planAutomaticCleanup.disabled = !advancedReport;
+  }
+}
+
+async function setChatRemoval(source, chatPk, title, planned) {
+  if (!provider || !advancedMode) return;
+  const action = planned ? "保留" : "刪除";
+  if (!planned && !window.confirm(
+    `要把「${title}」整個聊天室、全部訊息與其附件加入候選檔清理計畫嗎？\n\n原始備份不會被修改。`
+  )) {
+    return;
+  }
+  try {
+    const report = await provider.setChatRemovalPlanned(source, chatPk, !planned);
+    if (selectedChat &&
+        selectedChat.pk === Number(chatPk) &&
+        (selectedChat.source || "line") === source) {
+      selectedChat.plannedForRemoval = !planned;
+    }
+    renderAdvancedReport(report);
+    cleanupPage = cleanupOverview = null;
+    await Promise.all([
+      loadChats(null),
+      loadCleanupPage()
+    ]);
+  } catch (error) {
+    setStatus(`${action}聊天室失敗：${error.message}`, true);
+  }
+}
+
+async function toggleAutomaticCleanup() {
+  if (!provider || !advancedMode) return;
+  if (!advancedReport) {
+    await loadAdvancedReport();
+    if (!advancedReport) return;
+  }
+  const issueCount = advancedReport
+    .lineEmptyChats +
+    advancedReport.lineSystemOnlyChats +
+    advancedReport.squareEmptyChats +
+    advancedReport.squareSystemOnlyChats +
+    advancedReport.orphanCommunityMessages;
+  const planned = advancedReport.automaticCleanupPlanned;
+  const prompt = planned
+    ? "要從清理計畫取消所有自動偵測項目嗎？手動加入的聊天室與附件會保留。"
+    : `要將偵測到的 ${issueCount.toLocaleString()} 個項目加入清理計畫嗎？\n\n` +
+      "包含空聊天室、只有系統事件的聊天室，以及社群資料庫中找不到聊天室的孤兒訊息。";
+  if (!window.confirm(
+    prompt
+  )) {
+    return;
+  }
+  elements.planAutomaticCleanup.disabled = true;
+  try {
+    renderAdvancedReport(await provider.planAutomaticCleanup());
+    cleanupPage = cleanupOverview = null;
+    await Promise.all([loadChats(null), loadCleanupPage()]);
+    setStatus(planned ? "已取消所有自動偵測項目。" : "已將所有偵測項目加入清理計畫。");
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    elements.planAutomaticCleanup.disabled = false;
+  }
+}
+
+function setCandidateBuildDisabled(disabled) {
+  elements.buildCandidate.disabled = disabled;
+  elements.advancedBuildCandidate.disabled = disabled;
 }
 
 async function buildCandidate() {
@@ -1638,11 +1875,13 @@ async function buildCandidate() {
     showPackageModal(initialMessage);
     modalShown = true;
     packageInProgress = true;
-    elements.buildCandidate.disabled = true;
+    setCandidateBuildDisabled(true);
     const report = await provider.buildCandidate(output.token, { fullCrc: true });
     const successMessage =
       `候選檔完成：保留 ${report.outputEntries.toLocaleString()} 筆、` +
-      `移除 ${report.removedEntries.toLocaleString()} 筆，完整 CRC 驗證完成。`;
+      `移除 ${report.removedEntries.toLocaleString()} 個檔案項目、` +
+      `${report.removedChats.toLocaleString()} 個聊天室與 ` +
+      `${report.removedMessages.toLocaleString()} 則 SQLite 訊息，完整 CRC 驗證完成。`;
     setStatus(successMessage);
     packageInProgress = false;
     completePackageModal(false, "瘦身 .imazingapp 已建立", successMessage);
@@ -1654,13 +1893,18 @@ async function buildCandidate() {
     }
   } finally {
     packageInProgress = false;
-    elements.buildCandidate.disabled = false;
+    setCandidateBuildDisabled(false);
   }
 }
 
 function updateCleanupFilter() {
   cleanupState.kind = elements.cleanupKind.value;
   cleanupState.category = elements.cleanupCategory.value;
+  if (cleanupState.category === "no_attachments") {
+    cleanupState.kind = "all";
+    elements.cleanupKind.value = "all";
+  }
+  elements.cleanupKind.disabled = cleanupState.category === "no_attachments";
   cleanupState.sort = elements.cleanupSort.value;
   cleanupState.page = 1;
   void loadCleanupPage();
@@ -1691,8 +1935,21 @@ elements.previousChats.addEventListener("click", () => void loadChats("previous"
 elements.nextChats.addEventListener("click", () => void loadChats("next"));
 elements.previousMessages.addEventListener("click", () => void loadMessages("previous"));
 elements.nextMessages.addEventListener("click", () => void loadMessages("next"));
+elements.advancedMode.addEventListener("change", () => {
+  if (elements.advancedMode.checked &&
+      !window.confirm(
+        "進階模式可以建立會刪除聊天室並重寫 SQLite 副本的清理計畫。要繼續開啟嗎？"
+      )) {
+    elements.advancedMode.checked = false;
+    return;
+  }
+  setAdvancedMode(elements.advancedMode.checked);
+});
+elements.refreshAdvancedReport.addEventListener("click", () => void loadAdvancedReport());
+elements.planAutomaticCleanup.addEventListener("click", () => void toggleAutomaticCleanup());
 elements.scanCatalog.addEventListener("click", () => void scanCatalog());
 elements.buildCandidate.addEventListener("click", () => void buildCandidate());
+elements.advancedBuildCandidate.addEventListener("click", () => void buildCandidate());
 elements.packageModalClose.addEventListener("click", closePackageModal);
 elements.imageModalClose.addEventListener("click", closeImageModal);
 elements.imageModal.addEventListener("click", (event) => {
@@ -1753,6 +2010,16 @@ elements.cleanupNext.addEventListener("click", () => {
 });
 elements.cleanupList.addEventListener("scroll", handleCleanupAlbumScroll, { passive: true });
 elements.cleanupList.addEventListener("click", (event) => {
+  const chatRemoval = event.target.closest("button[data-chat-removal]");
+  if (chatRemoval) {
+    void setChatRemoval(
+      chatRemoval.dataset.chatSource,
+      Number(chatRemoval.dataset.chatPk),
+      chatRemoval.dataset.chatTitle,
+      chatRemoval.dataset.planned === "true"
+    );
+    return;
+  }
   const open = event.target.closest("button[data-open-group]");
   if (open) {
     cleanupState.groupKey = open.dataset.openGroup;

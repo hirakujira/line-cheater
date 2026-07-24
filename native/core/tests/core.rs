@@ -7,7 +7,7 @@ use line_backup_native::{
     NativeSession, SourceKind, UnifiedGroupDatabase, build_candidate, inspect_source,
     prepare_source, serve,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use tempfile::TempDir;
 use zip::write::SimpleFileOptions;
 
@@ -76,6 +76,38 @@ fn make_fixture(root: &Path) -> PathBuf {
         .unwrap();
     connection.close().unwrap();
     source
+}
+
+fn add_many_attachment_contexts(source: &Path, count: u32) {
+    let line_database = source.join(inspect_source(source).unwrap().database_path);
+    let attachments = line_database
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("Message Attachments/u1");
+    fs::create_dir_all(&attachments).unwrap();
+    let mut connection = Connection::open(&line_database).unwrap();
+    let transaction = connection.transaction().unwrap();
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO ZMESSAGE (
+                    Z_PK, ZID, ZTIMESTAMP, ZCHAT, ZSENDER, ZSENDSTATUS,
+                    ZCONTENTTYPE, ZMESSAGETYPE, ZTEXT, ZLATITUDE, ZLONGITUDE
+                ) VALUES (?1, ?2, ?3, 7, 1, 0, 1, 'R', 'bulk attachment', NULL, NULL)",
+            )
+            .unwrap();
+        for offset in 0..count {
+            let id = 10_000_000_i64 + i64::from(offset);
+            insert
+                .execute(params![id, id.to_string(), 1_000_i64 + i64::from(offset)])
+                .unwrap();
+            fs::write(attachments.join(format!("{id}.jpg")), b"bulk attachment").unwrap();
+        }
+    }
+    transaction.commit().unwrap();
+    connection.close().unwrap();
 }
 
 fn add_square_fixture(source: &Path) {
@@ -197,6 +229,39 @@ fn inspects_private_store_database_and_opens_read_only() {
     let database = LineDatabase::open(&prepared.database_path).unwrap();
     assert!(database.is_read_only().unwrap());
     assert_eq!(database.quick_check().unwrap(), "ok");
+}
+
+#[test]
+fn matches_numeric_message_ids_without_casting_the_source_column() {
+    let temporary = TempDir::new().unwrap();
+    let database_path = temporary.path().join("integer-message-id.sqlite");
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE ZCHAT (
+                Z_PK INTEGER PRIMARY KEY,
+                ZMID TEXT
+            );
+            CREATE TABLE ZMESSAGE (
+                Z_PK INTEGER PRIMARY KEY,
+                ZID INTEGER,
+                ZCHAT INTEGER
+            );
+            INSERT INTO ZCHAT VALUES (7, 'u1');
+            INSERT INTO ZMESSAGE VALUES (1, 12345678, 7);
+            CREATE INDEX message_id ON ZMESSAGE(ZID);
+            ",
+        )
+        .unwrap();
+    connection.close().unwrap();
+
+    let database = LineDatabase::open(&database_path).unwrap();
+    let contexts = database
+        .attachment_contexts(&["12345678".to_string()])
+        .unwrap();
+    assert_eq!(contexts["12345678"].len(), 1);
+    assert_eq!(contexts["12345678"][0].chat_pk, 7);
 }
 
 #[test]
@@ -441,6 +506,11 @@ fn catalogs_attachments_on_disk_and_persists_plan() {
     assert_eq!(page.items[0].chat_hint, "u1");
     catalog.set_marked(&page.items[0].path, true).unwrap();
     assert_eq!(catalog.stats().unwrap().marked_count, 1);
+    let advanced = catalog
+        .advanced_cleanup_report(0, 0, false, 0, 0, 0)
+        .unwrap();
+    assert_eq!(advanced.planned_files, 1);
+    assert_eq!(advanced.planned_bytes, page.items[0].bytes);
     drop(catalog);
 
     let catalog = Catalog::open(&catalog_path).unwrap();
@@ -452,6 +522,72 @@ fn catalogs_attachments_on_disk_and_persists_plan() {
             .iter()
             .any(|item| item.marked_for_removal)
     );
+}
+
+#[test]
+fn opening_a_native_session_clears_persisted_removal_plans() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let work = temporary.path().join("work");
+    let prepared = prepare_source(&source, &work).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let mut catalog = Catalog::open(&work.join("catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .index_attachment_contexts(&database, None, None, |_| {})
+        .unwrap();
+    let attachment = catalog
+        .list_attachments(None, 10, Some(AttachmentKind::Original), None)
+        .unwrap()
+        .items
+        .remove(0);
+    catalog.set_marked(&attachment.path, true).unwrap();
+    let chat = database.chat_for_cleanup(7).unwrap();
+    catalog
+        .set_chat_removal_planned(&chat, true, "selected")
+        .unwrap();
+    drop(catalog);
+
+    let session = NativeSession::open(&source, &work).unwrap();
+    drop(session);
+
+    let catalog = Catalog::open(&work.join("catalog.sqlite")).unwrap();
+    assert!(catalog.marked_paths().unwrap().is_empty());
+    let report = catalog
+        .advanced_cleanup_report(0, 0, false, 0, 0, 0)
+        .unwrap();
+    assert_eq!(report.planned_chats, 0);
+    assert_eq!(report.planned_database_messages, 0);
+    assert_eq!(report.planned_files, 0);
+}
+
+#[test]
+fn indexes_attachment_contexts_in_large_bounded_batches() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    add_many_attachment_contexts(&source, 901);
+    let prepared = prepare_source(&source, &temporary.path().join("work")).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let mut catalog = Catalog::open(&temporary.path().join("work/catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    let mut progress_reports = Vec::new();
+    let progress = catalog
+        .index_attachment_contexts(&database, None, None, |update| {
+            progress_reports.push(update);
+        })
+        .unwrap();
+
+    assert_eq!(progress_reports[0].processed_files, 0);
+    assert_eq!(progress_reports[0].total_files, 903);
+    assert_eq!(progress.total_files, 903);
+    assert_eq!(progress.referenced_files, 903);
+    assert_eq!(progress.unreferenced_files, 0);
+    assert_eq!(progress.unconfirmed_files, 0);
+    assert_eq!(progress_reports.len(), 4);
 }
 
 #[test]
@@ -504,14 +640,14 @@ fn cleanup_groups_match_web_reference_and_marking_semantics() {
         .iter()
         .find(|group| group.reference_status == "referenced")
         .unwrap();
-    assert_eq!(referenced_group.key, "chat:u1");
+    assert_eq!(referenced_group.key, "chat:line:7");
     assert!(referenced_group.has_original);
     assert!(referenced_group.has_thumbnail);
     assert_eq!(referenced_group.thumbnail_backed_image_count, 1);
     assert!(!referenced_group.keeping_thumbnails);
 
     let reviews = catalog
-        .list_cleanup_reviews("chat:u1", 1, 24, None, "all", "all", "recent")
+        .list_cleanup_reviews("chat:line:7", 1, 24, None, "all", "all", "recent")
         .unwrap();
     assert_eq!(reviews.total_items, 1);
     assert_eq!(reviews.items[0].files.len(), 2);
@@ -523,7 +659,7 @@ fn cleanup_groups_match_web_reference_and_marking_semantics() {
     );
 
     let overview = catalog
-        .apply_cleanup_group_action("chat:u1", "keep_thumbnail")
+        .apply_cleanup_group_action("chat:line:7", "keep_thumbnail")
         .unwrap();
     assert_eq!(overview.marked_count, 1);
     let groups = catalog
@@ -533,12 +669,12 @@ fn cleanup_groups_match_web_reference_and_marking_semantics() {
         groups
             .items
             .iter()
-            .find(|group| group.key == "chat:u1")
+            .find(|group| group.key == "chat:line:7")
             .unwrap()
             .keeping_thumbnails
     );
     let files = catalog
-        .list_cleanup_reviews("chat:u1", 1, 24, None, "all", "all", "recent")
+        .list_cleanup_reviews("chat:line:7", 1, 24, None, "all", "all", "recent")
         .unwrap()
         .items
         .remove(0)
@@ -547,17 +683,77 @@ fn cleanup_groups_match_web_reference_and_marking_semantics() {
     assert!(!files[1].marked_for_removal);
 
     let overview = catalog
-        .apply_cleanup_group_action("chat:u1", "keep_thumbnail")
+        .apply_cleanup_group_action("chat:line:7", "keep_thumbnail")
         .unwrap();
     assert_eq!(overview.marked_count, 0);
     let overview = catalog
-        .apply_cleanup_group_action("chat:u1", "toggle_all")
+        .apply_cleanup_group_action("chat:line:7", "toggle_all")
         .unwrap();
     assert_eq!(overview.marked_count, 2);
     let overview = catalog
-        .apply_cleanup_group_action("chat:u1", "toggle_all")
+        .apply_cleanup_group_action("chat:line:7", "toggle_all")
         .unwrap();
     assert_eq!(overview.marked_count, 0);
+}
+
+#[test]
+fn lists_chats_without_indexed_attachments_for_advanced_cleanup() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let database_path = source.join(inspect_source(&source).unwrap().database_path);
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "
+            INSERT INTO ZUSER VALUES (8, 'u-no-attachments', 'No attachments');
+            INSERT INTO ZCHAT VALUES (8, 'u-no-attachments', 0, 400, 'plain message');
+            INSERT INTO ZMESSAGE VALUES
+                (8, 'm-no-attachments', 400, 8, 8, 0, 0, 'R', 'plain message', NULL, NULL);
+            ",
+        )
+        .unwrap();
+    connection.close().unwrap();
+
+    let prepared = prepare_source(&source, &temporary.path().join("work")).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let mut catalog = Catalog::open(&temporary.path().join("work/catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .index_attachment_contexts(&database, None, None, |_| {})
+        .unwrap();
+
+    let page = catalog
+        .list_empty_attachment_chats(
+            database.all_chats_for_cleanup().unwrap(),
+            1,
+            24,
+            None,
+            "all",
+            "recent",
+        )
+        .unwrap();
+    assert_eq!(page.total_items, 1);
+    assert_eq!(page.items[0].chat_pk, Some(8));
+    assert_eq!(page.items[0].reference_status, "no_attachments");
+    assert_eq!(page.items[0].file_count, 0);
+
+    let chat = database.chat_for_cleanup(8).unwrap();
+    catalog
+        .set_chat_removal_planned(&chat, true, "selected")
+        .unwrap();
+    let page = catalog
+        .list_empty_attachment_chats(
+            database.all_chats_for_cleanup().unwrap(),
+            1,
+            24,
+            Some("plain"),
+            "all",
+            "recent",
+        )
+        .unwrap();
+    assert!(page.items[0].planned_for_chat_removal);
 }
 
 #[test]
@@ -613,17 +809,17 @@ fn keep_thumbnail_only_marks_images_with_nonempty_matching_thumbnails() {
         .unwrap()
         .items
         .into_iter()
-        .find(|group| group.key == "chat:u1")
+        .find(|group| group.key == "chat:line:7")
         .unwrap();
     assert_eq!(group.thumbnail_backed_image_count, 1);
 
     let overview = catalog
-        .apply_cleanup_group_action("chat:u1", "keep_thumbnail")
+        .apply_cleanup_group_action("chat:line:7", "keep_thumbnail")
         .unwrap();
     assert_eq!(overview.marked_count, 1);
 
     let reviews = catalog
-        .list_cleanup_reviews("chat:u1", 1, 24, None, "all", "all", "recent")
+        .list_cleanup_reviews("chat:line:7", 1, 24, None, "all", "all", "recent")
         .unwrap();
     let original_mark = |message_id: &str| {
         reviews
@@ -836,6 +1032,7 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
     let work = temporary.path().join("work");
     let mut session = NativeSession::open(&source, &work).unwrap();
     let requests = concat!(
+        "{\"id\":\"0\",\"method\":\"sessionInfo\"}\n",
         "{\"id\":\"1\",\"method\":\"listChats\",\"params\":{\"limit\":1}}\n",
         "{\"id\":\"2\",\"method\":\"listMessages\",\"params\":{\"chatPk\":7,\"limit\":2}}\n",
         "{\"id\":\"3\",\"method\":\"searchMessages\",\"params\":{\"query\":\"photo\",\"limit\":10}}\n",
@@ -849,6 +1046,9 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
         "{\"id\":\"12\",\"method\":\"listMessages\",\"params\":{\"chatPk\":7,\"limit\":2,\"cursor\":{\"timestamp\":100,\"pk\":2}}}\n",
         "{\"id\":\"13\",\"method\":\"listMessages\",\"params\":{\"chatPk\":7,\"limit\":2,\"beforeCursor\":{\"timestamp\":200,\"pk\":3}}}\n",
         "{\"id\":\"14\",\"method\":\"listChats\",\"params\":{\"limit\":1,\"beforeCursor\":{\"lastUpdated\":200,\"source\":\"line\",\"pk\":7}}}\n",
+        "{\"id\":\"15\",\"method\":\"advancedCleanupReport\"}\n",
+        "{\"id\":\"16\",\"method\":\"setChatRemovalPlanned\",\"params\":{\"source\":\"line\",\"chatPk\":7,\"planned\":true}}\n",
+        "{\"id\":\"17\",\"method\":\"sessionInfo\"}\n",
         "{\"id\":\"8\",\"method\":\"shutdown\"}\n"
     );
     let mut input = std::io::BufReader::new(requests.as_bytes());
@@ -865,6 +1065,7 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
             .find(|row| row["id"] == id)
             .expect("response ID exists")
     };
+    assert_eq!(response("0")["result"]["quickCheck"], "ok");
     assert_eq!(
         response("1")["result"]["items"].as_array().unwrap().len(),
         1
@@ -913,6 +1114,10 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
     assert_eq!(response("13")["result"]["items"][0]["id"], "m1");
     assert_eq!(response("13")["result"]["hasPrevious"], false);
     assert_eq!(response("14")["result"]["items"][0]["source"], "square");
+    assert_eq!(response("15")["result"]["plannedChats"], 0);
+    assert_eq!(response("16")["result"]["plannedChats"], 1);
+    assert_eq!(response("16")["result"]["plannedFiles"], 2);
+    assert_eq!(response("17")["result"]["quickCheck"], "ok");
     assert_eq!(response("8")["result"]["shuttingDown"], true);
 }
 
@@ -945,6 +1150,172 @@ fn builds_valid_directory_candidate_without_marked_attachment() {
             .file_names()
             .any(|name| name.ends_with("/Messages/Line.sqlite"))
     );
+}
+
+#[test]
+fn advanced_cleanup_rewrites_candidate_sqlite_and_removes_chat_files_only() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    add_square_fixture(&source);
+    let path_only_chat_file = "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Message Attachments/u1/87654321.bin";
+    fs::write(source.join(path_only_chat_file), b"path-only chat file").unwrap();
+    let report = inspect_source(&source).unwrap();
+    let line_path = source.join(&report.database_path);
+    let square_path = line_path.with_file_name("LineSquare.sqlite");
+
+    let connection = Connection::open(&line_path).unwrap();
+    connection
+        .execute_batch(
+            "
+            INSERT INTO ZCHAT VALUES (10, 'empty-line', 1, 0, '');
+            INSERT INTO ZCHAT VALUES (11, 'system-line', 1, 350, 'system');
+            INSERT INTO ZMESSAGE VALUES
+                (30, 'line-system-event', 350, 11, NULL, 0, 18, 'R',
+                 'system event', NULL, NULL);
+            ",
+        )
+        .unwrap();
+    connection.close().unwrap();
+
+    let connection = Connection::open(&square_path).unwrap();
+    connection
+        .execute_batch(
+            "
+            INSERT INTO ZCHAT VALUES (9, 'empty-square', 0, 3, '');
+            INSERT INTO ZCHAT VALUES (10, 'system-square', 0, 3, 'system');
+            INSERT INTO ZMESSAGE VALUES
+                (14, 'square-orphan', 420, 999, 11, 1, 0, 'R',
+                 'orphan message', NULL, NULL),
+                (15, 'square-system-event', 430, 10, 11, 1, 18, 'R',
+                 'system event', NULL, NULL);
+            ",
+        )
+        .unwrap();
+    connection.close().unwrap();
+
+    let original_line = fs::read(&line_path).unwrap();
+    let original_square = fs::read(&square_path).unwrap();
+    let work = temporary.path().join("advanced-work");
+    let prepared = prepare_source(&source, &work).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let square_database =
+        LineSquareDatabase::open(prepared.square_database_path.as_deref().unwrap()).unwrap();
+    let mut catalog = Catalog::open(&work.join("catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .index_attachment_contexts(&database, Some(&square_database), None, |_| {})
+        .unwrap();
+
+    let selected = database.chat_for_cleanup(7).unwrap();
+    catalog
+        .set_chat_removal_planned(&selected, true, "selected")
+        .unwrap();
+    let mut filtered = database.advanced_cleanup_chats().unwrap();
+    filtered.extend(square_database.advanced_cleanup_chats().unwrap());
+    let orphans = square_database.orphan_messages().unwrap();
+    assert_eq!(orphans.len(), 1);
+    catalog.plan_automatic_cleanup(&filtered, &orphans).unwrap();
+    let planned_group = catalog
+        .list_cleanup_groups(1, 24, None, "all", "all", "recent")
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|group| group.key == "chat:line:7")
+        .unwrap();
+    assert_eq!(planned_group.chat_source, "line");
+    assert_eq!(planned_group.chat_pk, Some(7));
+    assert!(planned_group.planned_for_chat_removal);
+    let advanced = catalog
+        .advanced_cleanup_report(1, 1, true, 1, 1, 1)
+        .unwrap();
+    assert!(advanced.automatic_cleanup_planned);
+    assert_eq!(advanced.planned_chats, 5);
+    assert_eq!(advanced.planned_database_messages, 7);
+    assert_eq!(advanced.planned_files, 3);
+
+    let output = temporary.path().join("LINE-advanced.imazingapp");
+    let candidate = build_candidate(&source, &output, &catalog, true, |_| Ok(())).unwrap();
+    assert_eq!(candidate.removed_chats, 5);
+    assert_eq!(candidate.removed_messages, 7);
+    assert_eq!(candidate.rewritten_databases.len(), 2);
+    assert_eq!(fs::read(&line_path).unwrap(), original_line);
+    assert_eq!(fs::read(&square_path).unwrap(), original_square);
+
+    let mut archive = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+    let attachment = catalog
+        .list_attachments(None, 10, Some(AttachmentKind::Original), None)
+        .unwrap()
+        .items
+        .remove(0);
+    assert!(archive.by_name(&attachment.path).is_err());
+    assert!(archive.by_name(path_only_chat_file).is_err());
+
+    let extracted_line = temporary.path().join("candidate-Line.sqlite");
+    {
+        let mut entry = archive.by_name(&report.database_path).unwrap();
+        let mut output = fs::File::create(&extracted_line).unwrap();
+        std::io::copy(&mut entry, &mut output).unwrap();
+    }
+    let square_entry = report
+        .database_path
+        .rsplit_once('/')
+        .map(|(parent, _)| format!("{parent}/LineSquare.sqlite"))
+        .unwrap();
+    let extracted_square = temporary.path().join("candidate-LineSquare.sqlite");
+    {
+        let mut entry = archive.by_name(&square_entry).unwrap();
+        let mut output = fs::File::create(&extracted_square).unwrap();
+        std::io::copy(&mut entry, &mut output).unwrap();
+    }
+
+    let connection = Connection::open(extracted_line).unwrap();
+    let line_chats: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM ZCHAT WHERE Z_PK IN (7, 10, 11)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let line_messages: i64 = connection
+        .query_row("SELECT COUNT(*) FROM ZMESSAGE", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(line_chats, 0);
+    assert_eq!(line_messages, 0);
+    connection.close().unwrap();
+
+    let connection = Connection::open(extracted_square).unwrap();
+    let retained_chat: i64 = connection
+        .query_row("SELECT COUNT(*) FROM ZCHAT WHERE Z_PK = 8", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let removed_square_chats: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM ZCHAT WHERE Z_PK IN (9, 10)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let orphan: i64 = connection
+        .query_row("SELECT COUNT(*) FROM ZMESSAGE WHERE Z_PK = 14", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(retained_chat, 1);
+    assert_eq!(removed_square_chats, 0);
+    assert_eq!(orphan, 0);
+    connection.close().unwrap();
+
+    catalog.plan_automatic_cleanup(&filtered, &orphans).unwrap();
+    let advanced = catalog
+        .advanced_cleanup_report(1, 1, true, 1, 1, 1)
+        .unwrap();
+    assert!(!advanced.automatic_cleanup_planned);
+    assert_eq!(advanced.planned_chats, 1);
+    assert_eq!(advanced.planned_database_messages, 4);
+    assert_eq!(advanced.planned_files, 3);
 }
 
 #[test]
@@ -991,6 +1362,87 @@ fn raw_copies_archive_candidate_and_removes_marked_entry() {
         .read_to_end(&mut lock)
         .unwrap();
     assert_eq!(lock, b"lock");
+}
+
+#[test]
+fn advanced_cleanup_rewrites_database_inside_archive_candidate() {
+    let temporary = TempDir::new().unwrap();
+    let source_directory = make_fixture(temporary.path());
+    let database = inspect_source(&source_directory).unwrap().database_path;
+    let attachment = "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Message Attachments/u1/12345678.jpg";
+    let thumbnail = "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Message Thumbnails/u1/12345678.thumb";
+    let archive_path = temporary.path().join("LINE-source.imazingapp");
+    let archive_file = fs::File::create(&archive_path).unwrap();
+    let mut writer = zip::ZipWriter::new(archive_file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let entries = vec![
+        (".lock".to_string(), b"lock".to_vec()),
+        ("Payload/LINE.app/Info.plist".to_string(), b"plist".to_vec()),
+        (
+            database.clone(),
+            fs::read(source_directory.join(&database)).unwrap(),
+        ),
+        (
+            attachment.to_string(),
+            fs::read(source_directory.join(attachment)).unwrap(),
+        ),
+        (
+            thumbnail.to_string(),
+            fs::read(source_directory.join(thumbnail)).unwrap(),
+        ),
+    ];
+    for (name, bytes) in entries {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(&bytes).unwrap();
+    }
+    writer.finish().unwrap();
+    let original_archive = fs::read(&archive_path).unwrap();
+
+    let work = temporary.path().join("archive-advanced-work");
+    let prepared = prepare_source(&archive_path, &work).unwrap();
+    let line_database = LineDatabase::open(&prepared.database_path).unwrap();
+    let mut catalog = Catalog::open(&work.join("catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&archive_path, SourceKind::ImazingArchive, |_| {})
+        .unwrap();
+    catalog
+        .index_attachment_contexts(&line_database, None, None, |_| {})
+        .unwrap();
+    let chat = line_database.chat_for_cleanup(7).unwrap();
+    catalog
+        .set_chat_removal_planned(&chat, true, "selected")
+        .unwrap();
+
+    let output = temporary.path().join("LINE-archive-advanced.imazingapp");
+    let report = build_candidate(&archive_path, &output, &catalog, true, |_| Ok(())).unwrap();
+    assert_eq!(report.removed_chats, 1);
+    assert_eq!(report.removed_messages, 4);
+    assert_eq!(report.removed_entries, 2);
+    assert_eq!(fs::read(&archive_path).unwrap(), original_archive);
+
+    let mut archive = zip::ZipArchive::new(fs::File::open(output).unwrap()).unwrap();
+    assert!(archive.by_name(attachment).is_err());
+    assert!(archive.by_name(thumbnail).is_err());
+    let extracted = temporary.path().join("archive-candidate-Line.sqlite");
+    {
+        let mut entry = archive.by_name(&database).unwrap();
+        let mut output = fs::File::create(&extracted).unwrap();
+        std::io::copy(&mut entry, &mut output).unwrap();
+    }
+    let connection = Connection::open(extracted).unwrap();
+    let chats: i64 = connection
+        .query_row("SELECT COUNT(*) FROM ZCHAT WHERE Z_PK = 7", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let messages: i64 = connection
+        .query_row("SELECT COUNT(*) FROM ZMESSAGE WHERE ZCHAT = 7", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(chats, 0);
+    assert_eq!(messages, 0);
+    connection.close().unwrap();
 }
 
 #[test]

@@ -13,15 +13,15 @@ for the SQLite staging directory and candidate output.
 
 ```bash
 # From the repository root.
-cargo build -p line-backup-native
+cargo build -p line-cheater
 npm --prefix native/electron ci
 npm --prefix native/electron test
 npm --prefix native/electron run dev
 ```
 
-The development shell finds `target/release/line-backup-native` first and then
-`target/debug/line-backup-native`. A packaged build must put the platform binary
-at `resources/bin/line-backup-native` (with `.exe` on Windows). For local
+The development shell finds `target/release/line-cheater` first and then
+`target/debug/line-cheater`. A packaged build must put the platform binary
+at `resources/bin/line-cheater` (with `.exe` on Windows). For local
 diagnostics only, `LINE_BACKUP_NATIVE_BIN` can point at another build.
 
 Electron is pinned in `package-lock.json`. Keep it current because the runtime
@@ -38,7 +38,7 @@ Electron main process
   native dialogs + output tokens + SidecarClient
         │ bounded JSON Lines over stdin/stdout
         ▼
-line-backup-native serve
+line-cheater serve
   read-only source + catalog.sqlite + candidate writer
 ```
 
@@ -90,8 +90,8 @@ signature, verifies the bundle, and produces:
 
 ```text
 native/electron/dist/mac-<arch>/LINE Cheater.app
-native/electron/dist/LINE-Cheater-0.1.0-macOS-<arch>.zip
-native/electron/dist/LINE-Cheater-0.1.0-macOS-<arch>.dmg
+native/electron/dist/LINE-Cheater-0.1.1-macOS-<arch>.zip
+native/electron/dist/LINE-Cheater-0.1.1-macOS-<arch>.dmg
 native/electron/dist/SHA256SUMS.txt
 ```
 
@@ -116,7 +116,7 @@ or a verified universal bundle before claiming Intel Mac support.
 3. Keep the user on the source screen after preparation and enable an explicit
    Next action.
 4. Enter a native app shell with a persistent source summary and sidebar. The
-   sidebar switches between Browse and Cleanup; only one workspace is mounted
+   sidebar switches between Browse, Cleanup, and Advanced; only one workspace is mounted
    visibly at a time. The welcome header and sidebar reuse the packaged macOS
    app icon rather than a separate lettermark.
 5. Resolve chat names from the main, `LineSquare.sqlite`, and
@@ -146,6 +146,10 @@ or a verified universal bundle before claiming Intel Mac support.
    delete-all / keep-thumbnail group actions.
 12. Choose an output through a native save dialog and build a full-CRC candidate
     with the web-style progress/success/error dialog.
+13. Turn on the guarded desktop-only Advanced mode to plan deletion of a selected
+    chat and its attachments, or use the Advanced sidebar page to include empty
+    chats, system-only chats, and orphan `LineSquare` messages. The source remains
+    read-only; only the newly built candidate receives the SQLite rewrite.
 
 Every next-page action replaces the current DOM window instead of appending to
 an unbounded array.
@@ -198,6 +202,11 @@ in the native catalog.
   originals.
 - Filters, category cards, sorting, search, category/group pagination, and
   safety/evidence copy mirror the web UI.
+- Advanced chat plans are keyed by `(source, chat_pk)`, so main and community
+  rows cannot collide. Exact referenced attachments and files whose path chat ID
+  matches the selected chat join the same removal plan. Empty/system-only
+  detection uses actual `ZMESSAGE` rows rather than a cached `ZMESSAGECOUNT`;
+  community orphan detection requires no matching `ZCHAT.Z_PK`.
 - Cleanup keeps the app workspace fixed instead of restoring a document-level
   scrollbar. The group list still replaces four rows at a time. Detail mode
   hides Previous/Next and uses one contained album scroller with sticky month

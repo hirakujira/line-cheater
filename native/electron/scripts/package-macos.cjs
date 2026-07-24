@@ -34,7 +34,7 @@ const releaseBinary = path.join(
   repositoryRoot,
   "target",
   "release",
-  "line-backup-native"
+  "line-cheater"
 );
 const distRoot = path.join(electronRoot, "dist");
 const platformRoot = path.join(distRoot, `mac-${architecture}`);
@@ -180,7 +180,7 @@ copyFile(
 );
 copyFile(
   releaseBinary,
-  path.join(resourcesPath, "bin", "line-backup-native"),
+  path.join(resourcesPath, "bin", "line-cheater"),
   0o755
 );
 

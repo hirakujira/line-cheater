@@ -66,7 +66,7 @@ trap cleanup EXIT
 mounted=1
 
 mounted_app="$mount_point/LINE Cheater.app"
-mounted_sidecar="$mounted_app/Contents/Resources/bin/line-backup-native"
+mounted_sidecar="$mounted_app/Contents/Resources/bin/line-cheater"
 [[ -d "$mounted_app" ]] || { print -u2 "Mounted DMG does not contain LINE Cheater.app"; exit 1; }
 [[ -x "$mounted_sidecar" ]] || { print -u2 "Mounted DMG sidecar is missing or not executable"; exit 1; }
 
