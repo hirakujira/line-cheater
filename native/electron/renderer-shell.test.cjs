@@ -19,6 +19,10 @@ const dmgPackager = fs.readFileSync(
   path.join(root, "scripts", "package-dmg.sh"),
   "utf8"
 );
+const macEntitlements = fs.readFileSync(
+  path.join(root, "entitlements.mac.plist"),
+  "utf8"
+);
 const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 
 test("uses LINE Cheater consistently as the desktop product name", () => {
@@ -219,16 +223,30 @@ test("does not duplicate DOM ids in the app shell", () => {
   assert.equal(new Set(ids).size, ids.length);
 });
 
-test("packages the release sidecar inside a verified macOS bundle", () => {
+test("packages the release sidecar with notarization-ready macOS signatures", () => {
   assert.match(packageJson.scripts["package:mac"], /build:native:mac/);
   assert.match(main, /path\.join\(process\.resourcesPath, "bin", executable\)/);
   assert.match(macPackager, /"target",\s*"release",\s*"line-cheater"/);
+  assert.match(macPackager, /MACOS_SIGN_IDENTITY to a Developer ID Application/);
+  assert.doesNotMatch(macPackager, /MACOS_SIGN_IDENTITY \|\| "-"/);
+  assert.match(macPackager, /function signElectronRuntime\(\)/);
+  assert.match(macPackager, /"--options", "runtime"/);
+  assert.match(macPackager, /"--timestamp"/);
+  assert.match(macPackager, /sign\(sidecarPath\)/);
+  assert.match(macPackager, /verifySignature\(sidecarPath, "Rust sidecar"\)/);
+  assert.match(macPackager, /entitlements\.mac\.plist/);
   assert.match(macPackager, /codesign",\s*\["--verify", "--deep", "--strict"/);
   assert.match(macPackager, /hdiutil",\s*\[/);
   assert.match(macPackager, /SHA256SUMS\.txt/);
   assert.match(macPackager, /line-cheater\.icns/);
   assert.match(macPackager, /"assets", "icon\.png"/);
   assert.match(macPackager, /pixelWidth:\\s\*1024/);
+});
+
+test("uses only the Electron JIT entitlements needed for hardened runtime", () => {
+  assert.match(macEntitlements, /com\.apple\.security\.cs\.allow-jit/);
+  assert.match(macEntitlements, /com\.apple\.security\.cs\.allow-unsigned-executable-memory/);
+  assert.doesNotMatch(macEntitlements, /com\.apple\.security\.app-sandbox/);
 });
 
 test("provides a self-checking DMG packaging script", () => {

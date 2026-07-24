@@ -45,6 +45,8 @@ const packagedSourceRoot = path.join(resourcesPath, "app");
 const artifactBase = `LINE-Cheater-${version}-macOS-${architecture}`;
 const zipPath = path.join(distRoot, `${artifactBase}.zip`);
 const dmgPath = path.join(distRoot, `${artifactBase}.dmg`);
+const electronEntitlements = path.join(electronRoot, "entitlements.mac.plist");
+const identity = process.env.MACOS_SIGN_IDENTITY;
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -69,6 +71,23 @@ function runOptional(command, args) {
     encoding: "utf8",
     stdio: "ignore"
   }).status === 0;
+}
+
+function capture(command, args) {
+  const result = spawnSync(command, args, {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const detail = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
+    throw new Error(
+      `${path.basename(command)} failed with exit code ${result.status}` +
+      (detail ? `:\n${detail}` : "")
+    );
+  }
+  return [result.stdout, result.stderr].filter(Boolean).join("\n");
 }
 
 function copyFile(source, destination, mode) {
@@ -124,11 +143,84 @@ function sha256(file) {
     .split(/\s+/)[0];
 }
 
+function sign(target, entitlements) {
+  const arguments_ = [
+    "--force",
+    "--sign", identity,
+    "--options", "runtime",
+    "--timestamp"
+  ];
+  if (entitlements) arguments_.push("--entitlements", entitlements);
+  arguments_.push(target);
+  run("/usr/bin/codesign", arguments_);
+}
+
+function findPaths(args) {
+  return capture("/usr/bin/find", args)
+    .split("\0")
+    .filter(Boolean);
+}
+
+function pathDepth(target) {
+  return target.split(path.sep).length;
+}
+
+function signElectronRuntime() {
+  const codeFiles = findPaths([contentsPath, "-type", "f", "-print0"])
+    .filter((target) => capture("/usr/bin/file", ["-b", target]).includes("Mach-O"))
+    .sort((left, right) => pathDepth(right) - pathDepth(left));
+
+  for (const target of codeFiles) sign(target);
+
+  const codeBundles = findPaths([
+    contentsPath,
+    "-type", "d",
+    "(",
+    "-name", "*.framework",
+    "-o",
+    "-name", "*.app",
+    "-o",
+    "-name", "*.xpc",
+    "-o",
+    "-name", "*.appex",
+    ")",
+    "-print0"
+  ]).sort((left, right) => pathDepth(right) - pathDepth(left));
+
+  for (const target of codeBundles) {
+    sign(target, target.endsWith(".app") ? electronEntitlements : undefined);
+  }
+}
+
+function verifySignature(target, label) {
+  run("/usr/bin/codesign", ["--verify", "--strict", "--verbose=2", target]);
+  const details = capture("/usr/bin/codesign", ["-dvvv", target]);
+  const teamIdentifier = identity.match(/\(([A-Z0-9]{10})\)$/)?.[1];
+  if (!details.includes(`Authority=${identity}`) ||
+      (teamIdentifier && !details.includes(`TeamIdentifier=${teamIdentifier}`)) ||
+      !details.includes("Runtime Version=") ||
+      (!details.includes("Signed Time=") && !details.includes("Timestamp="))) {
+    throw new Error(`${label} is not a timestamped Developer ID hardened-runtime signature.`);
+  }
+}
+
 if (!fs.existsSync(electronApp)) {
   throw new Error("Electron.app is missing. Run npm install in native/electron first.");
 }
 if (!fs.existsSync(releaseBinary)) {
   throw new Error("Release sidecar is missing. Run the package:mac npm script.");
+}
+if (!fs.existsSync(electronEntitlements)) {
+  throw new Error("Electron entitlements are missing.");
+}
+if (!identity || !identity.startsWith("Developer ID Application:")) {
+  throw new Error(
+    "Set MACOS_SIGN_IDENTITY to a Developer ID Application certificate before packaging."
+  );
+}
+if (!capture("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"])
+  .includes(`"${identity}"`)) {
+  throw new Error(`Developer ID certificate is unavailable in the keychain: ${identity}`);
 }
 
 fs.mkdirSync(distRoot, { recursive: true });
@@ -209,12 +301,13 @@ for (const key of [
 buildIcon();
 plist("Set :CFBundleIconFile line-cheater.icns");
 
-const identity = process.env.MACOS_SIGN_IDENTITY || "-";
-const signArguments = ["--force", "--deep", "--sign", identity];
-if (identity !== "-") signArguments.push("--options", "runtime", "--timestamp");
-signArguments.push(appPath);
-run("/usr/bin/codesign", signArguments);
+signElectronRuntime();
+const sidecarPath = path.join(resourcesPath, "bin", "line-cheater");
+sign(sidecarPath);
+sign(appPath, electronEntitlements);
 run("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=2", appPath]);
+verifySignature(newExecutable, "App executable");
+verifySignature(sidecarPath, "Rust sidecar");
 
 run("/usr/bin/ditto", [
   "-c", "-k", "--sequesterRsrc", "--keepParent", appPath, zipPath
@@ -244,6 +337,4 @@ fs.writeFileSync(path.join(distRoot, "SHA256SUMS.txt"), `${checksums.join("\n")}
 console.log(`Packaged ${appPath}`);
 console.log(`Created ${zipPath}`);
 console.log(`Created ${dmgPath}`);
-console.log(identity === "-"
-  ? "Signature: ad hoc (test distribution; not notarized)"
-  : `Signature: ${identity} (notarization still required)`);
+console.log(`Signature: ${identity} (notarization still required)`);
