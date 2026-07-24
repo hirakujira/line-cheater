@@ -399,6 +399,83 @@ fn pages_chats_and_messages_with_bounded_limits() {
 }
 
 #[test]
+fn chat_backward_pagination_keeps_the_adjacent_page() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let database_path = source.join(inspect_source(&source).unwrap().database_path);
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "
+            INSERT INTO ZCHAT VALUES
+                (8, 'chat-008', 0, 500, 'fifth'),
+                (9, 'chat-009', 0, 400, 'fourth'),
+                (10, 'chat-010', 0, 300, 'third'),
+                (11, 'chat-011', 0, 250, 'before');
+            INSERT INTO ZMESSAGE VALUES
+                (5, 'm5', 500, 8, 1, 0, 0, 'R', 'fifth', NULL, NULL),
+                (6, 'm6', 400, 9, 1, 0, 0, 'R', 'fourth', NULL, NULL),
+                (7, 'm7', 300, 10, 1, 0, 0, 'R', 'third', NULL, NULL),
+                (8, 'm8', 250, 11, 1, 0, 0, 'R', 'before', NULL, NULL);
+            ",
+        )
+        .unwrap();
+    connection.close().unwrap();
+
+    let prepared = prepare_source(&source, &temporary.path().join("work")).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let first = database.list_chats(None, 2).unwrap();
+    let second = database.list_chats(first.next_cursor, 2).unwrap();
+    let third = database.list_chats(second.next_cursor, 2).unwrap();
+
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|chat| chat.id.as_str())
+            .collect::<Vec<_>>(),
+        ["chat-008", "chat-009"]
+    );
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|chat| chat.id.as_str())
+            .collect::<Vec<_>>(),
+        ["chat-010", "chat-011"]
+    );
+    assert_eq!(third.items[0].id, "u1");
+    assert!(third.next_cursor.is_none());
+    assert!(third.has_previous);
+
+    let previous = database
+        .list_chats_before(
+            ChatCursor {
+                last_updated: third.items[0].last_updated,
+                source: third.items[0].source.clone(),
+                pk: third.items[0].pk,
+            },
+            2,
+        )
+        .unwrap();
+    assert_eq!(
+        previous
+            .items
+            .iter()
+            .map(|chat| chat.id.as_str())
+            .collect::<Vec<_>>(),
+        ["chat-010", "chat-011"]
+    );
+    assert!(previous.has_previous);
+
+    let forward = database.list_chats(previous.next_cursor, 2).unwrap();
+    assert_eq!(forward.items[0].id, "u1");
+    assert_eq!(forward.items.len(), 1);
+    assert!(forward.next_cursor.is_none());
+    assert!(forward.has_previous);
+}
+
+#[test]
 fn lists_nonempty_system_only_chats_like_the_web_browser() {
     let temporary = TempDir::new().unwrap();
     let source = make_fixture(temporary.path());

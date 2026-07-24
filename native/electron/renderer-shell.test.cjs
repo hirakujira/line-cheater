@@ -83,7 +83,7 @@ test("keeps browse, cleanup, and advanced as mutually exclusive native views", (
 
 test("keeps community chats source-aware and trusts native sender ownership", () => {
   assert.match(renderer, /button\.dataset\.chatSource = chat\.source \|\| "line"/);
-  assert.match(renderer, /provider\.listMessages\(selectedChatPk, \{\s+source: selectedChat\.source \|\| "line",\s+limit: 180,\s+cursor,\s+beforeCursor\s+\}\)/);
+  assert.match(renderer, /currentProvider\.listMessages\(currentChatPk, \{\s+source: currentChat\.source \|\| "line",\s+limit: 180,\s+cursor,\s+beforeCursor\s+\}\)/);
   assert.match(renderer, /typeof message\.isSelf === "boolean"/);
   assert.match(renderer, /return !hasSender &&/);
   assert.doesNotMatch(
@@ -102,7 +102,15 @@ test("keeps chat and message browsing bidirectionally paginated", () => {
   assert.match(renderer, /loadMessages\("previous"\)/);
   assert.match(renderer, /elements\.previousChats\.disabled = !page\.hasPrevious/);
   assert.match(renderer, /elements\.previousMessages\.disabled = !page\.hasPrevious/);
+  assert.match(renderer, /currentProvider !== provider/);
+  assert.match(renderer, /requestedSelectionGeneration !== selectedChatGeneration/);
+  assert.match(renderer, /setRetryVisible\(elements\.retryMessages, true\)/);
+  assert.match(renderer, /setRetryVisible\(elements\.retryChats, true\)/);
+  assert.match(html, /id="retry-chats"/);
+  assert.match(html, /id="retry-messages"/);
+  assert.match(html, /id="clear-search"/);
   assert.match(styles, /\.message-pagination\s*\{/);
+  assert.match(styles, /\.panel-status-row, \.message-status-row/);
 });
 
 test("renders HTTP links as previews and opens only safe external URLs", () => {
