@@ -1,0 +1,110 @@
+name: Build and release macOS DMG
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-macos-dmg
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-14
+
+    steps:
+      - name: Check out latest main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: native/electron/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Bump patch version after merge
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          commit_subject="$(git log -1 --format=%s)"
+          if [[ "$commit_subject" == "chore(release): bump version to "* ]]; then
+            echo "The latest main commit already contains the release version bump."
+          else
+            node native/electron/scripts/bump-version.cjs
+            version="$(node -p "require('./native/electron/package.json').version")"
+            git diff --check
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add Cargo.lock native/core/Cargo.toml native/electron/package.json native/electron/package-lock.json
+            git commit -m "chore(release): bump version to ${version} [skip release]"
+            git push origin HEAD:main
+          fi
+
+          version="$(node -p "require('./native/electron/package.json').version")"
+          version_commit="$(git rev-parse HEAD)"
+          {
+            echo "version=${version}"
+            echo "tag=v${version}"
+            echo "version_commit=${version_commit}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and verify DMG
+        env:
+          SKIP_NPM_CI: "0"
+        run: native/electron/scripts/package-dmg.sh
+
+      - name: Verify release artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          dmg="native/electron/dist/LINE-Cheater-${VERSION}-macOS-arm64.dmg"
+          zip="native/electron/dist/LINE-Cheater-${VERSION}-macOS-arm64.zip"
+          sums="native/electron/dist/SHA256SUMS.txt"
+          test -f "$dmg"
+          test -f "$zip"
+          test -f "$sums"
+          grep -F "  LINE-Cheater-${VERSION}-macOS-arm64.dmg" "$sums"
+          grep -F "  LINE-Cheater-${VERSION}-macOS-arm64.zip" "$sums"
+          shasum -a 256 -c "$sums"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          VERSION_COMMIT: ${{ steps.version.outputs.version_commit }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          dmg="native/electron/dist/LINE-Cheater-${VERSION}-macOS-arm64.dmg"
+          zip="native/electron/dist/LINE-Cheater-${VERSION}-macOS-arm64.zip"
+          sums="native/electron/dist/SHA256SUMS.txt"
+
+          notes=$'LINE Cheater macOS 12+ Apple Silicon (arm64) 測試封裝。\n\n來源備份以唯讀方式開啟，候選輸出另存，不會覆寫原始檔。此版本使用 ad-hoc code signature，尚未使用 Apple Developer ID 簽署或 notarize。\n\n完整功能、安全規則與限制請參考 README：'
+          notes+="https://github.com/${GITHUB_REPOSITORY}/blob/main/README.md"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$dmg" "$zip" "$sums" --clobber
+            gh release edit "$tag" --draft=false
+          else
+            gh release create "$tag" "$dmg" "$zip" "$sums" \
+              --target "$VERSION_COMMIT" \
+              --title "LINE Cheater ${VERSION}" \
+              --notes "$notes" \
+              --generate-notes
+          fi
