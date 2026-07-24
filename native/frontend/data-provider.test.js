@@ -150,6 +150,8 @@ test("normalizes web-compatible cleanup pages and filters", async () => {
       sort: "size"
     }
   });
+  await provider.listCleanupGroups({ category: "no_attachments" });
+  assert.equal(calls[1].params.category, "no_attachments");
   await assert.rejects(() => provider.listCleanupGroups({ page: 0 }), RangeError);
   await assert.rejects(() => provider.listCleanupGroups({ kind: "video" }), TypeError);
   await assert.rejects(() => provider.listCleanupGroups({ category: "other" }), TypeError);
@@ -181,6 +183,49 @@ test("forwards cleanup detail and group actions without exposing arbitrary metho
   });
   assert.throws(
     () => provider.applyCleanupGroupAction("chat:u1", "delete_now"),
+    TypeError
+  );
+});
+
+test("validates and forwards advanced SQLite cleanup operations", async () => {
+  const calls = [];
+  const provider = new NativeDataProvider({
+    request: async (method, params) => {
+      calls.push({ method, params });
+      return {
+        lineEmptyChats: 0,
+        lineSystemOnlyChats: 0,
+        squareAvailable: true,
+        squareEmptyChats: 0,
+        squareSystemOnlyChats: 0,
+        orphanCommunityMessages: 0,
+        automaticCleanupPlanned: false,
+        plannedChats: 0,
+        plannedDatabaseMessages: 0,
+        plannedFiles: 0,
+        plannedBytes: 0
+      };
+    }
+  });
+  await provider.advancedCleanupReport();
+  await provider.setChatRemovalPlanned("square", 8, true);
+  await provider.planAutomaticCleanup();
+  await provider.clearAdvancedCleanupPlan();
+  assert.deepEqual(calls, [
+    { method: "advancedCleanupReport", params: {} },
+    {
+      method: "setChatRemovalPlanned",
+      params: { source: "square", chatPk: 8, planned: true }
+    },
+    { method: "planAutomaticCleanup", params: {} },
+    { method: "clearAdvancedCleanupPlan", params: {} }
+  ]);
+  assert.throws(
+    () => provider.setChatRemovalPlanned("archive", 8, true),
+    TypeError
+  );
+  assert.throws(
+    () => provider.setChatRemovalPlanned("line", "not-a-pk", true),
     TypeError
   );
 });

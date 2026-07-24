@@ -30,6 +30,7 @@ pub struct Chat {
     pub human_message_count: i64,
     pub last_updated: i64,
     pub last_message: String,
+    pub planned_for_removal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -122,6 +123,7 @@ pub struct AttachmentCursor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentContext {
+    pub source: String,
     pub message_pk: i64,
     pub chat_pk: i64,
     pub chat_id: String,
@@ -239,6 +241,8 @@ pub struct CleanupOverview {
 #[serde(rename_all = "camelCase")]
 pub struct CleanupGroup {
     pub key: String,
+    pub chat_source: String,
+    pub chat_pk: Option<i64>,
     pub chat_id: String,
     pub chat_title: String,
     pub chat_kind: String,
@@ -251,6 +255,7 @@ pub struct CleanupGroup {
     pub thumbnail_backed_image_count: u64,
     pub keeping_thumbnails: bool,
     pub latest_timestamp: i64,
+    pub planned_for_chat_removal: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,6 +288,22 @@ pub struct CleanupReviewPage {
     pub page_size: u32,
     pub total_items: u64,
     pub total_pages: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AdvancedCleanupReport {
+    pub line_empty_chats: u64,
+    pub line_system_only_chats: u64,
+    pub square_available: bool,
+    pub square_empty_chats: u64,
+    pub square_system_only_chats: u64,
+    pub orphan_community_messages: u64,
+    pub automatic_cleanup_planned: bool,
+    pub planned_chats: u64,
+    pub planned_database_messages: u64,
+    pub planned_files: u64,
+    pub planned_bytes: u64,
 }
 
 pub fn checked_page_size(limit: u32) -> anyhow::Result<usize> {

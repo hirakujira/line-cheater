@@ -47,7 +47,7 @@ list, complete chat, or complete output archive.
 
 ```text
 Cargo.toml                 Rust workspace
-native/core/               Native library and line-backup-native CLI
+native/core/               Native library and line-cheater CLI
 native/core/src/source.rs  Directory, SQLite, and .imazingapp discovery/staging
 native/core/src/database.rs
                            Read-only LINE SQLite queries and cursor pagination
@@ -111,6 +111,10 @@ Verified implementation:
   while detail mode streams 24-review virtual batches.
 - [x] Correlate cleanup paths against both `Line.sqlite` and the same-store
   `LineSquare.sqlite`, including community titles and senders.
+- [x] Add a desktop-only advanced mode that plans full-chat deletion, attaches
+  source-aware files to that plan, detects empty/system-only chats, and removes
+  `LineSquare.ZMESSAGE` rows whose `ZCHAT` no longer exists. SQLite mutation is
+  applied only to snapshots inside the new candidate.
 - [x] Add bounded local image previews. A preview is catalog-authorized, capped
   at 16 MiB, delivered through a tokenized local protocol, and never serialized
   into JSON. Archive previews are streamed on demand into a 32-file LRU cache.
@@ -283,63 +287,63 @@ stderr so a desktop wrapper can parse stdout safely.
 
 ```bash
 # Inspect structure without reading chat content.
-cargo run -p line-backup-native -- \
+cargo run -p line-cheater -- \
   inspect --source /path/to/LINE
 
 # List the first page from the main database. The desktop uses `serve` below to
 # merge source-aware main/community pages.
-cargo run -p line-backup-native -- \
+cargo run -p line-cheater -- \
   --work-dir /path/to/work \
   chats --source /path/to/LINE --limit 100
 
 # Resume the main-database CLI page using both CLI cursor components.
-cargo run -p line-backup-native -- \
+cargo run -p line-cheater -- \
   --work-dir /path/to/work \
   chats --source /path/to/LINE --limit 100 \
   --after-updated 1700000000000 --after-pk 42
 
 # Read one bounded message page.
-cargo run -p line-backup-native -- \
+cargo run -p line-cheater -- \
   --work-dir /path/to/work \
   messages --source /path/to/LINE --chat-pk 42 --limit 180
 
 # Search message text with a bounded result page. This initial implementation
 # scans the read-only source SQLite; it does not build an FTS index yet.
-cargo run -p line-backup-native -- \
+cargo run -p line-cheater -- \
   --work-dir /path/to/work \
   search --source /path/to/LINE --query "keyword" --limit 180
 
 # Build/update the on-disk file catalog.
-cargo run -p line-backup-native -- \
+cargo run -p line-cheater -- \
   --work-dir /path/to/work \
   catalog --source /path/to/LINE
 
 # Page attachment metadata without loading attachment contents.
-cargo run -p line-backup-native -- \
+cargo run -p line-cheater -- \
   attachments --catalog /path/to/work/catalog.sqlite --limit 100
 
 # Hash only same-size duplicate candidates with fixed-size buffered reads.
-cargo run -p line-backup-native -- \
+cargo run -p line-cheater -- \
   hash-duplicates \
   --source /path/to/LINE.imazingapp \
   --catalog /path/to/work/catalog.sqlite
 
 # Page exact-content duplicate groups, then page one group's members.
-cargo run -p line-backup-native -- \
+cargo run -p line-cheater -- \
   duplicates --catalog /path/to/work/catalog.sqlite --limit 100
-cargo run -p line-backup-native -- \
+cargo run -p line-cheater -- \
   duplicate-members \
   --catalog /path/to/work/catalog.sqlite \
   --sha256 <digest-from-duplicates> \
   --limit 100
 
 # Start the long-running desktop sidecar.
-cargo run -p line-backup-native -- \
+cargo run -p line-cheater -- \
   --work-dir /path/to/work \
   serve --source /path/to/LINE
 
 # Build a new candidate from an already-scanned source.
-cargo run -p line-backup-native -- \
+cargo run -p line-cheater -- \
   slim \
   --source /path/to/LINE.imazingapp \
   --catalog /path/to/work/catalog.sqlite \
@@ -394,6 +398,10 @@ Supported methods:
 - `listCleanupGroups`
 - `listCleanupReviews`
 - `applyCleanupGroupAction`
+- `advancedCleanupReport`
+- `setChatRemovalPlanned`
+- `planAutomaticCleanup`
+- `clearAdvancedCleanupPlan`
 - `hashDuplicateCandidates`
 - `listDuplicateGroups`
 - `listDuplicateMembers`
@@ -459,6 +467,11 @@ It contains:
   chat path hint, persisted SQLite evidence/reference status, scan generation,
   and an optional exact-content SHA-256.
 - `removal_plan`: explicit user selections only.
+- `chat_removal_plan` and `chat_removal_files`: source-aware chat/database
+  deletion selections and their derived attachment paths, including exact
+  database references and files whose path identifies the selected chat.
+- `orphan_message_removal_plan`: exact `LineSquare.ZMESSAGE.Z_PK` rows confirmed
+  to have no matching `ZCHAT`.
 
 A catalog is bound to one canonical source path. Reusing it for another source
 is rejected.
@@ -467,7 +480,8 @@ Scans commit every 1,000 records. An interrupted scan leaves valid committed
 batches and `scan_status=scanning`; rerunning is idempotent. The current
 implementation re-enumerates the source and upserts existing paths rather than
 resuming from an exact directory cursor. Exact checkpoint continuation is still
-future work. Cleanup-context schema version 2 includes companion-database titles;
+future work. Cleanup-context schema version 3 includes companion-database titles
+and the source database for every exact attachment context;
 older complete catalogs are reported as stale and reindexed automatically.
 
 Duplicate hashing first selects attachment rows whose positive byte size occurs
@@ -586,13 +600,15 @@ evidence that a file is safe to delete.
 Archive browsing and slimming must support ZIP64. The candidate builder should:
 
 1. Read the central directory without extracting media.
-2. Validate every requested removal path and protect `.lock`, `Line.sqlite`,
-   WAL/SHM, payload metadata, and iMazing root metadata.
+2. Validate every requested removal path and protect `.lock`, payload metadata,
+   iMazing root metadata, and SQLite unless an explicit advanced plan requests a
+   database rewrite.
 3. Raw-copy retained compressed entries where possible.
 4. Write a new `<name>.imazingapp.partial`.
 5. Emit cancellable progress based on bytes.
 6. Finish ZIP64 central-directory records.
-7. Verify structure/CRC and hashes of protected core entries.
+7. Verify structure/CRC, unchanged protected-core hashes, and exact hashes of
+   rewritten SQLite snapshots.
 8. Atomically rename to the requested candidate name.
 9. Reconfirm that the source fingerprint did not change.
 
@@ -605,6 +621,10 @@ limitations:
 
 - `.imazingapp` inputs raw-copy compressed entries; directory inputs write
   uncompressed entries.
+- Advanced plans use SQLite's online-backup API to create a consistent snapshot,
+  delete exact planned chats/messages in a transaction, run `VACUUM` and
+  `quick_check`, write the snapshot as the candidate database entry, and omit
+  stale WAL/SHM sidecars. The selected source remains byte-for-byte untouched.
 - Non-UTF-8 paths, entry names that cannot round-trip byte-for-byte, encrypted
   entries, duplicate entry names, and unsafe relative paths are rejected instead
   of silently rewritten.

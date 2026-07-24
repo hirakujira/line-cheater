@@ -105,6 +105,17 @@
               <small>審核並建立瘦身檔</small>
             </span>
           </button>
+          <button class="sidebar-item" data-view="advanced" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 3v3M12 18v3M3 12h3M18 12h3"></path>
+              <path d="m5.6 5.6 2.1 2.1m8.6 8.6 2.1 2.1m0-12.8-2.1 2.1M7.7 16.3l-2.1 2.1"></path>
+              <circle cx="12" cy="12" r="3.5"></circle>
+            </svg>
+            <span>
+              <strong>進階</strong>
+              <small>清理 SQLite 與隱藏聊天室</small>
+            </span>
+          </button>
         </nav>
 
         <div class="sidebar-source">
@@ -121,7 +132,13 @@
             <h2 id="workspace-title">瀏覽</h2>
             <p id="workspace-subtitle">查看聊天室與訊息內容</p>
           </div>
-          <p id="workspace-status" role="status">備份已以唯讀模式開啟。</p>
+          <div class="workspace-topbar-actions">
+            <label class="advanced-mode-switch">
+              <input id="advanced-mode" type="checkbox" role="switch">
+              <span>進階模式</span>
+            </label>
+            <p id="workspace-status" role="status">備份已以唯讀模式開啟。</p>
+          </div>
         </header>
 
         <div class="workspace-content">
@@ -218,6 +235,9 @@
                       <option value="community">社群</option>
                       <option value="unreferenced">SQLite 未引用</option>
                       <option value="unconfirmed">無法確認</option>
+                      <option id="cleanup-no-attachments" value="no_attachments" hidden disabled>
+                        沒有附件的對話
+                      </option>
                     </select>
                   </label>
                   <label class="cleanup-filter">
@@ -234,7 +254,7 @@
               </div>
               <div class="cleanup-results">
                 <p id="cleanup-result-info" class="cleanup-result-info" aria-live="polite"></p>
-                <div id="cleanup-list" class="cleanup-list" aria-label="依聊天室分類的附件">
+                <div id="cleanup-list" class="cleanup-list" aria-label="依聊天室分類的附件與對話">
                   <div class="empty-state">請先掃描附件。</div>
                 </div>
                 <nav class="cleanup-pagination" aria-label="附件瘦身清單分頁">
@@ -250,6 +270,89 @@
                 <button id="build-candidate" class="primary-button" disabled>
                   建立瘦身 .imazingapp
                 </button>
+              </div>
+            </div>
+          </section>
+
+          <section id="advanced-view" class="workspace-view hidden" aria-labelledby="advanced-heading-title">
+            <div class="panel advanced-panel">
+              <div class="section-title">
+                <div>
+                  <p class="section-kicker">SQLITE CLEANUP</p>
+                  <h2 id="advanced-heading-title">進階清理</h2>
+                  <p class="muted">
+                    掃描一般與社群資料庫中不會出現在聊天室列表的資料，加入瘦身計畫。
+                  </p>
+                </div>
+                <span id="advanced-mode-state" class="advanced-state-badge">進階模式未開啟</span>
+              </div>
+
+              <div class="advanced-warning">
+                <strong>只修改新建立的候選檔</strong>
+                <span>
+                  原始備份保持唯讀。建立瘦身 .imazingapp 時會重寫 SQLite 副本並移除對應附件；
+                  還原前請保留原始備份。
+                </span>
+              </div>
+
+              <div id="advanced-locked" class="advanced-locked">
+                請先開啟右上角「進階模式」，才可建立會修改 SQLite 的清理計畫。
+              </div>
+
+              <div id="advanced-content" class="hidden">
+                <div class="advanced-issue-grid" aria-live="polite">
+                  <article class="advanced-issue-card">
+                    <span>一般資料庫</span>
+                    <strong id="advanced-line-empty">—</strong>
+                    <small>0 則訊息的聊天室</small>
+                  </article>
+                  <article class="advanced-issue-card">
+                    <span>一般資料庫</span>
+                    <strong id="advanced-line-system">—</strong>
+                    <small>只有系統事件的聊天室</small>
+                  </article>
+                  <article class="advanced-issue-card">
+                    <span>社群資料庫</span>
+                    <strong id="advanced-square-empty">—</strong>
+                    <small>0 則訊息的社群聊天室</small>
+                  </article>
+                  <article class="advanced-issue-card">
+                    <span>社群資料庫</span>
+                    <strong id="advanced-square-system">—</strong>
+                    <small>只有系統事件的社群聊天室</small>
+                  </article>
+                  <article class="advanced-issue-card danger">
+                    <span>社群資料庫</span>
+                    <strong id="advanced-orphan-messages">—</strong>
+                    <small>找不到聊天室的孤兒訊息</small>
+                  </article>
+                </div>
+
+                <section class="advanced-plan-summary" aria-labelledby="advanced-plan-heading">
+                  <div>
+                    <p class="section-kicker">CANDIDATE PLAN</p>
+                    <h3 id="advanced-plan-heading">清理計畫</h3>
+                  </div>
+                  <dl>
+                    <div><dt>聊天室</dt><dd id="advanced-planned-chats">0</dd></div>
+                    <div><dt>SQLite 訊息</dt><dd id="advanced-planned-messages">0</dd></div>
+                    <div><dt>附件</dt><dd id="advanced-planned-files">0</dd></div>
+                    <div><dt>附件容量</dt><dd id="advanced-planned-bytes">0 B</dd></div>
+                  </dl>
+                </section>
+
+                <div class="advanced-actions">
+                  <button id="refresh-advanced-report" type="button">掃描殘留的空白聊天室</button>
+                  <button id="plan-automatic-cleanup" class="danger-button" type="button">
+                    清理所有偵測項目
+                  </button>
+                  <button id="advanced-build-candidate" class="primary-button" type="button" disabled>
+                    建立瘦身 .imazingapp
+                  </button>
+                </div>
+                <p class="muted small">
+                  也可以回到「瀏覽」選擇單一聊天室，或在「清理」頁面直接將聊天室與其附件一併加入計畫。
+                </p>
               </div>
             </div>
           </section>

@@ -9,6 +9,8 @@ use crate::model::{
     MessagePage, checked_page_size,
 };
 
+const SQLITE_QUERY_BATCH_SIZE: usize = 900;
+
 pub struct LineDatabase {
     connection: Connection,
     chat_columns: HashSet<String>,
@@ -35,6 +37,13 @@ struct CompanionChatTitle {
     title: String,
     kind: String,
     source: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanMessage {
+    pub pk: i64,
+    pub id: String,
+    pub chat_pk: Option<i64>,
 }
 
 impl LineDatabase {
@@ -74,6 +83,81 @@ impl LineDatabase {
         Ok(self
             .connection
             .query_row("PRAGMA quick_check", [], |row| row.get(0))?)
+    }
+
+    pub fn chat_for_cleanup(&self, chat_pk: i64) -> Result<Chat> {
+        self.cleanup_chats(Some(chat_pk), false)?
+            .into_iter()
+            .next()
+            .context("LINE chat does not exist")
+    }
+
+    pub fn advanced_cleanup_chats(&self) -> Result<Vec<Chat>> {
+        self.cleanup_chats(None, true)
+    }
+
+    pub fn all_chats_for_cleanup(&self) -> Result<Vec<Chat>> {
+        self.cleanup_chats(None, false)
+    }
+
+    fn cleanup_chats(&self, chat_pk: Option<i64>, filtered_only: bool) -> Result<Vec<Chat>> {
+        if !self.message_columns.contains("ZCHAT") {
+            bail!("ZMESSAGE does not contain ZCHAT");
+        }
+        let chat_id = text_expr("c", &self.chat_columns, &["ZMID", "ZID"]);
+        let chat_type = integer_expr("c", &self.chat_columns, "ZTYPE", "0");
+        let chat_name = text_expr("c", &self.chat_columns, &["ZNAME"]);
+        let last_message = text_expr("c", &self.chat_columns, &["ZLASTMESSAGE"]);
+        let last_updated = if self.chat_columns.contains("ZLASTUPDATED") {
+            "CAST(COALESCE(c.ZLASTUPDATED, 0) AS INTEGER)".to_string()
+        } else if self.message_columns.contains("ZTIMESTAMP") {
+            "(SELECT CAST(COALESCE(MAX(mt.ZTIMESTAMP), 0) AS INTEGER) \
+              FROM ZMESSAGE mt WHERE mt.ZCHAT = c.Z_PK)"
+                .to_string()
+        } else {
+            "0".to_string()
+        };
+        let message_count =
+            "(SELECT COUNT(*) FROM ZMESSAGE mc WHERE mc.ZCHAT = c.Z_PK)".to_string();
+        let human_predicate = human_message_predicate("hm", &self.message_columns);
+        let human_message_count = format!(
+            "(SELECT COUNT(*) FROM ZMESSAGE hm \
+              WHERE hm.ZCHAT = c.Z_PK AND {human_predicate})"
+        );
+        let sql = format!(
+            "SELECT CAST(c.Z_PK AS INTEGER), {chat_id}, {chat_type}, {chat_name}, \
+                    {message_count}, {human_message_count}, {last_updated}, {last_message} \
+             FROM ZCHAT c \
+             WHERE (?1 IS NULL OR c.Z_PK = ?1) \
+               AND (?2 = 0 OR {message_count} = 0 OR {human_message_count} = 0) \
+             ORDER BY c.Z_PK ASC"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params![chat_pk, i64::from(filtered_only)], |row| {
+            let id: String = row.get(1)?;
+            let name: String = row.get(3)?;
+            Ok(Chat {
+                pk: row.get(0)?,
+                source: "line".to_string(),
+                id: id.clone(),
+                chat_type: row.get(2)?,
+                kind: chat_kind(row.get(2)?).to_string(),
+                title: if !name.is_empty() {
+                    name
+                } else if !id.is_empty() {
+                    id
+                } else {
+                    "未命名聊天室".to_string()
+                },
+                title_source: "chat".to_string(),
+                message_count: row.get(4)?,
+                human_message_count: row.get(5)?,
+                last_updated: row.get(6)?,
+                last_message: row.get(7)?,
+                planned_for_removal: false,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn list_chats(&self, cursor: Option<ChatCursor>, limit: u32) -> Result<ChatPage> {
@@ -218,6 +302,7 @@ impl LineDatabase {
                 human_message_count: row.get(7)?,
                 last_updated: row.get(8)?,
                 last_message: row.get(9)?,
+                planned_for_removal: false,
             });
         }
         let has_extra = items.len() > limit;
@@ -707,7 +792,7 @@ impl LineDatabase {
             }
         );
         let mut contexts: HashMap<String, Vec<AttachmentContext>> = HashMap::new();
-        for chunk in message_ids.chunks(200) {
+        for chunk in message_ids.chunks(SQLITE_QUERY_BATCH_SIZE) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
@@ -717,7 +802,7 @@ impl LineDatabase {
                  {content_type}, {text}, {chat_type}, {chat_id}, {chat_name}, \
                  {chat_user_name}, {group_name}, {rename_text} \
                  FROM ZMESSAGE m{joins} \
-                 WHERE CAST(m.ZID AS TEXT) IN ({placeholders}) \
+                 WHERE m.ZID IN ({placeholders}) \
                  ORDER BY m.Z_PK ASC"
             );
             let mut statement = self.connection.prepare(&sql)?;
@@ -749,6 +834,7 @@ impl LineDatabase {
                     .entry(message_id)
                     .or_default()
                     .push(AttachmentContext {
+                        source: "line".to_string(),
                         message_pk: row.get(0)?,
                         chat_pk: row.get(2)?,
                         chat_id,
@@ -822,7 +908,7 @@ impl UnifiedGroupDatabase {
         normalized_ids.dedup();
         let group_type = integer_expr("g", &self.group_columns, "ZTYPE", "1");
         let mut titles = HashMap::new();
-        for chunk in normalized_ids.chunks(200) {
+        for chunk in normalized_ids.chunks(SQLITE_QUERY_BATCH_SIZE) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
@@ -890,6 +976,129 @@ impl LineSquareDatabase {
             square_columns,
             member_columns,
         })
+    }
+
+    pub fn chat_for_cleanup(&self, chat_pk: i64) -> Result<Chat> {
+        self.cleanup_chats(Some(chat_pk), false)?
+            .into_iter()
+            .next()
+            .context("LineSquare chat does not exist")
+    }
+
+    pub fn advanced_cleanup_chats(&self) -> Result<Vec<Chat>> {
+        self.cleanup_chats(None, true)
+    }
+
+    pub fn all_chats_for_cleanup(&self) -> Result<Vec<Chat>> {
+        self.cleanup_chats(None, false)
+    }
+
+    pub fn orphan_messages(&self) -> Result<Vec<OrphanMessage>> {
+        if !self.message_columns.contains("ZCHAT") {
+            bail!("LineSquare.ZMESSAGE does not contain ZCHAT");
+        }
+        let message_id = text_expr("m", &self.message_columns, &["ZID"]);
+        let sql = format!(
+            "SELECT CAST(m.Z_PK AS INTEGER), {message_id}, CAST(m.ZCHAT AS INTEGER) \
+             FROM ZMESSAGE m \
+             LEFT JOIN ZCHAT c ON c.Z_PK = m.ZCHAT \
+             WHERE c.Z_PK IS NULL \
+             ORDER BY m.Z_PK ASC"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok(OrphanMessage {
+                pk: row.get(0)?,
+                id: row.get(1)?,
+                chat_pk: row.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn cleanup_chats(&self, chat_pk: Option<i64>, filtered_only: bool) -> Result<Vec<Chat>> {
+        if !self.message_columns.contains("ZCHAT") {
+            bail!("LineSquare.ZMESSAGE does not contain ZCHAT");
+        }
+        let chat_id = text_expr("c", &self.chat_columns, &["ZMID", "ZID"]);
+        let chat_type = integer_expr("c", &self.chat_columns, "ZTYPE", "100");
+        let chat_name = text_expr("c", &self.chat_columns, &["ZNAME"]);
+        let can_join_square =
+            self.chat_columns.contains("ZSQUARE") && self.square_columns.contains("Z_PK");
+        let square_name = if can_join_square {
+            text_expr("s", &self.square_columns, &["ZNAME"])
+        } else {
+            "''".to_string()
+        };
+        let join = if can_join_square {
+            " LEFT JOIN ZSQUARE s ON s.Z_PK = c.ZSQUARE"
+        } else {
+            ""
+        };
+        let last_updated = if self.chat_columns.contains("ZLASTUPDATED") {
+            "CAST(COALESCE(c.ZLASTUPDATED, 0) AS INTEGER)".to_string()
+        } else if self.message_columns.contains("ZTIMESTAMP") {
+            "(SELECT CAST(COALESCE(MAX(mt.ZTIMESTAMP), 0) AS INTEGER) \
+              FROM ZMESSAGE mt WHERE mt.ZCHAT = c.Z_PK)"
+                .to_string()
+        } else {
+            "0".to_string()
+        };
+        let last_message = if self.chat_columns.contains("ZLASTMESSAGE") {
+            text_expr("c", &self.chat_columns, &["ZLASTMESSAGE"])
+        } else if self.message_columns.contains("ZTEXT") {
+            "COALESCE((SELECT COALESCE(mt.ZTEXT, '') FROM ZMESSAGE mt \
+              WHERE mt.ZCHAT = c.Z_PK ORDER BY mt.Z_PK DESC LIMIT 1), '')"
+                .to_string()
+        } else {
+            "''".to_string()
+        };
+        let message_count =
+            "(SELECT COUNT(*) FROM ZMESSAGE mc WHERE mc.ZCHAT = c.Z_PK)".to_string();
+        let human_predicate = human_message_predicate("hm", &self.message_columns);
+        let human_message_count = format!(
+            "(SELECT COUNT(*) FROM ZMESSAGE hm \
+              WHERE hm.ZCHAT = c.Z_PK AND {human_predicate})"
+        );
+        let sql = format!(
+            "SELECT CAST(c.Z_PK AS INTEGER), {chat_id}, {chat_type}, {chat_name}, \
+                    {square_name}, {message_count}, {human_message_count}, \
+                    {last_updated}, {last_message} \
+             FROM ZCHAT c{join} \
+             WHERE (?1 IS NULL OR c.Z_PK = ?1) \
+               AND (?2 = 0 OR {message_count} = 0 OR {human_message_count} = 0) \
+             ORDER BY c.Z_PK ASC"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(params![chat_pk, i64::from(filtered_only)], |row| {
+            let id: String = row.get(1)?;
+            let chat_name: String = row.get(3)?;
+            let square_name: String = row.get(4)?;
+            let title = if !square_name.is_empty() {
+                square_name
+            } else if !chat_name.is_empty() {
+                chat_name
+            } else if !id.is_empty() {
+                id.clone()
+            } else {
+                "未命名社群".to_string()
+            };
+            Ok(Chat {
+                pk: row.get(0)?,
+                source: "square".to_string(),
+                id,
+                chat_type: row.get(2)?,
+                kind: "community".to_string(),
+                title,
+                title_source: "line-square".to_string(),
+                message_count: row.get(5)?,
+                human_message_count: row.get(6)?,
+                last_updated: row.get(7)?,
+                last_message: row.get(8)?,
+                planned_for_removal: false,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn list_chats(&self, cursor: Option<ChatCursor>, limit: u32) -> Result<ChatPage> {
@@ -1012,6 +1221,7 @@ impl LineSquareDatabase {
                 human_message_count: row.get(6)?,
                 last_updated: row.get(7)?,
                 last_message: row.get(8)?,
+                planned_for_removal: false,
             });
         }
         let has_extra = items.len() > limit;
@@ -1339,7 +1549,7 @@ impl LineSquareDatabase {
             }
         );
         let mut contexts: HashMap<String, Vec<AttachmentContext>> = HashMap::new();
-        for chunk in message_ids.chunks(200) {
+        for chunk in message_ids.chunks(SQLITE_QUERY_BATCH_SIZE) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");
@@ -1348,7 +1558,7 @@ impl LineSquareDatabase {
                  CAST(m.ZCHAT AS INTEGER), {timestamp}, {sender_pk}, {sender_name}, \
                  {content_type}, {text}, {chat_id}, {chat_name}, {square_name} \
                  FROM ZMESSAGE m{joins} \
-                 WHERE CAST(m.ZID AS TEXT) IN ({placeholders}) \
+                 WHERE m.ZID IN ({placeholders}) \
                  ORDER BY m.Z_PK ASC"
             );
             let mut statement = self.connection.prepare(&sql)?;
@@ -1372,6 +1582,7 @@ impl LineSquareDatabase {
                     .entry(message_id)
                     .or_default()
                     .push(AttachmentContext {
+                        source: "square".to_string(),
                         message_pk: row.get(0)?,
                         chat_pk: row.get(2)?,
                         chat_id,
@@ -1409,7 +1620,7 @@ impl LineSquareDatabase {
             ""
         };
         let mut titles = HashMap::new();
-        for chunk in normalized_ids.chunks(200) {
+        for chunk in normalized_ids.chunks(SQLITE_QUERY_BATCH_SIZE) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(",");

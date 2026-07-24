@@ -7,10 +7,10 @@ use serde_json::{Value, json};
 
 use crate::candidate::build_candidate;
 use crate::catalog::Catalog;
-use crate::database::{LineDatabase, LineSquareDatabase, UnifiedGroupDatabase};
+use crate::database::{LineDatabase, LineSquareDatabase, OrphanMessage, UnifiedGroupDatabase};
 use crate::model::{
-    AttachmentCursor, AttachmentKind, ChatCursor, ChatPage, DEFAULT_PAGE_SIZE,
-    DuplicateGroupCursor, MessageCursor,
+    AdvancedCleanupReport, AttachmentCursor, AttachmentKind, Chat, ChatCursor, ChatPage,
+    CleanupGroupPage, DEFAULT_PAGE_SIZE, DuplicateGroupCursor, MessageCursor,
 };
 use crate::source::{PreparedSource, prepare_source};
 
@@ -23,6 +23,7 @@ pub struct NativeSession {
     square_database: Option<LineSquareDatabase>,
     unified_group_database: Option<UnifiedGroupDatabase>,
     catalog: Catalog,
+    quick_check: Option<String>,
 }
 
 impl NativeSession {
@@ -40,13 +41,24 @@ impl NativeSession {
             .map(UnifiedGroupDatabase::open)
             .transpose()?;
         let catalog = Catalog::open(&work_dir.join("catalog.sqlite"))?;
+        catalog.clear_all_removal_plans()?;
         Ok(Self {
             prepared,
             database,
             square_database,
             unified_group_database,
             catalog,
+            quick_check: None,
         })
+    }
+
+    fn quick_check(&mut self) -> Result<String> {
+        if let Some(value) = self.quick_check.as_ref() {
+            return Ok(value.clone());
+        }
+        let value = self.database.quick_check()?;
+        self.quick_check = Some(value.clone());
+        Ok(value)
     }
 }
 
@@ -203,6 +215,24 @@ struct CleanupGroupActionParams {
     action: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatRemovalParams {
+    source: String,
+    chat_pk: i64,
+    planned: bool,
+}
+
+struct AdvancedCleanupAnalysis {
+    chats: Vec<Chat>,
+    orphan_messages: Vec<OrphanMessage>,
+    line_empty_chats: u64,
+    line_system_only_chats: u64,
+    square_available: bool,
+    square_empty_chats: u64,
+    square_system_only_chats: u64,
+}
+
 enum ReadLine {
     Eof,
     Line,
@@ -280,15 +310,18 @@ fn handle_request<W: Write>(
     output: &mut W,
 ) -> Result<Value> {
     match request.method.as_str() {
-        "sessionInfo" => Ok(json!({
-            "protocolVersion": SIDECAR_PROTOCOL_VERSION,
-            "source": session.prepared.report,
-            "readOnly": session.database.is_read_only()?,
-            "quickCheck": session.database.quick_check()?,
-            "lineSquareLoaded": session.square_database.is_some(),
-            "unifiedGroupLoaded": session.unified_group_database.is_some(),
-            "catalog": session.catalog.stats()?,
-        })),
+        "sessionInfo" => {
+            let quick_check = session.quick_check()?;
+            Ok(json!({
+                "protocolVersion": SIDECAR_PROTOCOL_VERSION,
+                "source": session.prepared.report,
+                "readOnly": session.database.is_read_only()?,
+                "quickCheck": quick_check,
+                "lineSquareLoaded": session.square_database.is_some(),
+                "unifiedGroupLoaded": session.unified_group_database.is_some(),
+                "catalog": session.catalog.stats()?,
+            }))
+        }
         "listChats" => {
             let params: ChatPageParams = parse_params(request)?;
             if params.cursor.is_some() && params.before_cursor.is_some() {
@@ -321,6 +354,7 @@ fn handle_request<W: Write>(
                 session.unified_group_database.as_ref(),
                 session.square_database.as_ref(),
             )?;
+            session.catalog.enrich_planned_chats(&mut items)?;
             items.sort_by(|left, right| {
                 right
                     .last_updated
@@ -528,14 +562,19 @@ fn handle_request<W: Write>(
         "cleanupOverview" => Ok(serde_json::to_value(session.catalog.cleanup_overview()?)?),
         "listCleanupGroups" => {
             let params: CleanupPageParams = parse_params(request)?;
-            Ok(serde_json::to_value(session.catalog.list_cleanup_groups(
-                params.page,
-                params.page_size,
-                params.search.as_deref(),
-                &params.kind,
-                &params.category,
-                &params.sort,
-            )?)?)
+            let page = if params.category == "no_attachments" {
+                list_empty_attachment_chats(session, &params)?
+            } else {
+                session.catalog.list_cleanup_groups(
+                    params.page,
+                    params.page_size,
+                    params.search.as_deref(),
+                    &params.kind,
+                    &params.category,
+                    &params.sort,
+                )?
+            };
+            Ok(serde_json::to_value(page)?)
         }
         "listCleanupReviews" => {
             let params: CleanupReviewParams = parse_params(request)?;
@@ -558,6 +597,36 @@ fn handle_request<W: Write>(
                     .catalog
                     .apply_cleanup_group_action(&params.group_key, &params.action)?,
             )?)
+        }
+        "advancedCleanupReport" => Ok(serde_json::to_value(advanced_cleanup_report(session)?)?),
+        "setChatRemovalPlanned" => {
+            let params: ChatRemovalParams = parse_params(request)?;
+            let chat = match params.source.as_str() {
+                "line" => session.database.chat_for_cleanup(params.chat_pk)?,
+                "square" => session
+                    .square_database
+                    .as_ref()
+                    .context("LineSquare.sqlite is not available")?
+                    .chat_for_cleanup(params.chat_pk)?,
+                _ => anyhow::bail!("chat cleanup source must be `line` or `square`"),
+            };
+            session
+                .catalog
+                .set_chat_removal_planned(&chat, params.planned, "selected")?;
+            Ok(serde_json::to_value(advanced_cleanup_report(session)?)?)
+        }
+        "planAutomaticCleanup" => {
+            let analysis = analyze_advanced_cleanup(session)?;
+            session
+                .catalog
+                .plan_automatic_cleanup(&analysis.chats, &analysis.orphan_messages)?;
+            Ok(serde_json::to_value(report_from_analysis(
+                session, &analysis,
+            )?)?)
+        }
+        "clearAdvancedCleanupPlan" => {
+            session.catalog.clear_advanced_cleanup_plan()?;
+            Ok(serde_json::to_value(advanced_cleanup_report(session)?)?)
         }
         "hashDuplicateCandidates" => {
             let request_id = request.id.clone();
@@ -636,6 +705,86 @@ fn handle_request<W: Write>(
         "shutdown" => Ok(json!({ "shuttingDown": true })),
         _ => anyhow::bail!("unknown method: {}", request.method),
     }
+}
+
+fn analyze_advanced_cleanup(session: &NativeSession) -> Result<AdvancedCleanupAnalysis> {
+    let line_chats = session.database.advanced_cleanup_chats()?;
+    let line_empty_chats = line_chats
+        .iter()
+        .filter(|chat| chat.message_count == 0)
+        .count() as u64;
+    let line_system_only_chats = line_chats
+        .iter()
+        .filter(|chat| chat.message_count > 0 && chat.human_message_count == 0)
+        .count() as u64;
+    let mut chats = line_chats;
+    let (square_available, square_empty_chats, square_system_only_chats, orphan_messages) =
+        if let Some(database) = session.square_database.as_ref() {
+            let square_chats = database.advanced_cleanup_chats()?;
+            let empty = square_chats
+                .iter()
+                .filter(|chat| chat.message_count == 0)
+                .count() as u64;
+            let system_only = square_chats
+                .iter()
+                .filter(|chat| chat.message_count > 0 && chat.human_message_count == 0)
+                .count() as u64;
+            chats.extend(square_chats);
+            (true, empty, system_only, database.orphan_messages()?)
+        } else {
+            (false, 0, 0, Vec::new())
+        };
+    Ok(AdvancedCleanupAnalysis {
+        chats,
+        orphan_messages,
+        line_empty_chats,
+        line_system_only_chats,
+        square_available,
+        square_empty_chats,
+        square_system_only_chats,
+    })
+}
+
+fn report_from_analysis(
+    session: &NativeSession,
+    analysis: &AdvancedCleanupAnalysis,
+) -> Result<AdvancedCleanupReport> {
+    session.catalog.advanced_cleanup_report(
+        analysis.line_empty_chats,
+        analysis.line_system_only_chats,
+        analysis.square_available,
+        analysis.square_empty_chats,
+        analysis.square_system_only_chats,
+        analysis.orphan_messages.len() as u64,
+    )
+}
+
+fn advanced_cleanup_report(session: &NativeSession) -> Result<AdvancedCleanupReport> {
+    let analysis = analyze_advanced_cleanup(session)?;
+    report_from_analysis(session, &analysis)
+}
+
+fn list_empty_attachment_chats(
+    session: &NativeSession,
+    params: &CleanupPageParams,
+) -> Result<CleanupGroupPage> {
+    let mut chats = session.database.all_chats_for_cleanup()?;
+    session.database.enrich_chat_titles(
+        &mut chats,
+        session.unified_group_database.as_ref(),
+        session.square_database.as_ref(),
+    )?;
+    if let Some(square_database) = session.square_database.as_ref() {
+        chats.extend(square_database.all_chats_for_cleanup()?);
+    }
+    session.catalog.list_empty_attachment_chats(
+        chats,
+        params.page,
+        params.page_size,
+        params.search.as_deref(),
+        &params.kind,
+        &params.sort,
+    )
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(request: &Request) -> Result<T> {

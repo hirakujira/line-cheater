@@ -70,18 +70,20 @@ test("leads source selection with the recommended imazing archive", () => {
   assert.doesNotMatch(html, /data-source="sqlite"/);
 });
 
-test("keeps browse and cleanup as mutually exclusive native views", () => {
+test("keeps browse, cleanup, and advanced as mutually exclusive native views", () => {
   assert.match(html, /id="browse-view" class="workspace-view"/);
   assert.match(html, /id="cleanup-view" class="workspace-view hidden"/);
-  assert.match(renderer, /elements\.browseView\.classList\.toggle\("hidden", !browse\)/);
-  assert.match(renderer, /elements\.cleanupView\.classList\.toggle\("hidden", browse\)/);
+  assert.match(html, /id="advanced-view" class="workspace-view hidden"/);
+  assert.match(renderer, /elements\.browseView\.classList\.toggle\("hidden", view !== "browse"\)/);
+  assert.match(renderer, /elements\.cleanupView\.classList\.toggle\("hidden", view !== "cleanup"\)/);
+  assert.match(renderer, /elements\.advancedView\.classList\.toggle\("hidden", view !== "advanced"\)/);
   assert.match(styles, /\.workspace-screen\s*\{/);
   assert.match(styles, /\.workspace-sidebar\s*\{/);
 });
 
 test("keeps community chats source-aware and trusts native sender ownership", () => {
   assert.match(renderer, /button\.dataset\.chatSource = chat\.source \|\| "line"/);
-  assert.match(renderer, /source: selectedChat\.source \|\| "line"/);
+  assert.match(renderer, /provider\.listMessages\(selectedChatPk, \{\s+source: selectedChat\.source \|\| "line",\s+limit: 180,\s+cursor,\s+beforeCursor\s+\}\)/);
   assert.match(renderer, /typeof message\.isSelf === "boolean"/);
   assert.match(renderer, /return !hasSender &&/);
   assert.doesNotMatch(
@@ -142,6 +144,15 @@ test("keeps cleanup bounded while presenting a continuous month-sectioned album"
   assert.match(styles, /#cleanup-view\.is-detail \.cleanup-warning\s*\{\s*display: none/);
 });
 
+test("reuses cleanup overview while paging groups", () => {
+  assert.match(
+    renderer,
+    /if \(cleanupOverview\) \{\s+page = await provider\.listCleanupGroups\(cleanupOptions\(\)\);/
+  );
+  assert.match(renderer, /cleanupOverview = await provider\.applyCleanupGroupAction\(/);
+  assert.match(renderer, /cleanupPage = cleanupOverview = null;/);
+});
+
 test("opens cleanup thumbnails in the shared image modal", () => {
   assert.match(renderer, /preview\.type = "button"/);
   assert.match(renderer, /preview\.setAttribute\("aria-label", `放大預覽：\$\{caption\}`\)/);
@@ -159,6 +170,42 @@ test("offers keep-thumbnail only for thumbnail-backed image originals", () => {
   assert.doesNotMatch(renderer, /group\.hasOriginal && group\.hasThumbnail/);
 });
 
+test("lists no-attachment chats only in advanced cleanup mode", () => {
+  assert.match(
+    html,
+    /id="cleanup-no-attachments" value="no_attachments" hidden disabled/
+  );
+  assert.match(renderer, /elements\.cleanupNoAttachments\.hidden = !advancedMode/);
+  assert.match(renderer, /elements\.cleanupNoAttachments\.disabled = !advancedMode/);
+  assert.match(renderer, /group\.referenceStatus !== "no_attachments"/);
+  assert.match(renderer, /\["referenced", "no_attachments"\]\.includes\(group\.referenceStatus\)/);
+  assert.match(renderer, /"刪除所有附件"/);
+  assert.doesNotMatch(renderer, /"刪除全部"/);
+});
+
+test("gates SQLite mutation planning behind desktop advanced mode", () => {
+  assert.match(html, /id="advanced-mode"[^>]*role="switch"/);
+  assert.match(html, /data-view="advanced"/);
+  assert.match(html, /id="plan-automatic-cleanup"/);
+  assert.match(html, /id="advanced-build-candidate"/);
+  assert.match(html, /建立瘦身 \.imazingapp/);
+  assert.doesNotMatch(html, /advanced-cleanup-marked/);
+  assert.match(html, /掃描殘留的空白聊天室/);
+  assert.match(html, /<h3 id="advanced-plan-heading">清理計畫<\/h3>/);
+  assert.doesNotMatch(html, /id="clear-advanced-plan"/);
+  assert.match(renderer, /provider\.setChatRemovalPlanned\(/);
+  assert.match(renderer, /provider\.planAutomaticCleanup\(\)/);
+  assert.match(renderer, /elements\.advancedBuildCandidate\.addEventListener\("click", \(\) => void buildCandidate\(\)\)/);
+  assert.doesNotMatch(renderer, /cleanupMarkedFiles|cleanupMarkedBytes/);
+  assert.match(renderer, /report\.automaticCleanupPlanned/);
+  assert.match(renderer, /取消清理所有偵測項目/);
+  assert.match(renderer, /原始備份不會被修改/);
+  assert.doesNotMatch(renderer, /已將「\$\{title\}」的聊天室/);
+  assert.match(main, /"advancedCleanupReport"/);
+  assert.match(main, /"setChatRemovalPlanned"/);
+  assert.match(main, /"planAutomaticCleanup"/);
+});
+
 test("does not duplicate DOM ids in the app shell", () => {
   const ids = Array.from(html.matchAll(/\sid="([^"]+)"/g), (match) => match[1]);
   assert.equal(new Set(ids).size, ids.length);
@@ -167,7 +214,7 @@ test("does not duplicate DOM ids in the app shell", () => {
 test("packages the release sidecar inside a verified macOS bundle", () => {
   assert.match(packageJson.scripts["package:mac"], /build:native:mac/);
   assert.match(main, /path\.join\(process\.resourcesPath, "bin", executable\)/);
-  assert.match(macPackager, /"target",\s*"release",\s*"line-backup-native"/);
+  assert.match(macPackager, /"target",\s*"release",\s*"line-cheater"/);
   assert.match(macPackager, /codesign",\s*\["--verify", "--deep", "--strict"/);
   assert.match(macPackager, /hdiutil",\s*\[/);
   assert.match(macPackager, /SHA256SUMS\.txt/);
@@ -184,6 +231,14 @@ test("provides a self-checking DMG packaging script", () => {
   assert.match(dmgPackager, /hdiutil verify/);
   assert.match(dmgPackager, /hdiutil attach/);
   assert.match(dmgPackager, /mounted_sidecar/);
+  assert.match(dmgPackager, /Resources\/bin\/line-cheater/);
   assert.match(dmgPackager, /--version/);
   assert.equal(fs.statSync(path.join(root, "scripts", "package-dmg.sh")).mode & 0o111, 0o111);
+});
+
+test("prefers the current debug sidecar during development", () => {
+  assert.match(
+    main,
+    /} else \{\s+candidates\.push\(path\.resolve\(__dirname, "\.\.", "\.\.", "target", "debug", executable\)\);\s+candidates\.push\(path\.resolve\(__dirname, "\.\.", "\.\.", "target", "release", executable\)\);/
+  );
 });

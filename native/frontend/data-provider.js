@@ -9,7 +9,7 @@
   var MAX_PAGE_SIZE = 1000;
   var CLEANUP_PAGE_SIZE = 24;
   var CLEANUP_KINDS = ["all", "original", "thumbnail", "marked"];
-  var CLEANUP_CATEGORIES = ["all", "individual", "group", "community", "unreferenced", "unconfirmed"];
+  var CLEANUP_CATEGORIES = ["all", "individual", "group", "community", "unreferenced", "unconfirmed", "no_attachments"];
   var CLEANUP_SORTS = ["recent", "oldest", "size", "path"];
 
   function assertBridge(bridge) {
@@ -198,6 +198,28 @@
       groupKey: groupKey,
       action: action
     });
+  };
+
+  NativeDataProvider.prototype.advancedCleanupReport = function () {
+    return this.bridge.request("advancedCleanupReport", {});
+  };
+
+  NativeDataProvider.prototype.setChatRemovalPlanned = function (source, chatPk, planned) {
+    source = boundedMessageSource(source);
+    if (!Number.isInteger(Number(chatPk))) throw new TypeError("chatPk must be an integer.");
+    return this.bridge.request("setChatRemovalPlanned", {
+      source: source,
+      chatPk: Number(chatPk),
+      planned: Boolean(planned)
+    });
+  };
+
+  NativeDataProvider.prototype.planAutomaticCleanup = function () {
+    return this.bridge.request("planAutomaticCleanup", {});
+  };
+
+  NativeDataProvider.prototype.clearAdvancedCleanupPlan = function () {
+    return this.bridge.request("clearAdvancedCleanupPlan", {});
   };
 
   NativeDataProvider.prototype.hashDuplicateCandidates = function () {

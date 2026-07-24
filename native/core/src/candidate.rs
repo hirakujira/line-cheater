@@ -2,9 +2,12 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use rusqlite::backup::Backup;
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -12,7 +15,8 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZIP64_BYTES_THR, ZipArchive, ZipWriter};
 
 use crate::catalog::Catalog;
-use crate::source::{SourceKind, inspect_source};
+use crate::catalog::DatabaseCleanupPlan;
+use crate::source::{PreparedSource, SourceKind, inspect_source, prepare_source};
 
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -33,6 +37,9 @@ pub struct CandidateReport {
     pub input_entries: u64,
     pub output_entries: u64,
     pub removed_entries: u64,
+    pub removed_chats: u64,
+    pub removed_messages: u64,
+    pub rewritten_databases: Vec<String>,
     pub output_bytes: u64,
     pub used_zip64: bool,
     pub full_crc_verified: bool,
@@ -51,6 +58,46 @@ struct ArchiveBuildInfo {
     compressed_bytes: u64,
     protected_hashes: HashMap<String, String>,
     warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct DatabaseRewrite {
+    path: PathBuf,
+    sha256: String,
+    removed_chats: u64,
+    removed_messages: u64,
+}
+
+#[derive(Debug, Default)]
+struct DatabaseRewrites {
+    entries: HashMap<String, DatabaseRewrite>,
+    skipped_sidecars: HashSet<String>,
+}
+
+impl DatabaseRewrites {
+    fn removed_chats(&self) -> u64 {
+        self.entries.values().map(|entry| entry.removed_chats).sum()
+    }
+
+    fn removed_messages(&self) -> u64 {
+        self.entries
+            .values()
+            .map(|entry| entry.removed_messages)
+            .sum()
+    }
+
+    fn rewritten_names(&self) -> Vec<String> {
+        let mut names = self.entries.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    fn hashes(&self) -> HashMap<String, String> {
+        self.entries
+            .iter()
+            .map(|(name, rewrite)| (name.clone(), rewrite.sha256.clone()))
+            .collect()
+    }
 }
 
 pub fn build_candidate<F>(
@@ -78,6 +125,8 @@ where
             bail!("removal plan contains a protected or non-attachment path: {path}");
         }
     }
+    let cleanup_plan = catalog.database_cleanup_plan()?;
+    let rewrites = prepare_database_rewrites(&source, catalog, &cleanup_plan)?;
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -91,12 +140,22 @@ where
     }
 
     let build_result = match report.kind {
-        SourceKind::Directory => {
-            build_from_directory(&source, &temporary, &marked, full_crc, &mut on_progress)
-        }
-        SourceKind::ImazingArchive => {
-            build_from_archive(&source, &temporary, &marked, full_crc, &mut on_progress)
-        }
+        SourceKind::Directory => build_from_directory(
+            &source,
+            &temporary,
+            &marked,
+            &rewrites,
+            full_crc,
+            &mut on_progress,
+        ),
+        SourceKind::ImazingArchive => build_from_archive(
+            &source,
+            &temporary,
+            &marked,
+            &rewrites,
+            full_crc,
+            &mut on_progress,
+        ),
         SourceKind::Sqlite => unreachable!(),
     };
     match build_result {
@@ -105,19 +164,236 @@ where
             candidate.source_path = source.display().to_string();
             candidate.output_path = output.display().to_string();
             candidate.output_bytes = fs::metadata(output)?.len();
+            for rewrite in rewrites.entries.values() {
+                let _ = fs::remove_file(&rewrite.path);
+            }
             Ok(candidate)
         }
         Err(error) => {
             let _ = fs::remove_file(&temporary);
+            for rewrite in rewrites.entries.values() {
+                let _ = fs::remove_file(&rewrite.path);
+            }
             Err(error)
         }
     }
+}
+
+fn prepare_database_rewrites(
+    source: &Path,
+    catalog: &Catalog,
+    plan: &DatabaseCleanupPlan,
+) -> Result<DatabaseRewrites> {
+    if plan.is_empty() {
+        return Ok(DatabaseRewrites::default());
+    }
+    let work_dir = catalog
+        .path()
+        .parent()
+        .context("catalog path has no working directory")?;
+    let prepared = prepare_source(source, work_dir)?;
+    prepare_rewrites_from_prepared(&prepared, work_dir, plan)
+}
+
+fn prepare_rewrites_from_prepared(
+    prepared: &PreparedSource,
+    work_dir: &Path,
+    plan: &DatabaseCleanupPlan,
+) -> Result<DatabaseRewrites> {
+    let mut rewrites = DatabaseRewrites::default();
+    let line_chats = plan
+        .chats
+        .iter()
+        .filter(|chat| chat.source == "line")
+        .map(|chat| chat.chat_pk)
+        .collect::<Vec<_>>();
+    let square_chats = plan
+        .chats
+        .iter()
+        .filter(|chat| chat.source == "square")
+        .map(|chat| chat.chat_pk)
+        .collect::<Vec<_>>();
+    if plan
+        .chats
+        .iter()
+        .any(|chat| !matches!(chat.source.as_str(), "line" | "square"))
+        || plan
+            .orphan_messages
+            .iter()
+            .any(|message| message.source != "square")
+    {
+        bail!("database cleanup plan contains an unsupported source");
+    }
+    let square_orphans = plan
+        .orphan_messages
+        .iter()
+        .map(|message| message.message_pk)
+        .collect::<Vec<_>>();
+    let rewrite_directory = work_dir.join("candidate-databases");
+    fs::create_dir_all(&rewrite_directory)?;
+
+    if !line_chats.is_empty() {
+        let destination = rewrite_directory.join("Line.cleaned.sqlite");
+        let (removed_chats, removed_messages) =
+            rewrite_database(&prepared.database_path, &destination, &line_chats, &[])?;
+        insert_database_rewrite(
+            &mut rewrites,
+            prepared.report.database_path.clone(),
+            destination,
+            removed_chats,
+            removed_messages,
+        )?;
+    }
+    if !square_chats.is_empty() || !square_orphans.is_empty() {
+        let source = prepared
+            .square_database_path
+            .as_deref()
+            .context("cleanup plan references LineSquare.sqlite, but it is unavailable")?;
+        let destination = rewrite_directory.join("LineSquare.cleaned.sqlite");
+        let (removed_chats, removed_messages) =
+            rewrite_database(source, &destination, &square_chats, &square_orphans)?;
+        let entry_name = sibling_entry_name(&prepared.report.database_path, "LineSquare.sqlite");
+        insert_database_rewrite(
+            &mut rewrites,
+            entry_name,
+            destination,
+            removed_chats,
+            removed_messages,
+        )?;
+    }
+    Ok(rewrites)
+}
+
+fn insert_database_rewrite(
+    rewrites: &mut DatabaseRewrites,
+    entry_name: String,
+    path: PathBuf,
+    removed_chats: u64,
+    removed_messages: u64,
+) -> Result<()> {
+    let sha256 = hash_reader(File::open(&path)?)?;
+    rewrites
+        .skipped_sidecars
+        .insert(format!("{entry_name}-wal"));
+    rewrites
+        .skipped_sidecars
+        .insert(format!("{entry_name}-shm"));
+    rewrites.entries.insert(
+        entry_name,
+        DatabaseRewrite {
+            path,
+            sha256,
+            removed_chats,
+            removed_messages,
+        },
+    );
+    Ok(())
+}
+
+fn rewrite_database(
+    source: &Path,
+    destination: &Path,
+    chat_pks: &[i64],
+    orphan_message_pks: &[i64],
+) -> Result<(u64, u64)> {
+    if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", destination.display()));
+        if sidecar.exists() {
+            fs::remove_file(sidecar)?;
+        }
+    }
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let source_connection = Connection::open_with_flags(source, flags)
+        .with_context(|| format!("cannot snapshot SQLite: {}", source.display()))?;
+    let mut destination_connection = Connection::open(destination)?;
+    {
+        let backup = Backup::new(&source_connection, &mut destination_connection)?;
+        backup.run_to_completion(256, Duration::from_millis(10), None)?;
+    }
+    drop(source_connection);
+    let journal_mode: String =
+        destination_connection.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("delete") {
+        bail!("rewritten SQLite could not switch to DELETE journal mode");
+    }
+
+    let transaction = destination_connection.transaction()?;
+    let mut removed_chats = 0_u64;
+    let mut removed_messages = 0_u64;
+    {
+        let mut chat_exists =
+            transaction.prepare("SELECT EXISTS(SELECT 1 FROM ZCHAT WHERE Z_PK = ?1)")?;
+        let mut delete_messages = transaction.prepare("DELETE FROM ZMESSAGE WHERE ZCHAT = ?1")?;
+        let mut delete_chat = transaction.prepare("DELETE FROM ZCHAT WHERE Z_PK = ?1")?;
+        for chat_pk in chat_pks {
+            let exists: bool = chat_exists.query_row([chat_pk], |row| row.get(0))?;
+            if !exists {
+                bail!("planned chat no longer exists in SQLite: {chat_pk}");
+            }
+            removed_messages =
+                removed_messages.saturating_add(delete_messages.execute([chat_pk])? as u64);
+            let deleted = delete_chat.execute([chat_pk])?;
+            if deleted != 1 {
+                bail!("failed to remove planned chat from SQLite: {chat_pk}");
+            }
+            removed_chats += 1;
+        }
+    }
+    {
+        let mut orphan_exists = transaction.prepare(
+            "SELECT EXISTS(
+                SELECT 1 FROM ZMESSAGE m
+                LEFT JOIN ZCHAT c ON c.Z_PK = m.ZCHAT
+                WHERE m.Z_PK = ?1 AND c.Z_PK IS NULL
+             )",
+        )?;
+        let mut delete_orphan = transaction.prepare(
+            "DELETE FROM ZMESSAGE
+             WHERE Z_PK = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM ZCHAT c WHERE c.Z_PK = ZMESSAGE.ZCHAT
+               )",
+        )?;
+        for message_pk in orphan_message_pks {
+            let exists: bool = orphan_exists.query_row([message_pk], |row| row.get(0))?;
+            if !exists {
+                bail!("planned community orphan is no longer orphaned: {message_pk}");
+            }
+            let deleted = delete_orphan.execute([message_pk])?;
+            if deleted != 1 {
+                bail!("failed to remove planned community orphan: {message_pk}");
+            }
+            removed_messages += 1;
+        }
+    }
+    transaction.commit()?;
+    destination_connection.execute_batch("VACUUM; PRAGMA optimize;")?;
+    let quick_check: String =
+        destination_connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if quick_check != "ok" {
+        bail!("rewritten SQLite failed quick_check: {quick_check}");
+    }
+    drop(destination_connection);
+    Ok((removed_chats, removed_messages))
+}
+
+fn sibling_entry_name(database_name: &str, filename: &str) -> String {
+    database_name
+        .rsplit_once('/')
+        .map(|(parent, _)| format!("{parent}/{filename}"))
+        .unwrap_or_else(|| filename.to_string())
 }
 
 fn build_from_archive<F>(
     source: &Path,
     temporary: &Path,
     marked: &HashSet<String>,
+    rewrites: &DatabaseRewrites,
     full_crc: bool,
     on_progress: &mut F,
 ) -> Result<CandidateReport>
@@ -142,6 +418,7 @@ where
     let output_file = File::create(temporary)?;
     let mut writer = ZipWriter::new(output_file).set_auto_large_file();
     let mut removed_found = HashSet::new();
+    let mut skipped_sidecars_found = 0_u64;
     let mut processed_bytes = 0_u64;
     let mut output_entries = 0_u64;
     for index in 0..archive.len() {
@@ -151,6 +428,32 @@ where
         processed_bytes = processed_bytes.saturating_add(entry.compressed_size());
         if marked.contains(&name) {
             removed_found.insert(name);
+            on_progress(CandidateProgress {
+                processed_bytes,
+                total_bytes,
+                processed_entries: (index + 1) as u64,
+                total_entries: input_entries,
+            })?;
+            continue;
+        }
+        if rewrites.skipped_sidecars.contains(&name) {
+            skipped_sidecars_found += 1;
+            on_progress(CandidateProgress {
+                processed_bytes,
+                total_bytes,
+                processed_entries: (index + 1) as u64,
+                total_entries: input_entries,
+            })?;
+            continue;
+        }
+        if let Some(rewrite) = rewrites.entries.get(&name) {
+            let metadata = fs::metadata(&rewrite.path)?;
+            let options = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Stored)
+                .large_file(metadata.len() >= ZIP64_BYTES_THR);
+            writer.start_file(&name, options)?;
+            std::io::copy(&mut File::open(&rewrite.path)?, &mut writer)?;
+            output_entries += 1;
             on_progress(CandidateProgress {
                 processed_bytes,
                 total_bytes,
@@ -182,18 +485,29 @@ where
         temporary,
         marked,
         &protected_before,
+        &rewrites.hashes(),
+        &rewrites.skipped_sidecars,
         full_crc,
         output_entries,
     )?;
     let output_bytes = fs::metadata(temporary)?.len();
-    let mut protected_entries_verified: Vec<String> = protected_before.keys().cloned().collect();
+    let mut protected_entries_verified: Vec<String> = protected_before
+        .keys()
+        .filter(|name| {
+            !rewrites.entries.contains_key(*name) && !rewrites.skipped_sidecars.contains(*name)
+        })
+        .cloned()
+        .collect();
     protected_entries_verified.sort();
     Ok(CandidateReport {
         source_path: String::new(),
         output_path: String::new(),
         input_entries,
         output_entries,
-        removed_entries: removed_found.len() as u64,
+        removed_entries: removed_found.len() as u64 + skipped_sidecars_found,
+        removed_chats: rewrites.removed_chats(),
+        removed_messages: rewrites.removed_messages(),
+        rewritten_databases: rewrites.rewritten_names(),
         output_bytes,
         used_zip64: output_bytes >= ZIP64_BYTES_THR || output_entries >= u16::MAX as u64,
         full_crc_verified: full_crc,
@@ -206,6 +520,7 @@ fn build_from_directory<F>(
     source: &Path,
     temporary: &Path,
     marked: &HashSet<String>,
+    rewrites: &DatabaseRewrites,
     full_crc: bool,
     on_progress: &mut F,
 ) -> Result<CandidateReport>
@@ -219,13 +534,14 @@ where
     {
         bail!("source directory does not contain a protected Messages/Line.sqlite");
     }
-    let stats = catalog_directory_work(source, marked)?;
+    let stats = catalog_directory_work(source, marked, rewrites)?;
     let output_file = File::create(temporary)?;
     let mut writer = ZipWriter::new(output_file).set_auto_large_file();
     let mut processed_bytes = 0_u64;
     let mut processed_entries = 0_u64;
     let mut output_entries = 0_u64;
     let mut removed_found = HashSet::new();
+    let mut skipped_sidecars_found = 0_u64;
 
     for entry in WalkDir::new(source).follow_links(false) {
         let entry = entry?;
@@ -236,6 +552,33 @@ where
         processed_entries += 1;
         if marked.contains(&relative) {
             removed_found.insert(relative);
+            on_progress(CandidateProgress {
+                processed_bytes,
+                total_bytes: stats.1,
+                processed_entries,
+                total_entries: stats.0,
+            })?;
+            continue;
+        }
+        if rewrites.skipped_sidecars.contains(&relative) {
+            skipped_sidecars_found += 1;
+            on_progress(CandidateProgress {
+                processed_bytes,
+                total_bytes: stats.1,
+                processed_entries,
+                total_entries: stats.0,
+            })?;
+            continue;
+        }
+        if let Some(rewrite) = rewrites.entries.get(&relative) {
+            let metadata = fs::metadata(&rewrite.path)?;
+            let options = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Stored)
+                .large_file(metadata.len() >= ZIP64_BYTES_THR);
+            writer.start_file(&relative, options)?;
+            let copied = std::io::copy(&mut File::open(&rewrite.path)?, &mut writer)?;
+            processed_bytes = processed_bytes.saturating_add(copied);
+            output_entries += 1;
             on_progress(CandidateProgress {
                 processed_bytes,
                 total_bytes: stats.1,
@@ -277,18 +620,29 @@ where
         temporary,
         marked,
         &protected_before,
+        &rewrites.hashes(),
+        &rewrites.skipped_sidecars,
         full_crc,
         output_entries,
     )?;
     let output_bytes = fs::metadata(temporary)?.len();
-    let mut protected_entries_verified: Vec<String> = protected_before.keys().cloned().collect();
+    let mut protected_entries_verified: Vec<String> = protected_before
+        .keys()
+        .filter(|name| {
+            !rewrites.entries.contains_key(*name) && !rewrites.skipped_sidecars.contains(*name)
+        })
+        .cloned()
+        .collect();
     protected_entries_verified.sort();
     Ok(CandidateReport {
         source_path: String::new(),
         output_path: String::new(),
         input_entries: stats.0,
         output_entries,
-        removed_entries: removed_found.len() as u64,
+        removed_entries: removed_found.len() as u64 + skipped_sidecars_found,
+        removed_chats: rewrites.removed_chats(),
+        removed_messages: rewrites.removed_messages(),
+        rewritten_databases: rewrites.rewritten_names(),
         output_bytes,
         used_zip64: output_bytes >= ZIP64_BYTES_THR || output_entries >= u16::MAX as u64,
         full_crc_verified: full_crc,
@@ -417,6 +771,8 @@ fn verify_candidate(
     candidate: &Path,
     marked: &HashSet<String>,
     protected_before: &HashMap<String, String>,
+    rewritten_hashes: &HashMap<String, String>,
+    skipped_entries: &HashSet<String>,
     full_crc: bool,
     expected_entries: u64,
 ) -> Result<()> {
@@ -436,6 +792,9 @@ fn verify_candidate(
         if marked.contains(&name) {
             bail!("candidate still contains a marked removal: {name}");
         }
+        if skipped_entries.contains(&name) {
+            bail!("candidate still contains a stale SQLite sidecar: {name}");
+        }
         if !names.insert(name.clone()) {
             bail!("candidate contains duplicate entry path: {name}");
         }
@@ -445,9 +804,18 @@ fn verify_candidate(
         }
     }
     for (name, expected_hash) in protected_before {
+        if rewritten_hashes.contains_key(name) || skipped_entries.contains(name) {
+            continue;
+        }
         let actual = hash_archive_entry(candidate, name)?;
         if &actual != expected_hash {
             bail!("protected entry hash changed in candidate: {name}");
+        }
+    }
+    for (name, expected_hash) in rewritten_hashes {
+        let actual = hash_archive_entry(candidate, name)?;
+        if &actual != expected_hash {
+            bail!("rewritten SQLite entry hash changed in candidate: {name}");
         }
     }
     Ok(())
@@ -490,7 +858,11 @@ fn hash_reader(mut reader: impl Read) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn catalog_directory_work(root: &Path, marked: &HashSet<String>) -> Result<(u64, u64)> {
+fn catalog_directory_work(
+    root: &Path,
+    marked: &HashSet<String>,
+    rewrites: &DatabaseRewrites,
+) -> Result<(u64, u64)> {
     let mut entries = 0_u64;
     let mut bytes = 0_u64;
     for entry in WalkDir::new(root).follow_links(false) {
@@ -500,7 +872,12 @@ fn catalog_directory_work(root: &Path, marked: &HashSet<String>) -> Result<(u64,
         }
         entries += 1;
         let relative = normalized_relative_path(root, entry.path())?;
-        if !marked.contains(&relative) {
+        if marked.contains(&relative) || rewrites.skipped_sidecars.contains(&relative) {
+            continue;
+        }
+        if let Some(rewrite) = rewrites.entries.get(&relative) {
+            bytes = bytes.saturating_add(fs::metadata(&rewrite.path)?.len());
+        } else {
             bytes = bytes.saturating_add(entry.metadata()?.len());
         }
     }

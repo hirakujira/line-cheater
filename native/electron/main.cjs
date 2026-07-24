@@ -23,6 +23,10 @@ const allowedMethods = new Set([
   "listCleanupGroups",
   "listCleanupReviews",
   "applyCleanupGroupAction",
+  "advancedCleanupReport",
+  "setChatRemovalPlanned",
+  "planAutomaticCleanup",
+  "clearAdvancedCleanupPlan",
   "hashDuplicateCandidates",
   "listDuplicateGroups",
   "listDuplicateMembers",
@@ -60,19 +64,24 @@ function assertTrustedSender(event) {
 
 function rustBinaryPath() {
   const executable = process.platform === "win32"
-    ? "line-backup-native.exe"
-    : "line-backup-native";
+    ? "line-cheater.exe"
+    : "line-cheater";
   const candidates = [];
   if (process.env.LINE_BACKUP_NATIVE_BIN) {
     candidates.push(path.resolve(process.env.LINE_BACKUP_NATIVE_BIN));
   }
-  if (app.isPackaged) candidates.push(path.join(process.resourcesPath, "bin", executable));
-  candidates.push(path.resolve(__dirname, "..", "..", "target", "release", executable));
-  candidates.push(path.resolve(__dirname, "..", "..", "target", "debug", executable));
+  if (app.isPackaged) {
+    candidates.push(path.join(process.resourcesPath, "bin", executable));
+    candidates.push(path.resolve(__dirname, "..", "..", "target", "release", executable));
+    candidates.push(path.resolve(__dirname, "..", "..", "target", "debug", executable));
+  } else {
+    candidates.push(path.resolve(__dirname, "..", "..", "target", "debug", executable));
+    candidates.push(path.resolve(__dirname, "..", "..", "target", "release", executable));
+  }
   const found = candidates.find((candidate) => fs.existsSync(candidate));
   if (!found) {
     throw new Error(
-      "找不到 Rust sidecar。請先執行 cargo build -p line-backup-native，" +
+      "找不到 Rust sidecar。請先執行 cargo build -p line-cheater，" +
       "或設定 LINE_BACKUP_NATIVE_BIN。"
     );
   }
