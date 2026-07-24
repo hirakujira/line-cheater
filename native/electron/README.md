@@ -83,8 +83,9 @@ sidecar with `--version`.
 
 The command runs the Electron contract tests, compiles an optimized Rust
 sidecar, copies the Electron runtime, installs the sidecar under
-`Contents/Resources/bin`, validates the full-bleed 1024 × 1024
-`assets/icon.png`, derives all ten required `.iconset` bitmap slots and the
+`Contents/Resources/bin`, validates the 1024 × 1024
+`assets/icon.png` with transparent macOS-style rounded corners, derives all
+ten required `.iconset` bitmap slots and the
 LINE Cheater `.icns`, applies an ad-hoc code
 signature, verifies the bundle, and produces:
 

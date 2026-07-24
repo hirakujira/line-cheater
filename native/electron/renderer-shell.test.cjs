@@ -229,6 +229,7 @@ test("packages the release sidecar inside a verified macOS bundle", () => {
   assert.match(macPackager, /line-cheater\.icns/);
   assert.match(macPackager, /"assets", "icon\.png"/);
   assert.match(macPackager, /pixelWidth:\\s\*1024/);
+  assert.match(macPackager, /hasAlpha:\\s\*\(\?:yes\|true\)/);
 });
 
 test("provides a self-checking DMG packaging script", () => {
