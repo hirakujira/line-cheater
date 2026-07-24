@@ -1,0 +1,1862 @@
+use std::collections::HashMap;
+use std::fs::{self, File, FileTimes, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use sha2::{Digest, Sha256};
+use walkdir::WalkDir;
+use zip::ZipArchive;
+
+use crate::database::{LineDatabase, LineSquareDatabase, UnifiedGroupDatabase};
+use crate::model::{
+    AttachmentContext, AttachmentCursor, AttachmentItem, AttachmentKind, AttachmentPage,
+    AttachmentPreview, CatalogStats, CleanupCategoryTotal, CleanupGroup, CleanupGroupPage,
+    CleanupOverview, CleanupReview, CleanupReviewPage, DuplicateGroup, DuplicateGroupCursor,
+    DuplicateGroupPage, DuplicateHashProgress, DuplicateMemberPage, Message, MessageAttachment,
+    checked_page_size,
+};
+use crate::source::SourceKind;
+
+const CATALOG_BATCH_SIZE: usize = 1_000;
+const HASH_UPDATE_BATCH_SIZE: usize = 100;
+const HASH_BUFFER_BYTES: usize = 1024 * 1024;
+const CONTEXT_BATCH_SIZE: usize = 200;
+const MAX_CLEANUP_RESPONSE_FILES: usize = 1_000;
+const MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_STAGED_PREVIEWS: usize = 32;
+const CONTEXT_INDEX_VERSION: &str = "2";
+const CLEANUP_GROUP_EXPR: &str = "
+    CASE f.reference_status
+        WHEN 'unreferenced' THEN '__unreferenced__'
+        WHEN 'unconfirmed' THEN '__unconfirmed__'
+        ELSE 'chat:' || COALESCE(NULLIF(f.context_chat_id, ''), f.chat_hint)
+    END
+";
+const CLEANUP_CATEGORY_EXPR: &str = "
+    CASE
+        WHEN f.reference_status = 'unreferenced' THEN 'unreferenced'
+        WHEN f.reference_status <> 'referenced' THEN 'unconfirmed'
+        WHEN f.context_chat_kind = 'direct' THEN 'individual'
+        WHEN f.context_chat_kind = 'group' THEN 'group'
+        WHEN f.context_chat_kind = 'community' THEN 'community'
+        ELSE 'unconfirmed'
+    END
+";
+const ATTACHMENT_COLUMNS: &str = "
+    f.id, f.path, f.bytes, f.modified_ns, f.attachment_kind,
+    f.message_id, f.chat_hint, p.path IS NOT NULL, f.reference_status,
+    f.message_pk, f.message_chat_pk, f.context_chat_id, f.context_chat_title,
+    f.context_chat_kind, f.message_timestamp, f.message_sender_pk,
+    f.message_sender_name, f.message_content_type, f.message_text
+";
+
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogScanProgress {
+    pub files: u64,
+    pub bytes: u64,
+    pub attachments: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CatalogContextProgress {
+    pub processed_files: u64,
+    pub total_files: u64,
+    pub referenced_files: u64,
+    pub unreferenced_files: u64,
+    pub unconfirmed_files: u64,
+}
+
+#[derive(Debug)]
+struct FileRecord {
+    path: String,
+    bytes: u64,
+    modified_ns: i64,
+    kind: Option<AttachmentKind>,
+    message_id: String,
+    chat_hint: String,
+}
+
+pub struct Catalog {
+    path: PathBuf,
+    connection: Connection,
+}
+
+impl Catalog {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let connection = Connection::open(path)?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
+        connection.pragma_update(None, "cache_size", -32_768_i64)?;
+        connection.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                bytes INTEGER NOT NULL,
+                modified_ns INTEGER NOT NULL,
+                attachment_kind TEXT,
+                message_id TEXT NOT NULL DEFAULT '',
+                chat_hint TEXT NOT NULL DEFAULT '',
+                seen_scan INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS files_attachment_page
+                ON files(attachment_kind, id);
+            CREATE INDEX IF NOT EXISTS files_message_id
+                ON files(message_id) WHERE message_id <> '';
+            CREATE TABLE IF NOT EXISTS removal_plan (
+                path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE,
+                marked_at INTEGER NOT NULL
+            );
+            ",
+        )?;
+        ensure_column(&connection, "files", "sha256", "TEXT")?;
+        ensure_column(&connection, "files", "message_pk", "INTEGER")?;
+        ensure_column(&connection, "files", "message_chat_pk", "INTEGER")?;
+        ensure_column(&connection, "files", "message_timestamp", "INTEGER")?;
+        ensure_column(&connection, "files", "message_sender_pk", "INTEGER")?;
+        ensure_column(&connection, "files", "message_sender_name", "TEXT")?;
+        ensure_column(&connection, "files", "message_content_type", "INTEGER")?;
+        ensure_column(&connection, "files", "message_text", "TEXT")?;
+        ensure_column(&connection, "files", "context_chat_id", "TEXT")?;
+        ensure_column(&connection, "files", "context_chat_title", "TEXT")?;
+        ensure_column(&connection, "files", "context_chat_kind", "TEXT")?;
+        ensure_column(
+            &connection,
+            "files",
+            "reference_status",
+            "TEXT NOT NULL DEFAULT 'unconfirmed'",
+        )?;
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS files_sha256 ON files(sha256, id) WHERE sha256 IS NOT NULL",
+            [],
+        )?;
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS files_cleanup_group
+             ON files(reference_status, context_chat_id, chat_hint, id)
+             WHERE attachment_kind IS NOT NULL",
+            [],
+        )?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            connection,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn source_path(&self) -> Result<Option<PathBuf>> {
+        Ok(self.meta("source_path")?.map(PathBuf::from))
+    }
+
+    pub fn marked_paths(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path FROM removal_plan ORDER BY path")?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+    }
+
+    pub fn scan_source<F>(
+        &mut self,
+        source: &Path,
+        kind: SourceKind,
+        mut on_progress: F,
+    ) -> Result<CatalogStats>
+    where
+        F: FnMut(CatalogScanProgress),
+    {
+        let source = source
+            .canonicalize()
+            .with_context(|| format!("source does not exist: {}", source.display()))?;
+        let source_key = source.display().to_string();
+        let existing_source = self.meta("source_path")?;
+        if existing_source
+            .as_deref()
+            .is_some_and(|value| value != source_key)
+        {
+            bail!(
+                "catalog belongs to another source; create a new work directory instead of mixing backups"
+            );
+        }
+        self.set_meta("source_path", &source_key)?;
+        self.set_meta("source_kind", &format!("{kind:?}"))?;
+        let source_fingerprint = source_metadata_fingerprint(&source)?;
+        if kind == SourceKind::ImazingArchive
+            && self
+                .meta("source_fingerprint")?
+                .is_some_and(|value| value != source_fingerprint)
+        {
+            self.connection
+                .execute("UPDATE files SET sha256 = NULL", [])?;
+        }
+        self.set_meta("source_fingerprint", &source_fingerprint)?;
+        let scan_id = self
+            .meta("scan_id")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0)
+            + 1;
+        self.set_meta("scan_id", &scan_id.to_string())?;
+        self.set_meta("scan_status", "scanning")?;
+
+        let mut batch = Vec::with_capacity(CATALOG_BATCH_SIZE);
+        let mut progress = CatalogScanProgress {
+            files: 0,
+            bytes: 0,
+            attachments: 0,
+        };
+        match kind {
+            SourceKind::Directory => {
+                for entry in WalkDir::new(&source).follow_links(false) {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(error) => {
+                            eprintln!("skipping unreadable path: {error}");
+                            continue;
+                        }
+                    };
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let metadata = match entry.metadata() {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            eprintln!("skipping unreadable metadata: {error}");
+                            continue;
+                        }
+                    };
+                    let relative = entry.path().strip_prefix(&source).unwrap_or(entry.path());
+                    batch.push(file_record(
+                        relative.to_string_lossy().replace('\\', "/"),
+                        metadata.len(),
+                        modified_ns(metadata.modified().ok()),
+                    ));
+                    update_progress(&mut progress, batch.last().expect("record exists"));
+                    if batch.len() == CATALOG_BATCH_SIZE {
+                        self.upsert_batch(scan_id, &mut batch)?;
+                        on_progress(progress);
+                    }
+                }
+            }
+            SourceKind::ImazingArchive => {
+                let file = File::open(&source)?;
+                let mut archive = ZipArchive::new(file)?;
+                for index in 0..archive.len() {
+                    let entry = archive.by_index(index)?;
+                    if entry.is_dir() {
+                        continue;
+                    }
+                    let path = String::from_utf8_lossy(entry.name_raw()).replace('\\', "/");
+                    batch.push(file_record(path, entry.size(), 0));
+                    update_progress(&mut progress, batch.last().expect("record exists"));
+                    if batch.len() == CATALOG_BATCH_SIZE {
+                        self.upsert_batch(scan_id, &mut batch)?;
+                        on_progress(progress);
+                    }
+                }
+            }
+            SourceKind::Sqlite => {
+                let metadata = fs::metadata(&source)?;
+                let path = source
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                batch.push(file_record(
+                    path,
+                    metadata.len(),
+                    modified_ns(metadata.modified().ok()),
+                ));
+                update_progress(&mut progress, batch.last().expect("record exists"));
+            }
+        }
+        self.upsert_batch(scan_id, &mut batch)?;
+        self.connection
+            .execute("DELETE FROM files WHERE seen_scan <> ?1", [scan_id])?;
+        self.set_meta("scan_status", "complete")?;
+        self.set_meta("scan_completed_at", &unix_seconds().to_string())?;
+        on_progress(progress);
+        self.stats()
+    }
+
+    pub fn list_attachments(
+        &self,
+        cursor: Option<AttachmentCursor>,
+        limit: u32,
+        kind: Option<AttachmentKind>,
+        search: Option<&str>,
+    ) -> Result<AttachmentPage> {
+        let limit = checked_page_size(limit)?;
+        let search = search
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("%{}%", escape_like(value)));
+        let kind_value = kind.map(AttachmentKind::as_str);
+        let sql = format!(
+            "
+            SELECT {ATTACHMENT_COLUMNS}
+            FROM files f
+            LEFT JOIN removal_plan p ON p.path = f.path
+            WHERE f.attachment_kind IS NOT NULL
+              AND f.id > ?1
+              AND (?2 IS NULL OR f.attachment_kind = ?2)
+              AND (?3 IS NULL OR f.path LIKE ?3 ESCAPE '\\')
+            ORDER BY f.id ASC
+            LIMIT ?4
+            "
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params![
+                cursor.map(|value| value.id).unwrap_or(0),
+                kind_value,
+                search,
+                limit as i64
+            ],
+            attachment_from_row,
+        )?;
+        let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let next_cursor = if items.len() == limit {
+            items
+                .last()
+                .map(|attachment| AttachmentCursor { id: attachment.id })
+        } else {
+            None
+        };
+        Ok(AttachmentPage { items, next_cursor })
+    }
+
+    pub fn set_marked(&self, path: &str, marked: bool) -> Result<()> {
+        let exists: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE path = ?1 AND attachment_kind IS NOT NULL)",
+            [path],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            bail!("attachment path is not present in this catalog");
+        }
+        if marked {
+            self.connection.execute(
+                "INSERT INTO removal_plan(path, marked_at) VALUES (?1, ?2)
+                 ON CONFLICT(path) DO UPDATE SET marked_at = excluded.marked_at",
+                params![path, unix_seconds()],
+            )?;
+        } else {
+            self.connection
+                .execute("DELETE FROM removal_plan WHERE path = ?1", [path])?;
+        }
+        Ok(())
+    }
+
+    pub fn enrich_messages_with_attachments(&self, messages: &mut [Message]) -> Result<()> {
+        if messages.len() > crate::model::MAX_PAGE_SIZE as usize {
+            bail!(
+                "message attachment enrichment cannot exceed {} messages",
+                crate::model::MAX_PAGE_SIZE
+            );
+        }
+        for message in messages.iter_mut() {
+            message.attachments.clear();
+        }
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut message_indexes = HashMap::new();
+        for (index, message) in messages.iter().enumerate() {
+            message_indexes.insert((message.pk, message.chat_pk, message.id.clone()), index);
+        }
+        let mut message_pks = messages
+            .iter()
+            .map(|message| message.pk)
+            .collect::<Vec<_>>();
+        message_pks.sort_unstable();
+        message_pks.dedup();
+        for chunk in message_pks.chunks(200) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT f.message_pk, f.message_chat_pk, f.message_id, f.path, f.bytes, \
+                        f.attachment_kind \
+                 FROM files f \
+                 WHERE f.reference_status = 'referenced' \
+                   AND f.attachment_kind IS NOT NULL \
+                   AND f.message_pk IN ({placeholders}) \
+                 ORDER BY f.message_pk, \
+                          CASE f.attachment_kind WHEN 'original' THEN 0 ELSE 1 END, \
+                          f.path"
+            );
+            let mut statement = self.connection.prepare(&sql)?;
+            let mut rows = statement.query(rusqlite::params_from_iter(chunk.iter().copied()))?;
+            while let Some(row) = rows.next()? {
+                let message_pk: i64 = row.get(0)?;
+                let chat_pk: i64 = row.get(1)?;
+                let message_id: String = row.get(2)?;
+                let Some(index) = message_indexes
+                    .get(&(message_pk, chat_pk, message_id))
+                    .copied()
+                else {
+                    continue;
+                };
+                let bytes: i64 = row.get(4)?;
+                messages[index].attachments.push(MessageAttachment {
+                    path: row.get(3)?,
+                    bytes: u64::try_from(bytes)
+                        .context("catalog attachment has an invalid byte size")?,
+                    kind: row.get::<_, String>(5)?.parse()?,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn stage_attachment_preview(
+        &self,
+        source: &Path,
+        source_kind: SourceKind,
+        path: &str,
+    ) -> Result<AttachmentPreview> {
+        if path.is_empty() || path.len() > 4_096 {
+            bail!("invalid attachment preview path");
+        }
+        let bytes = self
+            .connection
+            .query_row(
+                "SELECT bytes FROM files
+                 WHERE path = ?1 AND attachment_kind IS NOT NULL",
+                [path],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .context("attachment preview path is not present in this catalog")?;
+        let bytes = u64::try_from(bytes).context("attachment preview has an invalid size")?;
+        if bytes == 0 || bytes > MAX_PREVIEW_BYTES {
+            bail!("attachment preview must be between 1 byte and {MAX_PREVIEW_BYTES} bytes");
+        }
+        let source = source
+            .canonicalize()
+            .with_context(|| format!("source does not exist: {}", source.display()))?;
+        validate_bound_source(self, &source)?;
+        let staged_path = match source_kind {
+            SourceKind::Directory => {
+                let candidate = source.join(path);
+                let candidate = candidate
+                    .canonicalize()
+                    .with_context(|| format!("attachment preview does not exist: {path}"))?;
+                if !candidate.starts_with(&source) || !candidate.is_file() {
+                    bail!("attachment preview escapes the selected source");
+                }
+                candidate
+            }
+            SourceKind::ImazingArchive => self.stage_archive_preview(&source, path, bytes)?,
+            SourceKind::Sqlite => bail!("a direct Line.sqlite source has no attachment previews"),
+        };
+        let media_type = detect_image_media_type(&staged_path)?
+            .context("attachment is not a supported image")?;
+        Ok(AttachmentPreview {
+            staged_path: staged_path.display().to_string(),
+            media_type: media_type.to_string(),
+            bytes,
+        })
+    }
+
+    fn stage_archive_preview(&self, source: &Path, path: &str, bytes: u64) -> Result<PathBuf> {
+        let cache = self
+            .path
+            .parent()
+            .context("catalog has no working directory")?
+            .join("preview-cache");
+        fs::create_dir_all(&cache)?;
+        let digest = Sha256::digest(path.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let extension = Path::new(path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 8
+                    && value
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric())
+            })
+            .unwrap_or("bin");
+        let destination = cache.join(format!("{digest}.{extension}"));
+        if destination
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() == bytes)
+        {
+            OpenOptions::new()
+                .read(true)
+                .open(&destination)?
+                .set_times(FileTimes::new().set_modified(SystemTime::now()))?;
+            return Ok(destination);
+        }
+        trim_preview_cache(&cache, MAX_STAGED_PREVIEWS.saturating_sub(1))?;
+        let file = File::open(source)?;
+        let mut archive = ZipArchive::new(file)?;
+        let mut entry = archive
+            .by_name(path)
+            .with_context(|| format!("attachment preview is missing from archive: {path}"))?;
+        if entry.is_dir() || entry.size() != bytes || entry.size() > MAX_PREVIEW_BYTES {
+            bail!("archive preview metadata does not match the catalog");
+        }
+        let temporary = destination.with_extension("part");
+        {
+            let mut output = BufWriter::new(File::create(&temporary)?);
+            let copied = std::io::copy(&mut entry, &mut output)?;
+            output.flush()?;
+            if copied != bytes {
+                let _ = fs::remove_file(&temporary);
+                bail!("archive preview extraction was incomplete");
+            }
+        }
+        fs::rename(&temporary, &destination)?;
+        Ok(destination)
+    }
+
+    pub fn index_attachment_contexts<F>(
+        &mut self,
+        database: &LineDatabase,
+        square_database: Option<&LineSquareDatabase>,
+        unified_group_database: Option<&UnifiedGroupDatabase>,
+        mut on_progress: F,
+    ) -> Result<CatalogContextProgress>
+    where
+        F: FnMut(CatalogContextProgress),
+    {
+        let total_files = self.connection.query_row(
+            "SELECT COUNT(*) FROM files WHERE attachment_kind IS NOT NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        self.set_meta("context_status", "indexing")?;
+        self.connection.execute(
+            "
+            UPDATE files SET
+                message_pk = NULL,
+                message_chat_pk = NULL,
+                message_timestamp = NULL,
+                message_sender_pk = NULL,
+                message_sender_name = NULL,
+                message_content_type = NULL,
+                message_text = NULL,
+                context_chat_id = NULL,
+                context_chat_title = NULL,
+                context_chat_kind = NULL,
+                reference_status = 'unconfirmed'
+            WHERE attachment_kind IS NOT NULL
+            ",
+            [],
+        )?;
+        let mut progress = CatalogContextProgress {
+            processed_files: 0,
+            total_files: total_files.max(0) as u64,
+            referenced_files: 0,
+            unreferenced_files: 0,
+            unconfirmed_files: 0,
+        };
+        let mut after_id = 0_i64;
+        loop {
+            let records = {
+                let mut statement = self.connection.prepare(
+                    "
+                    SELECT id, message_id, chat_hint
+                    FROM files
+                    WHERE attachment_kind IS NOT NULL AND id > ?1
+                    ORDER BY id ASC
+                    LIMIT ?2
+                    ",
+                )?;
+                let rows =
+                    statement.query_map(params![after_id, CONTEXT_BATCH_SIZE as i64], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if records.is_empty() {
+                break;
+            }
+            after_id = records.last().map(|record| record.0).unwrap_or(after_id);
+            let mut message_ids = records
+                .iter()
+                .map(|record| record.1.clone())
+                .filter(|message_id| !message_id.is_empty())
+                .collect::<Vec<_>>();
+            message_ids.sort_unstable();
+            message_ids.dedup();
+            let mut contexts = database.attachment_contexts(&message_ids)?;
+            if let Some(square_database) = square_database {
+                for (message_id, mut candidates) in
+                    square_database.attachment_contexts(&message_ids)?
+                {
+                    contexts
+                        .entry(message_id)
+                        .or_default()
+                        .append(&mut candidates);
+                }
+            }
+            database.enrich_attachment_context_titles(
+                &mut contexts,
+                unified_group_database,
+                square_database,
+            )?;
+            let transaction = self.connection.transaction()?;
+            {
+                let mut update = transaction.prepare(
+                    "
+                    UPDATE files SET
+                        message_pk = ?2,
+                        message_chat_pk = ?3,
+                        message_timestamp = ?4,
+                        message_sender_pk = ?5,
+                        message_sender_name = ?6,
+                        message_content_type = ?7,
+                        message_text = ?8,
+                        context_chat_id = ?9,
+                        context_chat_title = ?10,
+                        context_chat_kind = ?11,
+                        reference_status = ?12
+                    WHERE id = ?1
+                    ",
+                )?;
+                for (id, message_id, chat_hint) in &records {
+                    let candidates = contexts.get(message_id).map(Vec::as_slice).unwrap_or(&[]);
+                    let exact = candidates
+                        .iter()
+                        .filter(|context| context.chat_id.eq_ignore_ascii_case(chat_hint))
+                        .collect::<Vec<_>>();
+                    let context = (exact.len() == 1).then(|| exact[0]);
+                    let reference_status = if context.is_some() {
+                        progress.referenced_files += 1;
+                        "referenced"
+                    } else if message_id.is_empty()
+                        || chat_hint.is_empty()
+                        || !candidates.is_empty()
+                    {
+                        progress.unconfirmed_files += 1;
+                        "unconfirmed"
+                    } else {
+                        progress.unreferenced_files += 1;
+                        "unreferenced"
+                    };
+                    if let Some(context) = context {
+                        update.execute(params![
+                            id,
+                            context.message_pk,
+                            context.chat_pk,
+                            context.timestamp,
+                            context.sender_pk,
+                            context.sender_name,
+                            context.content_type,
+                            context.text,
+                            context.chat_id,
+                            context.chat_title,
+                            context.chat_kind,
+                            reference_status,
+                        ])?;
+                    } else {
+                        update.execute(params![
+                            id,
+                            Option::<i64>::None,
+                            Option::<i64>::None,
+                            Option::<i64>::None,
+                            Option::<i64>::None,
+                            Option::<String>::None,
+                            Option::<i64>::None,
+                            Option::<String>::None,
+                            Option::<String>::None,
+                            Option::<String>::None,
+                            Option::<String>::None,
+                            reference_status,
+                        ])?;
+                    }
+                    progress.processed_files += 1;
+                }
+            }
+            transaction.commit()?;
+            on_progress(progress);
+        }
+        self.set_meta("context_status", "complete")?;
+        self.set_meta("context_index_version", CONTEXT_INDEX_VERSION)?;
+        self.set_meta("context_completed_at", &unix_seconds().to_string())?;
+        on_progress(progress);
+        Ok(progress)
+    }
+
+    pub fn cleanup_overview(&self) -> Result<CleanupOverview> {
+        let sql = format!(
+            "
+            SELECT {CLEANUP_CATEGORY_EXPR} AS category,
+                   COUNT(*), COALESCE(SUM(f.bytes), 0)
+            FROM files f
+            WHERE f.attachment_kind IS NOT NULL
+            GROUP BY category
+            "
+        );
+        let mut totals = [
+            "all",
+            "individual",
+            "group",
+            "community",
+            "unreferenced",
+            "unconfirmed",
+        ]
+        .into_iter()
+        .map(|category| {
+            (
+                category.to_string(),
+                CleanupCategoryTotal {
+                    category: category.to_string(),
+                    file_count: 0,
+                    bytes: 0,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u64,
+                row.get::<_, i64>(2)?.max(0) as u64,
+            ))
+        })?;
+        for row in rows {
+            let (category, file_count, bytes) = row?;
+            let category_key = if totals.contains_key(&category) && category != "all" {
+                category.as_str()
+            } else {
+                "unconfirmed"
+            };
+            {
+                let target = totals.get_mut(category_key).expect("cleanup total exists");
+                target.file_count = target.file_count.saturating_add(file_count);
+                target.bytes = target.bytes.saturating_add(bytes);
+            }
+            let all = totals.get_mut("all").expect("all total exists");
+            all.file_count = all.file_count.saturating_add(file_count);
+            all.bytes = all.bytes.saturating_add(bytes);
+        }
+        let stats = self.stats()?;
+        let categories = [
+            "all",
+            "individual",
+            "group",
+            "community",
+            "unreferenced",
+            "unconfirmed",
+        ]
+        .into_iter()
+        .map(|category| totals.remove(category).expect("cleanup total exists"))
+        .collect();
+        Ok(CleanupOverview {
+            categories,
+            marked_count: stats.marked_count,
+            marked_bytes: stats.marked_bytes,
+            context_status: if self.meta("context_index_version")?.as_deref()
+                == Some(CONTEXT_INDEX_VERSION)
+            {
+                self.meta("context_status")?
+                    .unwrap_or_else(|| "not_started".to_string())
+            } else {
+                "stale".to_string()
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_cleanup_groups(
+        &self,
+        page: u32,
+        page_size: u32,
+        search: Option<&str>,
+        kind: &str,
+        category: &str,
+        sort: &str,
+    ) -> Result<CleanupGroupPage> {
+        validate_cleanup_query(page, page_size, kind, category, sort)?;
+        let limit = checked_page_size(page_size)?;
+        let offset = cleanup_offset(page, limit)?;
+        let search = cleanup_search_pattern(search);
+        let sql = format!(
+            "
+            WITH base AS (
+                SELECT f.*, p.path IS NOT NULL AS marked,
+                       {CLEANUP_GROUP_EXPR} AS group_key,
+                       {CLEANUP_CATEGORY_EXPR} AS category
+                FROM files f
+                LEFT JOIN removal_plan p ON p.path = f.path
+                WHERE f.attachment_kind IS NOT NULL
+            ),
+            matched_groups AS (
+                SELECT DISTINCT group_key
+                FROM base
+                WHERE (?1 = 'all'
+                       OR (?1 = 'original' AND attachment_kind = 'original')
+                       OR (?1 = 'thumbnail' AND attachment_kind = 'thumbnail')
+                       OR (?1 = 'marked' AND marked))
+                  AND (?2 = 'all' OR category = ?2)
+                  AND (?3 IS NULL
+                       OR path LIKE ?3 ESCAPE '\\'
+                       OR chat_hint LIKE ?3 ESCAPE '\\'
+                       OR COALESCE(context_chat_title, '') LIKE ?3 ESCAPE '\\'
+                       OR COALESCE(message_sender_name, '') LIKE ?3 ESCAPE '\\'
+                       OR COALESCE(message_text, '') LIKE ?3 ESCAPE '\\')
+            ),
+            grouped AS (
+                SELECT group_key,
+                       MAX(CASE
+                           WHEN reference_status <> 'referenced' THEN ''
+                           ELSE COALESCE(context_chat_id, '')
+                       END) AS chat_id,
+                       MAX(CASE reference_status
+                           WHEN 'unreferenced' THEN '孤兒檔案（SQLite 未引用）'
+                           WHEN 'unconfirmed' THEN '無法確認引用的附件'
+                           ELSE COALESCE(NULLIF(context_chat_title, ''), NULLIF(chat_hint, ''), '無法辨識的聊天室')
+                       END) AS chat_title,
+                       MAX(CASE reference_status
+                           WHEN 'unreferenced' THEN 'unreferenced'
+                           WHEN 'unconfirmed' THEN 'unknown'
+                           ELSE COALESCE(NULLIF(context_chat_kind, ''), 'unknown')
+                       END) AS chat_kind,
+                       MAX(reference_status) AS reference_status,
+                       COUNT(*) AS file_count,
+                       COALESCE(SUM(bytes), 0) AS total_bytes,
+                       SUM(CASE WHEN marked THEN 1 ELSE 0 END) AS marked_count,
+                       MAX(CASE WHEN attachment_kind = 'original' THEN 1 ELSE 0 END) AS has_original,
+                       MAX(CASE WHEN attachment_kind = 'thumbnail' THEN 1 ELSE 0 END) AS has_thumbnail,
+                       CASE
+                           WHEN SUM(CASE WHEN attachment_kind = 'original' THEN 1 ELSE 0 END) > 0
+                            AND SUM(CASE WHEN attachment_kind = 'thumbnail' THEN 1 ELSE 0 END) > 0
+                            AND SUM(CASE WHEN attachment_kind = 'original' AND marked THEN 1 ELSE 0 END)
+                                = SUM(CASE WHEN attachment_kind = 'original' THEN 1 ELSE 0 END)
+                            AND SUM(CASE WHEN attachment_kind = 'thumbnail' AND marked THEN 1 ELSE 0 END) = 0
+                           THEN 1 ELSE 0
+                       END AS keeping_thumbnails,
+                       COALESCE(MAX(message_timestamp), 0) AS latest_timestamp,
+                       MIN(path) AS path_sort
+                FROM base
+                WHERE group_key IN (SELECT group_key FROM matched_groups)
+                GROUP BY group_key
+            )
+            SELECT group_key, chat_id, chat_title, chat_kind, reference_status,
+                   file_count, total_bytes, marked_count, has_original,
+                   has_thumbnail, keeping_thumbnails, latest_timestamp, COUNT(*) OVER()
+            FROM grouped
+            ORDER BY
+                CASE WHEN ?4 = 'size' THEN total_bytes END DESC,
+                CASE WHEN ?4 = 'path' THEN chat_title END ASC,
+                CASE WHEN ?4 = 'oldest' THEN latest_timestamp END ASC,
+                CASE WHEN ?4 = 'recent' THEN latest_timestamp END DESC,
+                chat_title ASC, group_key ASC
+            LIMIT ?5 OFFSET ?6
+            "
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params![kind, category, search, sort, limit as i64, offset],
+            cleanup_group_from_row,
+        )?;
+        let mut items = Vec::new();
+        let mut total_items = 0_u64;
+        for row in rows {
+            let (group, total) = row?;
+            total_items = total;
+            items.push(group);
+        }
+        Ok(CleanupGroupPage {
+            items,
+            page,
+            page_size,
+            total_items,
+            total_pages: cleanup_total_pages(total_items, page_size),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_cleanup_reviews(
+        &self,
+        group_key: &str,
+        page: u32,
+        page_size: u32,
+        search: Option<&str>,
+        kind: &str,
+        category: &str,
+        sort: &str,
+    ) -> Result<CleanupReviewPage> {
+        validate_cleanup_group_key(group_key)?;
+        validate_cleanup_query(page, page_size, kind, category, sort)?;
+        let limit = checked_page_size(page_size)?;
+        let offset = cleanup_offset(page, limit)?;
+        let search = cleanup_search_pattern(search);
+        let group = self.cleanup_group(group_key)?;
+        let bundle_expr = "
+            CASE
+                WHEN f.message_id <> '' THEN 'message:' || f.message_id
+                ELSE 'file:' || f.path
+            END
+        ";
+        let bundle_sql = format!(
+            "
+            WITH base AS (
+                SELECT f.*, p.path IS NOT NULL AS marked,
+                       {CLEANUP_GROUP_EXPR} AS group_key,
+                       {CLEANUP_CATEGORY_EXPR} AS category,
+                       {bundle_expr} AS bundle_key
+                FROM files f
+                LEFT JOIN removal_plan p ON p.path = f.path
+                WHERE f.attachment_kind IS NOT NULL
+            ),
+            bundles AS (
+                SELECT bundle_key, COALESCE(SUM(bytes), 0) AS total_bytes,
+                       COALESCE(MAX(message_timestamp), 0) AS latest_timestamp,
+                       MIN(path) AS path_sort
+                FROM base
+                WHERE group_key = ?1
+                  AND (?2 = 'all'
+                       OR (?2 = 'original' AND attachment_kind = 'original')
+                       OR (?2 = 'thumbnail' AND attachment_kind = 'thumbnail')
+                       OR (?2 = 'marked' AND marked))
+                  AND (?3 = 'all' OR category = ?3)
+                  AND (?4 IS NULL
+                       OR path LIKE ?4 ESCAPE '\\'
+                       OR COALESCE(context_chat_title, '') LIKE ?4 ESCAPE '\\'
+                       OR COALESCE(message_sender_name, '') LIKE ?4 ESCAPE '\\'
+                       OR COALESCE(message_text, '') LIKE ?4 ESCAPE '\\')
+                GROUP BY bundle_key
+            )
+            SELECT bundle_key, total_bytes, COUNT(*) OVER()
+            FROM bundles
+            ORDER BY
+                CASE WHEN ?5 = 'size' THEN total_bytes END DESC,
+                CASE WHEN ?5 = 'path' THEN path_sort END ASC,
+                CASE WHEN ?5 = 'oldest' THEN latest_timestamp END ASC,
+                CASE WHEN ?5 = 'recent' THEN latest_timestamp END DESC,
+                path_sort ASC, bundle_key ASC
+            LIMIT ?6 OFFSET ?7
+            "
+        );
+        let mut bundle_statement = self.connection.prepare(&bundle_sql)?;
+        let bundle_rows = bundle_statement.query_map(
+            params![
+                group_key,
+                kind,
+                category,
+                search,
+                sort,
+                limit as i64,
+                offset
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?.max(0) as u64,
+                ))
+            },
+        )?;
+        let mut bundle_keys = Vec::new();
+        let mut bundle_bytes = HashMap::new();
+        let mut total_items = 0_u64;
+        for row in bundle_rows {
+            let (key, bytes, total) = row?;
+            total_items = total;
+            bundle_bytes.insert(key.clone(), bytes);
+            bundle_keys.push(key);
+        }
+        if bundle_keys.is_empty() {
+            return Ok(CleanupReviewPage {
+                group,
+                items: Vec::new(),
+                page,
+                page_size,
+                total_items,
+                total_pages: cleanup_total_pages(total_items, page_size),
+            });
+        }
+        let placeholders = std::iter::repeat_n("?", bundle_keys.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let file_sql = format!(
+            "
+            SELECT {ATTACHMENT_COLUMNS}, {bundle_expr} AS bundle_key
+            FROM files f
+            LEFT JOIN removal_plan p ON p.path = f.path
+            WHERE {CLEANUP_GROUP_EXPR} = ?
+              AND {bundle_expr} IN ({placeholders})
+              AND (? = 'all'
+                   OR (? = 'original' AND f.attachment_kind = 'original')
+                   OR (? = 'thumbnail' AND f.attachment_kind = 'thumbnail')
+                   OR (? = 'marked' AND p.path IS NOT NULL))
+              AND (? IS NULL
+                   OR f.path LIKE ? ESCAPE '\\'
+                   OR COALESCE(f.context_chat_title, '') LIKE ? ESCAPE '\\'
+                   OR COALESCE(f.message_sender_name, '') LIKE ? ESCAPE '\\'
+                   OR COALESCE(f.message_text, '') LIKE ? ESCAPE '\\')
+            ORDER BY bundle_key ASC,
+                     CASE f.attachment_kind WHEN 'original' THEN 0 ELSE 1 END,
+                     f.bytes DESC, f.path ASC
+            LIMIT {}
+            ",
+            MAX_CLEANUP_RESPONSE_FILES + 1
+        );
+        let mut values = Vec::<rusqlite::types::Value>::new();
+        values.push(group_key.to_string().into());
+        values.extend(
+            bundle_keys
+                .iter()
+                .cloned()
+                .map(rusqlite::types::Value::from),
+        );
+        values.extend([
+            kind.to_string().into(),
+            kind.to_string().into(),
+            kind.to_string().into(),
+            kind.to_string().into(),
+            search.clone().into(),
+            search.clone().into(),
+            search.clone().into(),
+            search.clone().into(),
+            search.into(),
+        ]);
+        let mut file_statement = self.connection.prepare(&file_sql)?;
+        let mut rows = file_statement.query(rusqlite::params_from_iter(values.iter()))?;
+        let mut files_by_bundle = HashMap::<String, Vec<AttachmentItem>>::new();
+        let mut response_files = 0_usize;
+        while let Some(row) = rows.next()? {
+            response_files += 1;
+            if response_files > MAX_CLEANUP_RESPONSE_FILES {
+                bail!(
+                    "cleanup review page exceeds {MAX_CLEANUP_RESPONSE_FILES} files; narrow the filters"
+                );
+            }
+            let item = attachment_from_row(row)?;
+            let bundle_key: String = row.get(19)?;
+            files_by_bundle.entry(bundle_key).or_default().push(item);
+        }
+        let items = bundle_keys
+            .into_iter()
+            .filter_map(|key| {
+                let files = files_by_bundle.remove(&key)?;
+                let first = files.first()?;
+                Some(CleanupReview {
+                    key: key.clone(),
+                    message_id: first.message_id.clone(),
+                    reference_status: first.reference_status.clone(),
+                    context: first.context.clone(),
+                    files,
+                    total_bytes: bundle_bytes.remove(&key).unwrap_or(0),
+                })
+            })
+            .collect();
+        Ok(CleanupReviewPage {
+            group,
+            items,
+            page,
+            page_size,
+            total_items,
+            total_pages: cleanup_total_pages(total_items, page_size),
+        })
+    }
+
+    pub fn apply_cleanup_group_action(
+        &self,
+        group_key: &str,
+        action: &str,
+    ) -> Result<CleanupOverview> {
+        validate_cleanup_group_key(group_key)?;
+        if !matches!(action, "toggle_all" | "keep_thumbnail") {
+            bail!("cleanup group action must be `toggle_all` or `keep_thumbnail`");
+        }
+        let predicate = format!("f.attachment_kind IS NOT NULL AND {CLEANUP_GROUP_EXPR} = ?1");
+        let (total, marked, originals, thumbnails, marked_originals, marked_thumbnails) =
+            self.connection.query_row(
+                &format!(
+                    "
+                    SELECT COUNT(*),
+                           SUM(CASE WHEN p.path IS NOT NULL THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN f.attachment_kind = 'original' THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN f.attachment_kind = 'thumbnail' THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN f.attachment_kind = 'original' AND p.path IS NOT NULL THEN 1 ELSE 0 END),
+                           SUM(CASE WHEN f.attachment_kind = 'thumbnail' AND p.path IS NOT NULL THEN 1 ELSE 0 END)
+                    FROM files f
+                    LEFT JOIN removal_plan p ON p.path = f.path
+                    WHERE {predicate}
+                    "
+                ),
+                [group_key],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )?;
+        if total == 0 {
+            bail!("cleanup group does not exist");
+        }
+        let now = unix_seconds();
+        if action == "toggle_all" {
+            if marked == total {
+                self.connection.execute(
+                    &format!(
+                        "DELETE FROM removal_plan
+                         WHERE path IN (SELECT f.path FROM files f WHERE {predicate})"
+                    ),
+                    [group_key],
+                )?;
+            } else {
+                self.connection.execute(
+                    &format!(
+                        "INSERT OR REPLACE INTO removal_plan(path, marked_at)
+                         SELECT f.path, ?2 FROM files f WHERE {predicate}"
+                    ),
+                    params![group_key, now],
+                )?;
+            }
+        } else {
+            if originals == 0 || thumbnails == 0 {
+                bail!("cleanup group does not contain both originals and thumbnails");
+            }
+            let keeping_thumbnails = marked_originals == originals && marked_thumbnails == 0;
+            if keeping_thumbnails {
+                self.connection.execute(
+                    &format!(
+                        "DELETE FROM removal_plan
+                         WHERE path IN (
+                             SELECT f.path FROM files f
+                             WHERE {predicate} AND f.attachment_kind = 'original'
+                         )"
+                    ),
+                    [group_key],
+                )?;
+            } else {
+                self.connection.execute(
+                    &format!(
+                        "INSERT OR REPLACE INTO removal_plan(path, marked_at)
+                         SELECT f.path, ?2 FROM files f
+                         WHERE {predicate} AND f.attachment_kind = 'original'"
+                    ),
+                    params![group_key, now],
+                )?;
+                self.connection.execute(
+                    &format!(
+                        "DELETE FROM removal_plan
+                         WHERE path IN (
+                             SELECT f.path FROM files f
+                             WHERE {predicate} AND f.attachment_kind = 'thumbnail'
+                         )"
+                    ),
+                    [group_key],
+                )?;
+            }
+        }
+        self.cleanup_overview()
+    }
+
+    pub fn hash_duplicate_candidates<F>(
+        &self,
+        source: &Path,
+        kind: SourceKind,
+        mut on_progress: F,
+    ) -> Result<DuplicateHashProgress>
+    where
+        F: FnMut(DuplicateHashProgress) -> Result<()>,
+    {
+        if kind == SourceKind::Sqlite {
+            bail!("a direct Line.sqlite source has no attachment files");
+        }
+        let source = source
+            .canonicalize()
+            .with_context(|| format!("source does not exist: {}", source.display()))?;
+        validate_bound_source(self, &source)?;
+        let read_connection = Connection::open(&self.path)?;
+        read_connection.pragma_update(None, "query_only", true)?;
+        read_connection.pragma_update(None, "temp_store", "FILE")?;
+        let mut write_connection = Connection::open(&self.path)?;
+        let (candidate_files, total_bytes): (i64, i64) = read_connection.query_row(
+            "
+            SELECT COUNT(*), COALESCE(SUM(bytes), 0)
+            FROM files
+            WHERE attachment_kind IS NOT NULL
+              AND bytes > 0
+              AND sha256 IS NULL
+              AND bytes IN (
+                  SELECT bytes FROM files
+                  WHERE attachment_kind IS NOT NULL AND bytes > 0
+                  GROUP BY bytes HAVING COUNT(*) > 1
+              )
+            ",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut statement = read_connection.prepare(
+            "
+            SELECT path, bytes, modified_ns
+            FROM files
+            WHERE attachment_kind IS NOT NULL
+              AND bytes > 0
+              AND sha256 IS NULL
+              AND bytes IN (
+                  SELECT bytes FROM files
+                  WHERE attachment_kind IS NOT NULL AND bytes > 0
+                  GROUP BY bytes HAVING COUNT(*) > 1
+              )
+            ORDER BY id ASC
+            ",
+        )?;
+        let mut rows = statement.query([])?;
+        let archive_fingerprint = if kind == SourceKind::ImazingArchive {
+            Some(source_metadata_fingerprint(&source)?)
+        } else {
+            None
+        };
+        let mut archive = if kind == SourceKind::ImazingArchive {
+            Some(ZipArchive::new(File::open(&source)?)?)
+        } else {
+            None
+        };
+        let mut pending = Vec::with_capacity(HASH_UPDATE_BATCH_SIZE);
+        let mut progress = DuplicateHashProgress {
+            candidate_files: candidate_files.max(0) as u64,
+            processed_files: 0,
+            total_bytes: total_bytes.max(0) as u64,
+            processed_bytes: 0,
+        };
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let bytes = row.get::<_, i64>(1)?.max(0) as u64;
+            let modified_ns: i64 = row.get(2)?;
+            let digest = match archive.as_mut() {
+                Some(archive) => {
+                    let entry = archive.by_name(&path).with_context(|| {
+                        format!("archive entry disappeared during hash: {path}")
+                    })?;
+                    if entry.size() != bytes {
+                        bail!("archive entry size changed since catalog scan: {path}");
+                    }
+                    hash_reader(entry)?
+                }
+                None => {
+                    let file_path = safe_source_join(&source, &path)?;
+                    let before = file_record_fingerprint(&file_path)?;
+                    if before.0 != bytes || before.1 != modified_ns {
+                        bail!("source file changed since catalog scan: {path}");
+                    }
+                    let digest = hash_reader(BufReader::with_capacity(
+                        HASH_BUFFER_BYTES,
+                        File::open(&file_path)?,
+                    ))?;
+                    if file_record_fingerprint(&file_path)? != before {
+                        bail!("source file changed while hashing: {path}");
+                    }
+                    digest
+                }
+            };
+            pending.push((path, digest));
+            progress.processed_files += 1;
+            progress.processed_bytes = progress.processed_bytes.saturating_add(bytes);
+            if pending.len() == HASH_UPDATE_BATCH_SIZE {
+                update_hash_batch(&mut write_connection, &mut pending)?;
+            }
+            on_progress(progress)?;
+        }
+        update_hash_batch(&mut write_connection, &mut pending)?;
+        if let Some(before) = archive_fingerprint
+            && source_metadata_fingerprint(&source)? != before
+        {
+            bail!("source archive changed while hashing");
+        }
+        Ok(progress)
+    }
+
+    pub fn list_duplicate_groups(
+        &self,
+        cursor: Option<DuplicateGroupCursor>,
+        limit: u32,
+    ) -> Result<DuplicateGroupPage> {
+        let limit = checked_page_size(limit)?;
+        let reclaimable = "((COUNT(*) - 1) * bytes)";
+        let cursor_filter = if cursor.is_some() {
+            format!(
+                "HAVING COUNT(*) > 1 AND ({reclaimable} < ?1 OR ({reclaimable} = ?1 AND sha256 > ?2))"
+            )
+        } else {
+            "HAVING COUNT(*) > 1".to_string()
+        };
+        let sql = format!(
+            "
+            SELECT sha256, bytes, COUNT(*), {reclaimable},
+                   MAX(CASE WHEN attachment_kind = 'original' THEN 1 ELSE 0 END),
+                   MAX(CASE WHEN attachment_kind = 'thumbnail' THEN 1 ELSE 0 END)
+            FROM files
+            WHERE sha256 IS NOT NULL
+            GROUP BY sha256, bytes
+            {cursor_filter}
+            ORDER BY {reclaimable} DESC, sha256 ASC
+            LIMIT ?3
+            "
+        );
+        let cursor = cursor.unwrap_or(DuplicateGroupCursor {
+            reclaimable_bytes: u64::MAX,
+            sha256: String::new(),
+        });
+        let reclaimable_cursor = i64::try_from(cursor.reclaimable_bytes).unwrap_or(i64::MAX);
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params![reclaimable_cursor, cursor.sha256, limit as i64],
+            |row| {
+                Ok(DuplicateGroup {
+                    sha256: row.get(0)?,
+                    bytes: row.get::<_, i64>(1)?.max(0) as u64,
+                    file_count: row.get::<_, i64>(2)?.max(0) as u64,
+                    reclaimable_bytes: row.get::<_, i64>(3)?.max(0) as u64,
+                    has_original: row.get::<_, i64>(4)? != 0,
+                    has_thumbnail: row.get::<_, i64>(5)? != 0,
+                })
+            },
+        )?;
+        let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let next_cursor = if items.len() == limit {
+            items.last().map(|group| DuplicateGroupCursor {
+                reclaimable_bytes: group.reclaimable_bytes,
+                sha256: group.sha256.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(DuplicateGroupPage { items, next_cursor })
+    }
+
+    pub fn list_duplicate_members(
+        &self,
+        sha256: &str,
+        cursor: Option<AttachmentCursor>,
+        limit: u32,
+    ) -> Result<DuplicateMemberPage> {
+        validate_sha256(sha256)?;
+        let limit = checked_page_size(limit)?;
+        let sql = format!(
+            "
+            SELECT {ATTACHMENT_COLUMNS}
+            FROM files f
+            LEFT JOIN removal_plan p ON p.path = f.path
+            WHERE f.sha256 = ?1 AND f.id > ?2
+            ORDER BY f.id ASC
+            LIMIT ?3
+            ",
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let rows = statement.query_map(
+            params![
+                sha256,
+                cursor.map(|value| value.id).unwrap_or(0),
+                limit as i64
+            ],
+            attachment_from_row,
+        )?;
+        let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let next_cursor = if items.len() == limit {
+            items
+                .last()
+                .map(|attachment| AttachmentCursor { id: attachment.id })
+        } else {
+            None
+        };
+        Ok(DuplicateMemberPage { items, next_cursor })
+    }
+
+    fn cleanup_group(&self, group_key: &str) -> Result<CleanupGroup> {
+        let sql = format!(
+            "
+            SELECT {CLEANUP_GROUP_EXPR} AS group_key,
+                   MAX(CASE
+                       WHEN f.reference_status <> 'referenced' THEN ''
+                       ELSE COALESCE(f.context_chat_id, '')
+                   END) AS chat_id,
+                   MAX(CASE f.reference_status
+                       WHEN 'unreferenced' THEN '孤兒檔案（SQLite 未引用）'
+                       WHEN 'unconfirmed' THEN '無法確認引用的附件'
+                       ELSE COALESCE(NULLIF(f.context_chat_title, ''), NULLIF(f.chat_hint, ''), '無法辨識的聊天室')
+                   END) AS chat_title,
+                   MAX(CASE f.reference_status
+                       WHEN 'unreferenced' THEN 'unreferenced'
+                       WHEN 'unconfirmed' THEN 'unknown'
+                       ELSE COALESCE(NULLIF(f.context_chat_kind, ''), 'unknown')
+                   END) AS chat_kind,
+                   MAX(f.reference_status) AS reference_status,
+                   COUNT(*) AS file_count,
+                   COALESCE(SUM(f.bytes), 0) AS total_bytes,
+                   SUM(CASE WHEN p.path IS NOT NULL THEN 1 ELSE 0 END) AS marked_count,
+                   MAX(CASE WHEN f.attachment_kind = 'original' THEN 1 ELSE 0 END) AS has_original,
+                   MAX(CASE WHEN f.attachment_kind = 'thumbnail' THEN 1 ELSE 0 END) AS has_thumbnail,
+                   CASE
+                       WHEN SUM(CASE WHEN f.attachment_kind = 'original' THEN 1 ELSE 0 END) > 0
+                        AND SUM(CASE WHEN f.attachment_kind = 'thumbnail' THEN 1 ELSE 0 END) > 0
+                        AND SUM(CASE WHEN f.attachment_kind = 'original' AND p.path IS NOT NULL THEN 1 ELSE 0 END)
+                            = SUM(CASE WHEN f.attachment_kind = 'original' THEN 1 ELSE 0 END)
+                        AND SUM(CASE WHEN f.attachment_kind = 'thumbnail' AND p.path IS NOT NULL THEN 1 ELSE 0 END) = 0
+                       THEN 1 ELSE 0
+                   END AS keeping_thumbnails,
+                   COALESCE(MAX(f.message_timestamp), 0) AS latest_timestamp,
+                   1
+            FROM files f
+            LEFT JOIN removal_plan p ON p.path = f.path
+            WHERE f.attachment_kind IS NOT NULL
+              AND {CLEANUP_GROUP_EXPR} = ?1
+            GROUP BY group_key
+            "
+        );
+        self.connection
+            .query_row(&sql, [group_key], cleanup_group_from_row)
+            .optional()?
+            .map(|value| value.0)
+            .context("cleanup group does not exist")
+    }
+
+    pub fn stats(&self) -> Result<CatalogStats> {
+        let (file_count, total_bytes): (i64, i64) = self.connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM files",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (attachment_count, attachment_bytes): (i64, i64) = self.connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(bytes), 0) FROM files WHERE attachment_kind IS NOT NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (marked_count, marked_bytes): (i64, i64) = self.connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(f.bytes), 0)
+             FROM removal_plan p JOIN files f ON f.path = p.path",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(CatalogStats {
+            source_path: self.meta("source_path")?.unwrap_or_default(),
+            scan_status: self
+                .meta("scan_status")?
+                .unwrap_or_else(|| "not_started".to_string()),
+            file_count: file_count.max(0) as u64,
+            total_bytes: total_bytes.max(0) as u64,
+            attachment_count: attachment_count.max(0) as u64,
+            attachment_bytes: attachment_bytes.max(0) as u64,
+            marked_count: marked_count.max(0) as u64,
+            marked_bytes: marked_bytes.max(0) as u64,
+        })
+    }
+
+    fn upsert_batch(&mut self, scan_id: i64, batch: &mut Vec<FileRecord>) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.connection.transaction()?;
+        insert_records(&transaction, scan_id, batch)?;
+        transaction.commit()?;
+        batch.clear();
+        Ok(())
+    }
+
+    fn meta(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+}
+
+fn insert_records(
+    transaction: &Transaction<'_>,
+    scan_id: i64,
+    records: &[FileRecord],
+) -> Result<()> {
+    let mut statement = transaction.prepare(
+        "
+        INSERT INTO files(path, bytes, modified_ns, attachment_kind, message_id, chat_hint, seen_scan)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(path) DO UPDATE SET
+            bytes = excluded.bytes,
+            modified_ns = excluded.modified_ns,
+            attachment_kind = excluded.attachment_kind,
+            message_id = excluded.message_id,
+            chat_hint = excluded.chat_hint,
+            sha256 = CASE
+                WHEN files.bytes = excluded.bytes
+                 AND files.modified_ns = excluded.modified_ns
+                THEN files.sha256
+                ELSE NULL
+            END,
+            seen_scan = excluded.seen_scan
+        ",
+    )?;
+    for record in records {
+        let bytes = i64::try_from(record.bytes).context("file is too large for catalog SQLite")?;
+        statement.execute(params![
+            record.path,
+            bytes,
+            record.modified_ns,
+            record.kind.map(AttachmentKind::as_str),
+            record.message_id,
+            record.chat_hint,
+            scan_id
+        ])?;
+    }
+    Ok(())
+}
+
+fn update_progress(progress: &mut CatalogScanProgress, record: &FileRecord) {
+    progress.files += 1;
+    progress.bytes = progress.bytes.saturating_add(record.bytes);
+    if record.kind.is_some() {
+        progress.attachments += 1;
+    }
+}
+
+fn file_record(path: String, bytes: u64, modified_ns: i64) -> FileRecord {
+    let normalized = path.replace('\\', "/");
+    let segments: Vec<&str> = normalized.split('/').collect();
+    let attachment = segments
+        .iter()
+        .position(|segment| *segment == "Message Attachments" || *segment == "Message Thumbnails");
+    let kind = attachment.map(|index| {
+        if segments[index] == "Message Thumbnails" {
+            AttachmentKind::Thumbnail
+        } else {
+            AttachmentKind::Original
+        }
+    });
+    let filename = segments.last().copied().unwrap_or_default();
+    let message_id = leading_message_id(filename);
+    let chat_hint = attachment
+        .and_then(|index| segments.get(index + 1))
+        .filter(|value| **value != filename)
+        .copied()
+        .unwrap_or_default()
+        .to_string();
+    FileRecord {
+        path: normalized,
+        bytes,
+        modified_ns,
+        kind,
+        message_id,
+        chat_hint,
+    }
+}
+
+fn leading_message_id(filename: &str) -> String {
+    let digits: String = filename
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    if digits.len() >= 8 {
+        digits
+    } else {
+        String::new()
+    }
+}
+
+fn modified_ns(value: Option<SystemTime>) -> i64 {
+    value
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .and_then(|value| i64::try_from(value.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
+fn unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|value| i64::try_from(value.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn cleanup_search_pattern(search: Option<&str>) -> Option<String> {
+    search
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("%{}%", escape_like(value)))
+}
+
+fn validate_cleanup_query(
+    page: u32,
+    page_size: u32,
+    kind: &str,
+    category: &str,
+    sort: &str,
+) -> Result<()> {
+    if page == 0 {
+        bail!("cleanup page must be at least 1");
+    }
+    checked_page_size(page_size)?;
+    if !matches!(kind, "all" | "original" | "thumbnail" | "marked") {
+        bail!("cleanup kind must be all, original, thumbnail, or marked");
+    }
+    if !matches!(
+        category,
+        "all" | "individual" | "group" | "community" | "unreferenced" | "unconfirmed"
+    ) {
+        bail!("unsupported cleanup category");
+    }
+    if !matches!(sort, "recent" | "oldest" | "size" | "path") {
+        bail!("cleanup sort must be recent, oldest, size, or path");
+    }
+    Ok(())
+}
+
+fn validate_cleanup_group_key(group_key: &str) -> Result<()> {
+    if group_key.is_empty() || group_key.len() > 1_024 {
+        bail!("invalid cleanup group key");
+    }
+    Ok(())
+}
+
+fn cleanup_offset(page: u32, page_size: usize) -> Result<i64> {
+    let offset = u64::from(page - 1)
+        .checked_mul(page_size as u64)
+        .context("cleanup page offset overflow")?;
+    i64::try_from(offset).context("cleanup page offset is too large")
+}
+
+fn cleanup_total_pages(total_items: u64, page_size: u32) -> u64 {
+    if total_items == 0 {
+        1
+    } else {
+        total_items.div_ceil(u64::from(page_size))
+    }
+}
+
+fn cleanup_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(CleanupGroup, u64)> {
+    Ok((
+        CleanupGroup {
+            key: row.get(0)?,
+            chat_id: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            chat_title: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            chat_kind: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+            reference_status: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+            file_count: row.get::<_, i64>(5)?.max(0) as u64,
+            total_bytes: row.get::<_, i64>(6)?.max(0) as u64,
+            marked_count: row.get::<_, i64>(7)?.max(0) as u64,
+            has_original: row.get::<_, i64>(8)? != 0,
+            has_thumbnail: row.get::<_, i64>(9)? != 0,
+            keeping_thumbnails: row.get::<_, i64>(10)? != 0,
+            latest_timestamp: row.get::<_, i64>(11)?,
+        },
+        row.get::<_, i64>(12)?.max(0) as u64,
+    ))
+}
+
+fn detect_image_media_type(path: &Path) -> Result<Option<&'static str>> {
+    let mut file = File::open(path)?;
+    let mut header = [0_u8; 16];
+    let read = file.read(&mut header)?;
+    let header = &header[..read];
+    let media_type = if header.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if header.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if header.starts_with(b"GIF87a") || header.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if header.len() >= 12 && &header[..4] == b"RIFF" && &header[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if header.starts_with(b"BM") {
+        Some("image/bmp")
+    } else if header.len() >= 12
+        && &header[4..8] == b"ftyp"
+        && matches!(&header[8..12], b"avif" | b"avis")
+    {
+        Some("image/avif")
+    } else {
+        None
+    };
+    Ok(media_type)
+}
+
+fn trim_preview_cache(directory: &Path, keep: usize) -> Result<()> {
+    let mut files = fs::read_dir(directory)?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            metadata
+                .is_file()
+                .then(|| (metadata.modified().unwrap_or(UNIX_EPOCH), entry.path()))
+        })
+        .collect::<Vec<_>>();
+    files.sort_by_key(|entry| entry.0);
+    let remove_count = files.len().saturating_sub(keep);
+    for (_, path) in files.into_iter().take(remove_count) {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !columns.iter().any(|name| name == column) {
+        connection.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_bound_source(catalog: &Catalog, source: &Path) -> Result<()> {
+    let bound = catalog
+        .source_path()?
+        .context("catalog has not been scanned yet")?
+        .canonicalize()
+        .context("catalog source no longer exists")?;
+    if bound != source {
+        bail!("catalog belongs to another source");
+    }
+    Ok(())
+}
+
+fn update_hash_batch(
+    connection: &mut Connection,
+    pending: &mut Vec<(String, String)>,
+) -> Result<()> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let transaction = connection.transaction()?;
+    {
+        let mut statement = transaction.prepare("UPDATE files SET sha256 = ?2 WHERE path = ?1")?;
+        for (path, digest) in pending.iter() {
+            statement.execute(params![path, digest])?;
+        }
+    }
+    transaction.commit()?;
+    pending.clear();
+    Ok(())
+}
+
+fn hash_reader(mut reader: impl Read) -> Result<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn safe_source_join(source: &Path, relative: &str) -> Result<PathBuf> {
+    if relative.is_empty()
+        || relative.starts_with('/')
+        || relative
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        bail!("catalog contains an unsafe source path: {relative}");
+    }
+    Ok(source.join(relative))
+}
+
+fn file_record_fingerprint(path: &Path) -> Result<(u64, i64)> {
+    let metadata = fs::metadata(path)?;
+    Ok((metadata.len(), modified_ns(metadata.modified().ok())))
+}
+
+fn source_metadata_fingerprint(path: &Path) -> Result<String> {
+    let metadata = fs::metadata(path)?;
+    Ok(format!(
+        "{}:{}",
+        metadata.len(),
+        modified_ns(metadata.modified().ok())
+    ))
+}
+
+fn validate_sha256(value: &str) -> Result<()> {
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("sha256 must contain exactly 64 hexadecimal characters");
+    }
+    Ok(())
+}
+
+fn attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentItem> {
+    let raw_kind: String = row.get(4)?;
+    let kind = match raw_kind.as_str() {
+        "original" => AttachmentKind::Original,
+        "thumbnail" => AttachmentKind::Thumbnail,
+        _ => unreachable!("catalog only stores known attachment kinds"),
+    };
+    let reference_status: String = row.get(8)?;
+    let context = if reference_status == "referenced" {
+        Some(AttachmentContext {
+            message_pk: row.get(9)?,
+            chat_pk: row.get(10)?,
+            chat_id: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+            chat_title: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+            chat_kind: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
+            timestamp: row.get::<_, Option<i64>>(14)?.unwrap_or(0),
+            sender_pk: row.get(15)?,
+            sender_name: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
+            content_type: row.get(17)?,
+            text: row.get::<_, Option<String>>(18)?.unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+    Ok(AttachmentItem {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        bytes: row.get::<_, i64>(2)?.max(0) as u64,
+        modified_ns: row.get(3)?,
+        kind,
+        message_id: row.get(5)?,
+        chat_hint: row.get(6)?,
+        marked_for_removal: row.get(7)?,
+        reference_status,
+        context,
+    })
+}

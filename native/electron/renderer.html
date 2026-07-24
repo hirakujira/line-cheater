@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
+  <title>LINE Cheater</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main id="app-shell" class="app-shell">
+    <section id="welcome-screen" class="welcome-screen app-screen">
+      <div class="welcome-layout">
+        <header class="welcome-brand">
+          <img class="brand-mark" src="/assets/icon.png" alt="" aria-hidden="true">
+          <div>
+            <h1>LINE Cheater</h1>
+            <p class="brand-subtitle">你的 LINE 清得乾乾淨淨</p>
+          </div>
+        </header>
+
+        <section class="welcome-card" aria-labelledby="welcome-title">
+          <div class="step-badge"><span>1</span> 選擇備份</div>
+          <h2 id="welcome-title">從你的 LINE 備份開始</h2>
+          <p class="welcome-copy">
+            選擇一種備份來源。LINE Cheater 只會以唯讀方式解析原始資料，
+            大型附件會留在磁碟上按需讀取。
+          </p>
+
+          <div class="source-options" aria-label="備份來源類型">
+            <button class="source-option is-recommended" data-source="archive" type="button">
+              <span class="source-option-icon" aria-hidden="true">▣</span>
+              <span class="source-option-copy">
+                <span class="source-option-title">
+                  <strong>.imazingapp</strong>
+                  <span class="source-recommend-badge">推薦</span>
+                </span>
+                <small>iMazing 匯出的完整備份</small>
+              </span>
+            </button>
+            <button class="source-option" data-source="directory" type="button">
+              <span class="source-option-icon" aria-hidden="true">⌁</span>
+              <span class="source-option-copy">
+                <span class="source-option-title">
+                  <strong>備份資料夾</strong>
+                </span>
+                <small>已解開的 LINE 備份</small>
+              </span>
+            </button>
+          </div>
+
+          <div id="source-ready-card" class="source-ready-card hidden" aria-live="polite">
+            <span class="ready-check" aria-hidden="true">✓</span>
+            <div class="source-ready-main">
+              <strong id="selected-source-name">備份已準備好</strong>
+              <span id="selected-source-detail">可以進入工作區。</span>
+            </div>
+            <span class="read-only-badge">唯讀</span>
+          </div>
+
+          <p id="status" class="welcome-status" role="status">尚未選擇備份。</p>
+          <dl id="session-summary" class="session-summary hidden"></dl>
+
+          <footer class="welcome-footer">
+            <span>步驟 1 / 2</span>
+            <button id="enter-workspace" class="primary-button" type="button" disabled>
+              下一步
+              <span aria-hidden="true">→</span>
+            </button>
+          </footer>
+        </section>
+      </div>
+    </section>
+
+    <section id="workspace-screen" class="workspace-screen app-screen hidden">
+      <aside class="workspace-sidebar">
+        <div class="sidebar-brand">
+          <img class="brand-mark small-mark" src="/assets/icon.png" alt="" aria-hidden="true">
+          <div>
+            <strong>LINE Cheater</strong>
+            <span>你的 LINE 清得乾乾淨淨</span>
+          </div>
+        </div>
+
+        <nav class="sidebar-nav" aria-label="主要功能">
+          <p class="sidebar-label">工作區</p>
+          <button class="sidebar-item active" data-view="browse" type="button"
+                  aria-current="page">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 5.5h16v11H8l-4 3v-14Z"></path>
+              <path d="M8 9h8M8 13h5"></path>
+            </svg>
+            <span>
+              <strong>瀏覽</strong>
+              <small>查看聊天室與訊息</small>
+            </span>
+          </button>
+          <button class="sidebar-item" data-view="cleanup" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M5 7h14M9 7V4h6v3M8 10v8M12 10v8M16 10v8M7 7l1 14h8l1-14"></path>
+            </svg>
+            <span>
+              <strong>清理</strong>
+              <small>審核並建立瘦身檔</small>
+            </span>
+          </button>
+        </nav>
+
+        <div class="sidebar-source">
+          <p class="sidebar-label">目前備份</p>
+          <strong id="sidebar-source-name">尚未選擇</strong>
+          <span id="sidebar-source-detail">—</span>
+          <button id="change-source" type="button">更換備份</button>
+        </div>
+      </aside>
+
+      <div class="workspace-main">
+        <header class="workspace-topbar">
+          <div>
+            <h2 id="workspace-title">瀏覽</h2>
+            <p id="workspace-subtitle">查看聊天室與訊息內容</p>
+          </div>
+          <p id="workspace-status" role="status">備份已以唯讀模式開啟。</p>
+        </header>
+
+        <div class="workspace-content">
+          <section id="browse-view" class="workspace-view" aria-labelledby="browse-heading">
+            <h2 id="browse-heading" class="sr-only">瀏覽聊天室</h2>
+            <div class="content-grid">
+              <aside class="panel chat-panel">
+                <div class="section-title compact">
+                  <div>
+                    <p class="section-kicker">CONVERSATIONS</p>
+                    <h3>聊天室</h3>
+                  </div>
+                </div>
+                <div id="chats" class="chat-list" role="listbox" aria-label="聊天室列表">
+                  <div class="empty-state">載入備份後顯示聊天室。</div>
+                </div>
+                <nav class="chat-pagination" aria-label="聊天室分頁">
+                  <span id="chat-page-info">第 1 頁</span>
+                  <button id="next-chats" disabled>下一頁</button>
+                </nav>
+              </aside>
+
+              <section class="panel messages-panel">
+                <div class="section-title compact message-heading">
+                  <div>
+                    <h3 id="selected-chat-title">選取聊天室</h3>
+                    <p id="selected-chat-meta" class="muted small">請從左側選取聊天室開始。</p>
+                  </div>
+                  <button id="next-messages" disabled>載入更多訊息</button>
+                </div>
+                <form id="search-form" class="search message-search">
+                  <input id="search-query" maxlength="1024" placeholder="搜尋目前聊天室的訊息文字">
+                  <button type="submit" disabled>搜尋</button>
+                </form>
+                <div id="message-status" class="message-status" aria-live="polite"></div>
+                <div id="messages" class="message-list" aria-live="polite">
+                  <div class="empty-state">尚未選取聊天室。</div>
+                </div>
+              </section>
+            </div>
+          </section>
+
+          <section id="cleanup-view" class="workspace-view hidden" aria-labelledby="cleanup-heading-title">
+            <div class="panel cleanup-panel">
+              <div class="section-title cleanup-heading">
+                <div>
+                  <p class="section-kicker">STORAGE CLEANUP</p>
+                  <h2 id="cleanup-heading-title">清理附件</h2>
+                  <p class="muted">依聊天室檢查附件，確認後再決定要刪除原始檔或縮圖。</p>
+                </div>
+                <div class="cleanup-heading-actions">
+                  <div class="cleanup-summary" aria-live="polite">
+                    <span>已標記 <strong id="marked-count">0</strong> 個</span>
+                    <span>預估釋放 <strong id="marked-size">0 B</strong></span>
+                  </div>
+                  <div class="cleanup-scan-action">
+                    <button id="scan-catalog" disabled>重新掃描附件</button>
+                    <div class="cleanup-scan-status">
+                      <progress id="progress" max="1" value="0"></progress>
+                      <span id="catalog-summary"></span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="cleanup-controls">
+                <div class="cleanup-warning">
+                  <strong>還原前請保留原始檔</strong>
+                  <span>「SQLite 未引用」仍需人工確認；候選檔只會排除已標記附件，不會改動來源備份。</span>
+                </div>
+                <div class="cleanup-toolbar">
+                  <label class="cleanup-search">
+                    <span class="sr-only">搜尋附件</span>
+                    <input id="cleanup-search" type="search" maxlength="1024" placeholder="搜尋聊天室、傳送者、訊息內容或檔名">
+                  </label>
+                  <label class="cleanup-filter">
+                    <span class="sr-only">檔案篩選</span>
+                    <select id="cleanup-kind" aria-label="檔案篩選">
+                      <option value="all">全部檔案</option>
+                      <option value="original">只看原始附件</option>
+                      <option value="thumbnail">只看縮圖</option>
+                      <option value="marked">只看已標記刪除</option>
+                    </select>
+                  </label>
+                  <label class="cleanup-filter">
+                    <span class="sr-only">聊天室分類</span>
+                    <select id="cleanup-category" aria-label="聊天室分類">
+                      <option value="all">全部分類</option>
+                      <option value="individual">個人聊天室</option>
+                      <option value="group">群組聊天室</option>
+                      <option value="community">社群</option>
+                      <option value="unreferenced">SQLite 未引用</option>
+                      <option value="unconfirmed">無法確認</option>
+                    </select>
+                  </label>
+                  <label class="cleanup-filter">
+                    <span class="sr-only">排序方式</span>
+                    <select id="cleanup-sort" aria-label="排序方式">
+                      <option value="recent">最近傳送／接收</option>
+                      <option value="oldest">最早傳送／接收</option>
+                      <option value="size">檔案大小</option>
+                      <option value="path">來源路徑</option>
+                    </select>
+                  </label>
+                </div>
+                <div id="category-summary" class="category-summary" aria-label="附件分類摘要"></div>
+              </div>
+              <div class="cleanup-results">
+                <p id="cleanup-result-info" class="cleanup-result-info" aria-live="polite"></p>
+                <div id="cleanup-list" class="cleanup-list" aria-label="依聊天室分類的附件">
+                  <div class="empty-state">請先掃描附件。</div>
+                </div>
+                <nav class="cleanup-pagination" aria-label="附件瘦身清單分頁">
+                  <button id="cleanup-prev" disabled>上一頁</button>
+                  <span id="cleanup-page-info">第 1 頁</span>
+                  <button id="cleanup-next" disabled>下一頁</button>
+                </nav>
+              </div>
+              <div class="cleanup-footer">
+                <p class="muted small">
+                  建立候選檔時會保留未標記的 Container／Payload 檔案，並執行完整 CRC 驗證。
+                </p>
+                <button id="build-candidate" class="primary-button" disabled>
+                  建立瘦身 .imazingapp
+                </button>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="load-modal" class="package-modal load-modal is-processing hidden"
+       role="dialog" aria-modal="true" aria-labelledby="load-modal-title"
+       aria-describedby="load-modal-message" aria-hidden="true">
+    <div class="package-modal-backdrop" aria-hidden="true"></div>
+    <section class="package-modal-card" role="document" tabindex="-1">
+      <div class="package-modal-state" aria-hidden="true">
+        <span class="package-modal-spinner"></span>
+      </div>
+      <p class="section-kicker">LINE 備份</p>
+      <h2 id="load-modal-title">正在讀取備份</h2>
+      <p id="load-modal-message" class="package-modal-message" role="status" aria-live="polite">
+        正在準備選取的檔案，請勿關閉此視窗。
+      </p>
+      <div class="package-modal-progress-track">
+        <div id="load-modal-progress" class="package-modal-progress" role="progressbar"
+             aria-label="讀取進度" aria-valuemin="0" aria-valuemax="100"
+             aria-valuenow="0"></div>
+      </div>
+      <p id="load-modal-progress-label" class="package-modal-progress-label">0%</p>
+    </section>
+  </div>
+
+  <div id="package-modal" class="package-modal is-processing hidden"
+       role="dialog" aria-modal="true" aria-labelledby="package-modal-title"
+       aria-describedby="package-modal-message" aria-hidden="true">
+    <div class="package-modal-backdrop" aria-hidden="true"></div>
+    <section class="package-modal-card" role="document" tabindex="-1">
+      <div class="package-modal-state" aria-hidden="true">
+        <span class="package-modal-spinner"></span>
+      </div>
+      <p class="section-kicker">瘦身封裝</p>
+      <h2 id="package-modal-title">正在建立 .imazingapp</h2>
+      <p id="package-modal-message" class="package-modal-message" role="status" aria-live="polite">
+        正在整理保留的檔案，請勿關閉此視窗。
+      </p>
+      <div class="package-modal-progress-track">
+        <div id="package-modal-progress" class="package-modal-progress" role="progressbar"
+             aria-label="封裝進度" aria-valuemin="0" aria-valuemax="100"
+             aria-valuenow="0"></div>
+      </div>
+      <p id="package-modal-progress-label" class="package-modal-progress-label">0%</p>
+      <button id="package-modal-close" class="package-modal-close hidden" type="button">完成</button>
+    </section>
+  </div>
+
+  <div id="image-modal" class="image-modal hidden" role="dialog" aria-modal="true"
+       aria-labelledby="image-modal-caption" aria-hidden="true">
+    <div class="image-modal-backdrop" aria-hidden="true"></div>
+    <section class="image-modal-card" role="document" tabindex="-1">
+      <button id="image-modal-close" class="image-modal-close" type="button"
+              aria-label="關閉圖片預覽">關閉</button>
+      <img id="image-modal-image" alt="">
+      <p id="image-modal-caption" class="image-modal-caption"></p>
+    </section>
+  </div>
+
+  <script src="/data-provider.js"></script>
+  <script src="/renderer.js"></script>
+</body>
+</html>

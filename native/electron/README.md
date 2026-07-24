@@ -1,0 +1,264 @@
+# LINE Cheater desktop preview
+
+This is the runnable desktop shell for the bounded-memory Rust core. A macOS
+arm64 tester package is available; it is not yet a notarized public release.
+
+Read [`../../NATIVE.md`](../../NATIVE.md) first. That file is the authoritative
+architecture, safety, verification, and handoff record.
+
+## Run
+
+Prerequisites: Rust 1.96 or compatible, Node.js/npm, and enough free disk space
+for the SQLite staging directory and candidate output.
+
+```bash
+# From the repository root.
+cargo build -p line-backup-native
+npm --prefix native/electron ci
+npm --prefix native/electron test
+npm --prefix native/electron run dev
+```
+
+The development shell finds `target/release/line-backup-native` first and then
+`target/debug/line-backup-native`. A packaged build must put the platform binary
+at `resources/bin/line-backup-native` (with `.exe` on Windows). For local
+diagnostics only, `LINE_BACKUP_NATIVE_BIN` can point at another build.
+
+Electron is pinned in `package-lock.json`. Keep it current because the runtime
+ships Chromium and Node.js security updates.
+
+## Process boundary
+
+```text
+sandboxed renderer
+  renderer.js + NativeDataProvider
+        │ allowlisted invoke/event bridge
+        ▼
+Electron main process
+  native dialogs + output tokens + SidecarClient
+        │ bounded JSON Lines over stdin/stdout
+        ▼
+line-backup-native serve
+  read-only source + catalog.sqlite + candidate writer
+```
+
+The renderer never receives Node.js, Electron IPC primitives, a child-process
+handle, or arbitrary filesystem methods. The main process:
+
+- serves only four allowlisted local assets from the `line-cheater://app` custom
+  protocol;
+- enables context isolation, process sandboxing, and web security;
+- disables renderer Node integration, navigation, new windows, and permissions;
+- validates the IPC sender and method allowlist;
+- limits sidecar requests to 1 MiB and response lines to 16 MiB;
+- keeps source selection in native dialogs;
+- converts catalog-authorized image files into opaque local preview URLs;
+- opens only credential-free `http:`/`https:` links through the system browser;
+  renderer navigation, `file:` URLs, and other schemes remain blocked;
+- converts a one-use output token into the candidate path so the renderer cannot
+  choose arbitrary paths directly.
+
+Do not replace this bridge with a general `ipcRenderer.send`, filesystem, shell,
+or child-process API.
+
+## macOS package
+
+Build the current machine architecture with:
+
+```bash
+npm --prefix native/electron run package:mac
+```
+
+The command runs the Electron contract tests, compiles an optimized Rust
+sidecar, copies the Electron runtime, installs the sidecar under
+`Contents/Resources/bin`, validates the full-bleed 1024 × 1024
+`assets/icon.png`, derives all ten required `.iconset` bitmap slots and the
+LINE Cheater `.icns`, applies an ad-hoc code
+signature, verifies the bundle, and produces:
+
+```text
+native/electron/dist/mac-<arch>/LINE Cheater.app
+native/electron/dist/LINE-Cheater-0.1.0-macOS-<arch>.zip
+native/electron/dist/LINE-Cheater-0.1.0-macOS-<arch>.dmg
+native/electron/dist/SHA256SUMS.txt
+```
+
+The 2026-07-24 artifact is `arm64`, for Apple Silicon Macs running macOS 12 or
+later. It is ad-hoc signed but not Developer ID signed or notarized. It is
+suitable for direct testing, but a recipient may see an unidentified-developer
+Gatekeeper warning. Public distribution still requires an Apple Developer
+account, a `Developer ID Application` signature, notarization with
+`xcrun notarytool`, and ticket stapling. Build a separate `x64` runtime/sidecar
+or a verified universal bundle before claiming Intel Mac support.
+
+## Implemented UI flow
+
+1. Start on a dedicated LINE Cheater welcome screen. `.imazingapp` is the first
+   and recommended source; an unpacked backup directory remains available as
+   the secondary choice. Direct `Line.sqlite` loading remains supported by the
+   native core for diagnostics but is intentionally hidden from the end-user
+   welcome screen.
+2. Show the same blocking spinner/progress treatment as the web app while the
+   read-only session, companion databases, attachment catalog, and chat page are
+   prepared.
+3. Keep the user on the source screen after preparation and enable an explicit
+   Next action.
+4. Enter a native app shell with a persistent source summary and sidebar. The
+   sidebar switches between Browse and Cleanup; only one workspace is mounted
+   visibly at a time. The welcome header and sidebar reuse the packaged macOS
+   app icon rather than a separate lettermark.
+5. Resolve chat names from the main, `LineSquare.sqlite`, and
+   `UnifiedGroup.sqlite` databases plus rename system messages. Main and
+   community chats share a source-aware cursor and keep the source needed to
+   route later message requests.
+6. Page chats at 100 rows and messages at 180 rows using the web-style
+   chat/message panel and incoming/outgoing/system bubble layout. Rust supplies
+   `isSelf`; send status is never allowed to turn another identified member
+   into “我”.
+7. Hydrate referenced chat images from catalog-authorized original/thumbnail
+   paths with at most four concurrent preview requests. HTTP(S) text is
+   linkified, receives a bounded domain/title preview card, and opens in the
+   system browser through a protocol-validated main-process bridge.
+8. Search message text with bounded native result pages.
+9. Review six cleanup categories inside a fixed-height workspace. The list
+   replaces four chat/special groups at a time, so the page header, filters,
+   pagination, and candidate action never leave the window.
+10. Search/filter/sort and enter a group. Detail mode becomes an iOS
+    Photos-style continuous album grouped by month. It fetches 24 review bundles
+    per native request and keeps at most three adjacent batches (72 cards) in
+    the DOM; measured virtual spacers preserve scroll position when an older
+    batch is discarded. Thumbnails keep their aspect ratio without cropping,
+    with message/file controls below. A loaded thumbnail is a keyboard-focusable
+    zoom button and opens the same full-size image modal used by chat messages.
+11. Mark original attachments and thumbnails independently, or use the reversible
+   delete-all / keep-thumbnail group actions.
+12. Choose an output through a native save dialog and build a full-CRC candidate
+    with the web-style progress/success/error dialog.
+
+Every next-page action replaces the current DOM window instead of appending to
+an unbounded array.
+
+## 2026-07-24 browser comparison
+
+The same ignored 1.1 GB directory fixture was loaded in the production web app
+and in this desktop preview. Only aggregate results were recorded:
+
+| Check | Web app | Electron + Rust |
+|---|---:|---:|
+| Source totals | 221 chats, 925,868 messages, 11,239 attachments | Same source tables/catalog |
+| Nonempty chat list | 221 merged chats | 221 source-aware chats; 20 community labels |
+| Visible chat window | 4 rows at the tested viewport | 100 rows |
+| Visible message window | 180 rows | 180 rows |
+| Raw-ID titles in first 100 main chats | Not shown by the reference UI | 0 |
+| Referenced message image route | Local image preview | Original, then thumbnail fallback |
+| Attachment presentation | 59 chat/special groups across 3 pages | Same 59 groups across 15 fixed-view pages |
+| Cleanup page size | 24 groups or review bundles | 4 group rows; detail uses 24-card virtual batches |
+| Cleanup categories | 6 categories | Same 6 categories and aggregate totals |
+| Group actions | Delete all / keep thumbnails | Same actions and reversible states |
+| No-match search | 0 results | 0 results |
+
+The same real `.imazingapp` also returned 11,239 attachments and 59 cleanup
+groups. The fixed desktop list showed four groups on page 1 of 15. The earlier
+two-card detail comparison was later replaced by continuous month-sectioned
+scrolling backed by bounded 24-card batches. Only aggregate results were
+recorded.
+
+The desktop now uses the same title evidence, nonempty-chat visibility, and
+sender-ownership rules as the web app. The web app remains the reference for
+cleanup-plan exports, duplicate presentation, cross-store coalescing when an ID
+exists in both databases, and its broader analysis tools.
+The desktop cleanup workflow and safety decisions match while large state stays
+in the native catalog.
+
+## Cleanup behavior
+
+- `referenced` requires exactly one message whose database chat ID matches the
+  chat ID embedded in the attachment path.
+- A valid ID absent from both `Line.sqlite` and `LineSquare.sqlite` is
+  `unreferenced`.
+- Missing/ambiguous IDs and IDs found in another chat are `unconfirmed`.
+- Original and thumbnail checkboxes are separate.
+- “刪除全部” toggles the complete group.
+- “只保留縮圖” marks originals, clears thumbnail marks, and toggles back to
+  restore originals.
+- Filters, category cards, sorting, search, category/group pagination, and
+  safety/evidence copy mirror the web UI.
+- Cleanup keeps the app workspace fixed instead of restoring a document-level
+  scrollbar. The group list still replaces four rows at a time. Detail mode
+  hides Previous/Next and uses one contained album scroller with sticky month
+  headings; the source, filters, and build action remain stationary. The album
+  grid auto-fills compact columns, keeps thumbnails uncropped with
+  `object-fit: contain`, and puts metadata below each image.
+- File-risk copy remains available to assistive technology and as a native
+  hover tooltip, while each album card keeps original/thumbnail controls
+  below its image without expanding the evidence disclosure.
+
+Preview requests do not carry file bytes over JSON. Rust validates the current
+catalog row and a 16 MiB ceiling. Directory images are streamed from the source;
+archive images are extracted on demand into a 32-file cache. Electron exposes
+at most 128 opaque preview tokens to the sandboxed renderer. Message pages carry
+only matching paths, byte counts, and original/thumbnail kinds. The renderer
+requests visible pixels afterward with four workers and falls back from an
+unsupported original to its thumbnail.
+
+## Known gaps before a desktop release
+
+- Add job IDs and cancellation for catalog, hash, and candidate operations.
+- Port cleanup-plan exports, duplicate review, and the remaining analysis UI.
+- Coalesce the same normalized chat ID across the main and community databases
+  if a future fixture contains one. The current real fixture had zero such
+  overlaps; source-aware community listing and message routing are implemented.
+- Add the resumable on-disk FTS5 index.
+- Manually regress directory, SQLite, and `.imazingapp` selection plus preview
+  rendering through native file pickers on macOS, Windows, and Linux.
+- Add Developer ID signing/notarization, Intel/universal macOS, Windows signing,
+  Linux packages, and update policy. The repeatable macOS arm64 ad-hoc package
+  already bundles the optimized Rust sidecar and icon.
+- Measure Electron main/renderer and Rust sidecar peak RSS separately with a
+  synthetic large fixture.
+- Validate a native-built candidate through an actual iMazing restore before
+  presenting the operation as production-safe.
+
+## Tests
+
+```bash
+npm --prefix native/electron test
+npm --prefix native/electron audit --omit=dev
+node --check native/electron/main.cjs
+node --check native/electron/preload.cjs
+node --check native/electron/renderer.js
+```
+
+`sidecar-client.test.cjs` verifies event/response routing and termination when a
+sidecar exceeds the 16 MiB response-line limit.
+`renderer-shell.test.cjs` locks the LINE Cheater product name, two-screen
+source/Next flow, sidebar destinations, mutually exclusive workspaces, and
+unique DOM IDs. It also locks source-aware community selection, native
+`isSelf` use, safe HTTP(S)-only external links, bounded URL preview cards,
+cleanup-thumbnail zoom, the fixed cleanup viewport, four-group/24-card virtual
+batch sizes, a three-batch DOM ceiling, sticky month sections,
+aspect-ratio-preserving thumbnails, compact risk descriptions, and absence of
+the former three-step scrolling guide. It also checks that macOS
+packaging uses the optimized Rust
+sidecar, packaged resource path, custom icon, signature verification, DMG
+output, and checksums.
+`../frontend/data-provider.test.js` verifies page limits, cleanup filter
+normalization, source forwarding, detail requests, and group-action validation.
+Rust integration tests cover reference semantics, companion/rename title
+resolution, sender ownership, source-aware community chat/message pages,
+message attachment enrichment, reversible marking, and bounded
+directory/archive preview staging.
+
+Never put real backup paths, account IDs, chat titles, message text, attachment
+names, work catalogs, or candidates into test snapshots or committed logs.
+
+For a manual UX regression, run `npm --prefix native/electron run dev`, open a
+backup read-only, press Next, and choose Cleanup. At the normal window size,
+verify that exactly four group rows plus Previous/Next and “建立瘦身
+.imazingapp” are visible together without a page scrollbar. Open View on one
+group and verify that the grid auto-fills compact columns with uncropped
+thumbnails above both file choices. Scroll through at least four
+internal batches and confirm month headings remain sticky, Previous/Next stays
+hidden, the build action stays in the same window, and the DOM does not grow
+beyond 72 review cards. Do not mark files or build a candidate when using a
+personal backup for this visual check.

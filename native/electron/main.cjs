@@ -1,0 +1,298 @@
+"use strict";
+
+const { app, BrowserWindow, dialog, ipcMain, net, protocol, session, shell } = require("electron");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const { pathToFileURL } = require("node:url");
+const { SidecarClient } = require("./sidecar-client.cjs");
+
+app.setName("LINE Cheater");
+
+const APP_ORIGIN = "line-cheater://app";
+const allowedMethods = new Set([
+  "sessionInfo",
+  "listChats",
+  "listMessages",
+  "searchMessages",
+  "scanCatalog",
+  "listAttachments",
+  "setAttachmentMarked",
+  "catalogStats",
+  "cleanupOverview",
+  "listCleanupGroups",
+  "listCleanupReviews",
+  "applyCleanupGroupAction",
+  "hashDuplicateCandidates",
+  "listDuplicateGroups",
+  "listDuplicateMembers",
+  "buildCandidate"
+]);
+const assetFiles = new Map([
+  ["/assets/icon.png", path.join("assets", "icon.png")],
+  ["/renderer.html", "renderer.html"],
+  ["/renderer.js", "renderer.js"],
+  ["/styles.css", "styles.css"],
+  ["/data-provider.js", path.join("..", "frontend", "data-provider.js")]
+]);
+
+protocol.registerSchemesAsPrivileged([{
+  scheme: "line-cheater",
+  privileges: { standard: true, secure: true, supportFetchAPI: true }
+}]);
+
+let mainWindow = null;
+let sidecar = null;
+const outputTokens = new Map();
+const previewTokens = new Map();
+const MAX_PREVIEW_TOKENS = 128;
+const MAX_PREVIEW_BYTES = 16 * 1024 * 1024;
+
+function assertTrustedSender(event) {
+  if (!mainWindow || event.sender !== mainWindow.webContents) {
+    throw new Error("Rejected IPC from an unknown renderer.");
+  }
+  const url = event.senderFrame && event.senderFrame.url || "";
+  if (!url.startsWith(`${APP_ORIGIN}/`)) {
+    throw new Error("Rejected IPC from an untrusted origin.");
+  }
+}
+
+function rustBinaryPath() {
+  const executable = process.platform === "win32"
+    ? "line-backup-native.exe"
+    : "line-backup-native";
+  const candidates = [];
+  if (process.env.LINE_BACKUP_NATIVE_BIN) {
+    candidates.push(path.resolve(process.env.LINE_BACKUP_NATIVE_BIN));
+  }
+  if (app.isPackaged) candidates.push(path.join(process.resourcesPath, "bin", executable));
+  candidates.push(path.resolve(__dirname, "..", "..", "target", "release", executable));
+  candidates.push(path.resolve(__dirname, "..", "..", "target", "debug", executable));
+  const found = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!found) {
+    throw new Error(
+      "找不到 Rust sidecar。請先執行 cargo build -p line-backup-native，" +
+      "或設定 LINE_BACKUP_NATIVE_BIN。"
+    );
+  }
+  return found;
+}
+
+function sourceDialogOptions(kind) {
+  if (kind === "directory") {
+    return { title: "選擇解開的 LINE 備份資料夾", properties: ["openDirectory"] };
+  }
+  if (kind === "sqlite") {
+    return {
+      title: "選擇 Line.sqlite",
+      properties: ["openFile"],
+      filters: [{ name: "SQLite", extensions: ["sqlite", "db"] }]
+    };
+  }
+  return {
+    title: "選擇 LINE .imazingapp",
+    properties: ["openFile"],
+    filters: [{ name: "iMazing App Data", extensions: ["imazingapp"] }]
+  };
+}
+
+async function replaceSidecar(source) {
+  if (sidecar) await sidecar.dispose();
+  outputTokens.clear();
+  previewTokens.clear();
+  const workKey = crypto.createHash("sha256").update(path.resolve(source)).digest("hex");
+  const workDir = path.join(app.getPath("userData"), "sessions", workKey);
+  fs.mkdirSync(workDir, { recursive: true });
+  const client = await SidecarClient.start(rustBinaryPath(), [
+    "--work-dir", workDir,
+    "serve", "--source", source
+  ]);
+  client.on("sidecarEvent", (event) => {
+    if (event.event !== "ready" && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("line-native:event", event);
+    }
+  });
+  client.on("sidecarFailure", (error) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("line-native:event", {
+        event: "sidecarFailure",
+        message: error.message
+      });
+    }
+  });
+  sidecar = client;
+  return client.ready;
+}
+
+async function registerIpc() {
+  ipcMain.handle("line-native:select-source", async (event, kind) => {
+    assertTrustedSender(event);
+    if (!["directory", "archive", "sqlite"].includes(kind)) {
+      throw new TypeError("Invalid source kind.");
+    }
+    const result = await dialog.showOpenDialog(mainWindow, sourceDialogOptions(kind));
+    if (result.canceled || result.filePaths.length !== 1) return null;
+    return replaceSidecar(result.filePaths[0]);
+  });
+
+  ipcMain.handle("line-native:choose-candidate-output", async (event) => {
+    assertTrustedSender(event);
+    if (!sidecar) throw new Error("請先開啟並掃描備份。");
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: "儲存瘦身候選備份",
+      defaultPath: "LINE-slim.imazingapp",
+      filters: [{ name: "iMazing App Data", extensions: ["imazingapp"] }]
+    });
+    if (result.canceled || !result.filePath) return null;
+    const token = crypto.randomUUID();
+    outputTokens.set(token, result.filePath);
+    return { token, displayName: path.basename(result.filePath) };
+  });
+
+  ipcMain.handle("line-native:attachment-preview", async (event, attachmentPath) => {
+    assertTrustedSender(event);
+    if (!sidecar) throw new Error("尚未開啟備份。");
+    if (typeof attachmentPath !== "string" ||
+        !attachmentPath ||
+        Buffer.byteLength(attachmentPath, "utf8") > 4096) {
+      throw new TypeError("Invalid attachment preview path.");
+    }
+    const preview = await sidecar.request("stageAttachmentPreview", {
+      path: attachmentPath
+    });
+    if (!preview ||
+        typeof preview.stagedPath !== "string" ||
+        !String(preview.mediaType || "").startsWith("image/") ||
+        !Number.isSafeInteger(preview.bytes) ||
+        preview.bytes < 1 ||
+        preview.bytes > MAX_PREVIEW_BYTES) {
+      throw new Error("Rust sidecar returned an invalid attachment preview.");
+    }
+    const filePath = fs.realpathSync(preview.stagedPath);
+    const metadata = fs.statSync(filePath);
+    if (!metadata.isFile() || metadata.size !== preview.bytes) {
+      throw new Error("Attachment preview changed after validation.");
+    }
+    while (previewTokens.size >= MAX_PREVIEW_TOKENS) {
+      previewTokens.delete(previewTokens.keys().next().value);
+    }
+    const token = crypto.randomUUID();
+    previewTokens.set(token, {
+      filePath,
+      mediaType: preview.mediaType,
+      bytes: preview.bytes
+    });
+    return `${APP_ORIGIN}/preview/${token}`;
+  });
+
+  ipcMain.handle("line-native:open-external", async (event, value) => {
+    assertTrustedSender(event);
+    if (typeof value !== "string" || Buffer.byteLength(value, "utf8") > 4096) {
+      throw new TypeError("Invalid external URL.");
+    }
+    let url;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new TypeError("Invalid external URL.");
+    }
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) {
+      throw new TypeError("Only credential-free HTTP(S) URLs can be opened.");
+    }
+    await shell.openExternal(url.href, { activate: true });
+    return true;
+  });
+
+  ipcMain.handle("line-native:request", async (event, method, params) => {
+    assertTrustedSender(event);
+    if (!sidecar) throw new Error("尚未開啟備份。");
+    if (!allowedMethods.has(method)) throw new Error("Renderer requested a disallowed method.");
+    const safeParams = params && typeof params === "object" && !Array.isArray(params)
+      ? structuredClone(params)
+      : {};
+    if (method === "buildCandidate") {
+      const token = String(safeParams.output || "");
+      const output = outputTokens.get(token);
+      if (!output) throw new Error("候選輸出授權已失效，請重新選擇位置。");
+      outputTokens.delete(token);
+      safeParams.output = output;
+    }
+    return sidecar.request(method, safeParams);
+  });
+}
+
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    title: "LINE Cheater",
+    width: 1180,
+    height: 820,
+    minWidth: 840,
+    minHeight: 620,
+    show: false,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true
+    }
+  });
+  mainWindow.setMenuBarVisibility(false);
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    if (!url.startsWith(`${APP_ORIGIN}/`)) event.preventDefault();
+  });
+  mainWindow.once("ready-to-show", () => mainWindow.show());
+  mainWindow.on("closed", () => {
+    mainWindow = null;
+    if (sidecar) void sidecar.dispose();
+    sidecar = null;
+  });
+  void mainWindow.loadURL(`${APP_ORIGIN}/renderer.html`);
+}
+
+app.whenReady().then(async () => {
+  protocol.handle("line-cheater", async (request) => {
+    const url = new URL(request.url);
+    if (url.host !== "app") {
+      return new Response("Not found", { status: 404 });
+    }
+    if (url.pathname.startsWith("/preview/")) {
+      const token = url.pathname.slice("/preview/".length);
+      const preview = previewTokens.get(token);
+      if (!preview || !/^[0-9a-f-]{36}$/i.test(token)) {
+        return new Response("Not found", { status: 404 });
+      }
+      const response = await net.fetch(pathToFileURL(preview.filePath).toString());
+      return new Response(response.body, {
+        status: response.status,
+        headers: {
+          "Content-Type": preview.mediaType,
+          "Content-Length": String(preview.bytes),
+          "Cache-Control": "private, no-store"
+        }
+      });
+    }
+    if (!assetFiles.has(url.pathname)) {
+      return new Response("Not found", { status: 404 });
+    }
+    return net.fetch(pathToFileURL(path.join(__dirname, assetFiles.get(url.pathname))).toString());
+  });
+  session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => {
+    callback(false);
+  });
+  await registerIpc();
+  createWindow();
+  app.on("activate", () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  });
+});
+
+app.on("window-all-closed", () => {
+  if (process.platform !== "darwin") app.quit();
+});
+
+app.on("before-quit", () => {
+  if (sidecar) void sidecar.dispose();
+});

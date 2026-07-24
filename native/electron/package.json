@@ -1,0 +1,18 @@
+{
+  "name": "line-cheater-desktop",
+  "productName": "LINE Cheater",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LINE Cheater desktop app with a bounded-memory Rust backup core",
+  "main": "main.cjs",
+  "scripts": {
+    "dev": "electron .",
+    "start": "electron .",
+    "test": "node --test ../frontend/data-provider.test.js sidecar-client.test.cjs renderer-shell.test.cjs",
+    "build:native:mac": "cargo build --manifest-path ../../Cargo.toml -p line-backup-native --release",
+    "package:mac": "npm test && npm run build:native:mac && node scripts/package-macos.cjs"
+  },
+  "devDependencies": {
+    "electron": "43.2.0"
+  }
+}

@@ -1,6 +1,17 @@
 # LINE Cheater｜GitHub Pages 部署包
 
+> 超大型備份與桌面版 Rust core 的架構、目前進度、驗證紀錄及接手說明請見
+> [NATIVE.md](NATIVE.md)。
+
+> 可執行的 Electron + Rust 開發預覽、啟動方式與安全邊界請見
+> [native/electron/README.md](native/electron/README.md)。
+
 **直接使用：<https://line-cheater.gginin.de>**
+
+Apple Silicon macOS 測試版可用
+`npm --prefix native/electron run package:mac` 產生 `.app`、ZIP 與 DMG。
+目前為 ad-hoc 簽章、尚未 Apple Developer ID 簽署或 notarize；公開散布與
+Intel Mac 支援狀態請見 [macOS package 說明](native/electron/README.md#macos-package)。
 
 這個資料夾包含可直接上傳到 GitHub Pages 的純前端版本，以及供本機使用的 CLI。GitHub Pages 只會發布 HTML／CSS／JavaScript，不會執行 `cli/`。
 

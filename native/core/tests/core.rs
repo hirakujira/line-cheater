@@ -1,0 +1,870 @@
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+use line_backup_native::{
+    AttachmentKind, Catalog, ChatCursor, LineDatabase, LineSquareDatabase, MessageCursor,
+    NativeSession, SourceKind, UnifiedGroupDatabase, build_candidate, inspect_source,
+    prepare_source, serve,
+};
+use rusqlite::Connection;
+use tempfile::TempDir;
+use zip::write::SimpleFileOptions;
+
+fn make_fixture(root: &Path) -> PathBuf {
+    let source = root.join("LINE");
+    let messages = source.join(
+        "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Messages",
+    );
+    let attachments = source.join(
+        "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Message Attachments/u1",
+    );
+    let thumbnails = source.join(
+        "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Message Thumbnails/u1",
+    );
+    fs::create_dir_all(&messages).unwrap();
+    fs::create_dir_all(&attachments).unwrap();
+    fs::create_dir_all(&thumbnails).unwrap();
+    fs::write(attachments.join("12345678.jpg"), b"\xff\xd8\xffimage123").unwrap();
+    fs::write(thumbnails.join("12345678.thumb"), b"\x89PNG\r\n\x1a\n").unwrap();
+
+    let database = messages.join("Line.sqlite");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE ZCHAT (
+                Z_PK INTEGER PRIMARY KEY,
+                ZMID TEXT,
+                ZTYPE INTEGER,
+                ZLASTUPDATED INTEGER,
+                ZLASTMESSAGE TEXT
+            );
+            CREATE TABLE ZUSER (
+                Z_PK INTEGER PRIMARY KEY,
+                ZMID TEXT,
+                ZNAME TEXT
+            );
+            CREATE TABLE ZGROUP (
+                Z_PK INTEGER PRIMARY KEY,
+                ZID TEXT,
+                ZNAME TEXT
+            );
+            CREATE TABLE ZMESSAGE (
+                Z_PK INTEGER PRIMARY KEY,
+                ZID TEXT,
+                ZTIMESTAMP INTEGER,
+                ZCHAT INTEGER,
+                ZSENDER INTEGER,
+                ZSENDSTATUS INTEGER,
+                ZCONTENTTYPE INTEGER,
+                ZMESSAGETYPE TEXT,
+                ZTEXT TEXT,
+                ZLATITUDE REAL,
+                ZLONGITUDE REAL
+            );
+            INSERT INTO ZUSER VALUES (1, 'u1', 'Alice');
+            INSERT INTO ZUSER VALUES (2, 'test', 'Backup Owner');
+            INSERT INTO ZCHAT VALUES (7, 'u1', 0, 200, 'second');
+            INSERT INTO ZMESSAGE VALUES (1, 'm1', 100, 7, 1, 1, 0, 'R', 'first', NULL, NULL);
+            INSERT INTO ZMESSAGE VALUES (2, 'm2', 100, 7, 2, 1, 0, 'R', 'same time', NULL, NULL);
+            INSERT INTO ZMESSAGE VALUES (3, 'm3', 200, 7, 1, 0, 0, 'R', 'second', NULL, NULL);
+            INSERT INTO ZMESSAGE VALUES (4, '12345678', 300, 7, 1, 0, 1, 'R', 'photo context', NULL, NULL);
+            CREATE INDEX message_chat_time ON ZMESSAGE(ZCHAT, ZTIMESTAMP, Z_PK);
+            ",
+        )
+        .unwrap();
+    connection.close().unwrap();
+    source
+}
+
+fn add_square_fixture(source: &Path) {
+    let line_database = source.join(inspect_source(source).unwrap().database_path);
+    let square_database = line_database.with_file_name("LineSquare.sqlite");
+    let connection = Connection::open(&square_database).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE ZCHAT (
+                Z_PK INTEGER PRIMARY KEY,
+                ZMID TEXT,
+                ZTYPE INTEGER,
+                ZSQUARE INTEGER,
+                ZNAME TEXT
+            );
+            CREATE TABLE ZSQUARE (
+                Z_PK INTEGER PRIMARY KEY,
+                ZNAME TEXT
+            );
+            CREATE TABLE ZSQUAREMEMBER (
+                Z_PK INTEGER PRIMARY KEY,
+                ZDISPLAYNAME TEXT,
+                ZMID TEXT
+            );
+            CREATE TABLE ZMESSAGE (
+                Z_PK INTEGER PRIMARY KEY,
+                ZID TEXT,
+                ZTIMESTAMP INTEGER,
+                ZCHAT INTEGER,
+                ZSENDER INTEGER,
+                ZSENDSTATUS INTEGER,
+                ZCONTENTTYPE INTEGER,
+                ZMESSAGETYPE TEXT,
+                ZTEXT TEXT,
+                ZLATITUDE REAL,
+                ZLONGITUDE REAL
+            );
+            INSERT INTO ZSQUARE VALUES (3, 'Square A');
+            INSERT INTO ZCHAT VALUES (8, 'square-chat', 0, 3, '');
+            INSERT INTO ZSQUAREMEMBER VALUES (11, 'Square Sender', 'square-user');
+            INSERT INTO ZSQUAREMEMBER VALUES (12, 'Backup Owner', 'test');
+            INSERT INTO ZMESSAGE VALUES
+                (12, '23456789', 400, 8, 11, 1, 1, 'R', 'square photo', NULL, NULL);
+            INSERT INTO ZMESSAGE VALUES
+                (13, 'square-self', 410, 8, 12, 1, 0, 'S', 'square self', NULL, NULL);
+            ",
+        )
+        .unwrap();
+    connection.close().unwrap();
+
+    let attachment = line_database
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("Message Attachments/square-chat/23456789.jpg");
+    fs::create_dir_all(attachment.parent().unwrap()).unwrap();
+    fs::write(attachment, b"square attachment").unwrap();
+}
+
+fn add_chat_title_fixtures(source: &Path) {
+    let line_database = source.join(inspect_source(source).unwrap().database_path);
+    let connection = Connection::open(&line_database).unwrap();
+    connection
+        .execute_batch(
+            "
+            INSERT INTO ZCHAT VALUES (8, 'g-unified', 1, 400, 'group photo');
+            INSERT INTO ZCHAT VALUES (9, 'g-renamed', 1, 500, 'renamed');
+            INSERT INTO ZMESSAGE VALUES
+                (20, '34567890', 400, 8, 1, 0, 1, 'R', 'group photo', NULL, NULL);
+            INSERT INTO ZMESSAGE VALUES
+                (21, 'rename-event', 500, 9, NULL, 0, 18, 'R',
+                 '群組名稱改為「Renamed Room」', NULL, NULL);
+            INSERT INTO ZMESSAGE VALUES
+                (22, 'ordinary-message', 510, 9, 1, 0, 0, 'R',
+                 'hello group', NULL, NULL);
+            ",
+        )
+        .unwrap();
+    connection.close().unwrap();
+
+    let unified_database = line_database.with_file_name("UnifiedGroup.sqlite");
+    let connection = Connection::open(&unified_database).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE ZUNIFIEDGROUP (
+                Z_PK INTEGER PRIMARY KEY,
+                ZID TEXT,
+                ZNAME TEXT,
+                ZTYPE INTEGER
+            );
+            INSERT INTO ZUNIFIEDGROUP VALUES (1, 'g-unified', 'Unified Room', 1);
+            ",
+        )
+        .unwrap();
+    connection.close().unwrap();
+
+    let attachment = line_database
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("Message Attachments/g-unified/34567890.jpg");
+    fs::create_dir_all(attachment.parent().unwrap()).unwrap();
+    fs::write(attachment, b"\xff\xd8\xffgroup-image").unwrap();
+}
+
+#[test]
+fn inspects_private_store_database_and_opens_read_only() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let report = inspect_source(&source).unwrap();
+    assert_eq!(report.kind, SourceKind::Directory);
+    assert!(report.database_path.contains("PrivateStore/P_test"));
+    let prepared = prepare_source(&source, &temporary.path().join("work")).unwrap();
+    assert_eq!(prepared.account_id.as_deref(), Some("test"));
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    assert!(database.is_read_only().unwrap());
+    assert_eq!(database.quick_check().unwrap(), "ok");
+}
+
+#[test]
+fn pages_chats_and_messages_with_bounded_limits() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let prepared = prepare_source(&source, &temporary.path().join("work")).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+
+    let chats = database.list_chats(None, 10).unwrap();
+    assert_eq!(chats.items.len(), 1);
+    assert_eq!(chats.items[0].source, "line");
+    assert_eq!(chats.items[0].title, "Alice");
+    assert_eq!(chats.items[0].message_count, 4);
+
+    let first = database
+        .list_messages_for_account(7, None, 2, prepared.account_id.as_deref())
+        .unwrap();
+    assert_eq!(first.items.len(), 2);
+    assert_eq!(first.items[0].id, "m1");
+    assert_eq!(first.items[0].source, "line");
+    assert!(!first.items[0].is_self);
+    assert!(first.items[1].is_self);
+    assert_eq!(
+        first.next_cursor,
+        Some(MessageCursor {
+            timestamp: 100,
+            pk: 2
+        })
+    );
+    let second = database.list_messages(7, first.next_cursor, 2).unwrap();
+    assert_eq!(
+        second
+            .items
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        ["m3", "12345678"]
+    );
+    assert!(database.list_messages(7, None, 1_001).is_err());
+
+    let after = ChatCursor {
+        last_updated: chats.items[0].last_updated,
+        source: chats.items[0].source.clone(),
+        pk: chats.items[0].pk,
+    };
+    assert!(
+        database
+            .list_chats(Some(after), 10)
+            .unwrap()
+            .items
+            .is_empty()
+    );
+
+    let search = database.search_messages("photo", None, None, 1).unwrap();
+    assert_eq!(search.items.len(), 1);
+    assert_eq!(search.items[0].id, "12345678");
+    let contexts = database
+        .attachment_contexts(&["12345678".to_string()])
+        .unwrap();
+    assert_eq!(contexts["12345678"][0].chat_title, "Alice");
+    assert_eq!(contexts["12345678"][0].text, "photo context");
+    assert!(
+        database
+            .search_messages(&"x".repeat(1_025), None, None, 10)
+            .is_err()
+    );
+}
+
+#[test]
+fn lists_nonempty_system_only_chats_like_the_web_browser() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let database_path = source.join(inspect_source(&source).unwrap().database_path);
+    let connection = Connection::open(database_path).unwrap();
+    connection
+        .execute_batch(
+            "
+            INSERT INTO ZCHAT VALUES (10, 'system-only', 1, 250, 'system event');
+            INSERT INTO ZMESSAGE VALUES
+                (10, 'system-event', 250, 10, NULL, 0, 18, 'R',
+                 'system event', NULL, NULL);
+            ",
+        )
+        .unwrap();
+    connection.close().unwrap();
+
+    let prepared = prepare_source(&source, &temporary.path().join("work")).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let chats = database.list_chats(None, 10).unwrap();
+    let system_only = chats
+        .items
+        .iter()
+        .find(|chat| chat.id == "system-only")
+        .unwrap();
+    assert_eq!(system_only.message_count, 1);
+    assert_eq!(system_only.human_message_count, 0);
+}
+
+#[test]
+fn resolves_companion_and_rename_titles_and_enriches_message_images() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    add_chat_title_fixtures(&source);
+    let work = temporary.path().join("work");
+    let prepared = prepare_source(&source, &work).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let unified_groups =
+        UnifiedGroupDatabase::open(prepared.unified_group_database_path.as_deref().unwrap())
+            .unwrap();
+
+    let mut chats = database.list_chats(None, 10).unwrap();
+    database
+        .enrich_chat_titles(&mut chats.items, Some(&unified_groups), None)
+        .unwrap();
+    let unified = chats
+        .items
+        .iter()
+        .find(|chat| chat.id == "g-unified")
+        .unwrap();
+    assert_eq!(unified.title, "Unified Room");
+    assert_eq!(unified.title_source, "unified-group");
+    let renamed = chats
+        .items
+        .iter()
+        .find(|chat| chat.id == "g-renamed")
+        .unwrap();
+    assert_eq!(renamed.title, "Renamed Room");
+    assert_eq!(renamed.title_source, "rename");
+
+    let mut catalog = Catalog::open(&work.join("catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .index_attachment_contexts(&database, None, Some(&unified_groups), |_| {})
+        .unwrap();
+    let groups = catalog
+        .list_cleanup_groups(1, 24, None, "all", "group", "recent")
+        .unwrap();
+    assert!(
+        groups
+            .items
+            .iter()
+            .any(|group| group.chat_title == "Unified Room")
+    );
+
+    let mut messages = database.list_messages(8, None, 10).unwrap();
+    catalog
+        .enrich_messages_with_attachments(&mut messages.items)
+        .unwrap();
+    assert_eq!(messages.items[0].attachments.len(), 1);
+    assert_eq!(
+        messages.items[0].attachments[0].kind,
+        AttachmentKind::Original
+    );
+}
+
+#[test]
+fn catalogs_attachments_on_disk_and_persists_plan() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let catalog_path = temporary.path().join("work/catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    let stats = catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    assert_eq!(stats.attachment_count, 2);
+
+    let page = catalog
+        .list_attachments(None, 10, Some(AttachmentKind::Original), None)
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].message_id, "12345678");
+    assert_eq!(page.items[0].chat_hint, "u1");
+    catalog.set_marked(&page.items[0].path, true).unwrap();
+    assert_eq!(catalog.stats().unwrap().marked_count, 1);
+    drop(catalog);
+
+    let catalog = Catalog::open(&catalog_path).unwrap();
+    assert!(
+        catalog
+            .list_attachments(None, 10, None, Some("12345678"))
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.marked_for_removal)
+    );
+}
+
+#[test]
+fn cleanup_groups_match_web_reference_and_marking_semantics() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let private_store = source.join(
+        "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test",
+    );
+    let uncertain = private_store.join("Message Attachments/other-chat/12345678.png");
+    let unreferenced = private_store.join("Message Attachments/other-chat/87654321.png");
+    fs::create_dir_all(uncertain.parent().unwrap()).unwrap();
+    fs::write(&uncertain, b"uncertain").unwrap();
+    fs::write(&unreferenced, b"unreferenced").unwrap();
+
+    let prepared = prepare_source(&source, &temporary.path().join("work")).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let mut catalog = Catalog::open(&temporary.path().join("work/cleanup-catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    let progress = catalog
+        .index_attachment_contexts(&database, None, None, |_| {})
+        .unwrap();
+    assert_eq!(progress.referenced_files, 2);
+    assert_eq!(progress.unconfirmed_files, 1);
+    assert_eq!(progress.unreferenced_files, 1);
+
+    let overview = catalog.cleanup_overview().unwrap();
+    let category = |name: &str| {
+        overview
+            .categories
+            .iter()
+            .find(|total| total.category == name)
+            .unwrap()
+            .file_count
+    };
+    assert_eq!(category("all"), 4);
+    assert_eq!(category("individual"), 2);
+    assert_eq!(category("unconfirmed"), 1);
+    assert_eq!(category("unreferenced"), 1);
+
+    let groups = catalog
+        .list_cleanup_groups(1, 24, None, "all", "all", "recent")
+        .unwrap();
+    assert_eq!(groups.total_items, 3);
+    assert_eq!(groups.page_size, 24);
+    let referenced_group = groups
+        .items
+        .iter()
+        .find(|group| group.reference_status == "referenced")
+        .unwrap();
+    assert_eq!(referenced_group.key, "chat:u1");
+    assert!(referenced_group.has_original);
+    assert!(referenced_group.has_thumbnail);
+    assert!(!referenced_group.keeping_thumbnails);
+
+    let reviews = catalog
+        .list_cleanup_reviews("chat:u1", 1, 24, None, "all", "all", "recent")
+        .unwrap();
+    assert_eq!(reviews.total_items, 1);
+    assert_eq!(reviews.items[0].files.len(), 2);
+    assert_eq!(reviews.items[0].files[0].kind, AttachmentKind::Original);
+    assert_eq!(reviews.items[0].files[1].kind, AttachmentKind::Thumbnail);
+    assert_eq!(
+        reviews.items[0].context.as_ref().unwrap().text,
+        "photo context"
+    );
+
+    let overview = catalog
+        .apply_cleanup_group_action("chat:u1", "keep_thumbnail")
+        .unwrap();
+    assert_eq!(overview.marked_count, 1);
+    let groups = catalog
+        .list_cleanup_groups(1, 24, None, "all", "all", "recent")
+        .unwrap();
+    assert!(
+        groups
+            .items
+            .iter()
+            .find(|group| group.key == "chat:u1")
+            .unwrap()
+            .keeping_thumbnails
+    );
+    let files = catalog
+        .list_cleanup_reviews("chat:u1", 1, 24, None, "all", "all", "recent")
+        .unwrap()
+        .items
+        .remove(0)
+        .files;
+    assert!(files[0].marked_for_removal);
+    assert!(!files[1].marked_for_removal);
+
+    let overview = catalog
+        .apply_cleanup_group_action("chat:u1", "keep_thumbnail")
+        .unwrap();
+    assert_eq!(overview.marked_count, 0);
+    let overview = catalog
+        .apply_cleanup_group_action("chat:u1", "toggle_all")
+        .unwrap();
+    assert_eq!(overview.marked_count, 2);
+    let overview = catalog
+        .apply_cleanup_group_action("chat:u1", "toggle_all")
+        .unwrap();
+    assert_eq!(overview.marked_count, 0);
+}
+
+#[test]
+fn cleanup_context_includes_line_square_communities() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    add_square_fixture(&source);
+    let prepared = prepare_source(&source, &temporary.path().join("work")).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let square_database =
+        LineSquareDatabase::open(prepared.square_database_path.as_deref().unwrap()).unwrap();
+    let chats = square_database.list_chats(None, 10).unwrap();
+    assert_eq!(chats.items.len(), 1);
+    assert_eq!(chats.items[0].source, "square");
+    assert_eq!(chats.items[0].kind, "community");
+    assert_eq!(chats.items[0].title, "Square A");
+    assert_eq!(chats.items[0].message_count, 2);
+    let messages = square_database
+        .list_messages(8, None, 10, prepared.account_id.as_deref())
+        .unwrap();
+    assert_eq!(messages.items.len(), 2);
+    assert_eq!(messages.items[0].sender_name, "Square Sender");
+    assert!(!messages.items[0].is_self);
+    assert!(messages.items[1].is_self);
+    let mut catalog = Catalog::open(&temporary.path().join("work/square-catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .index_attachment_contexts(&database, Some(&square_database), None, |_| {})
+        .unwrap();
+
+    let overview = catalog.cleanup_overview().unwrap();
+    assert_eq!(
+        overview
+            .categories
+            .iter()
+            .find(|total| total.category == "community")
+            .unwrap()
+            .file_count,
+        1
+    );
+    let groups = catalog
+        .list_cleanup_groups(1, 24, None, "all", "community", "recent")
+        .unwrap();
+    assert_eq!(groups.total_items, 1);
+    assert_eq!(groups.items[0].chat_title, "Square A");
+    assert_eq!(groups.items[0].chat_kind, "community");
+    let reviews = catalog
+        .list_cleanup_reviews(
+            &groups.items[0].key,
+            1,
+            24,
+            None,
+            "all",
+            "community",
+            "recent",
+        )
+        .unwrap();
+    assert_eq!(
+        reviews.items[0].context.as_ref().unwrap().sender_name,
+        "Square Sender"
+    );
+}
+
+#[test]
+fn stages_only_sqlite_from_imazing_archive() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    add_square_fixture(&source);
+    add_chat_title_fixtures(&source);
+    let database = inspect_source(&source).unwrap().database_path;
+    let square_database = Path::new(&database)
+        .with_file_name("LineSquare.sqlite")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let unified_group_database = Path::new(&database)
+        .with_file_name("UnifiedGroup.sqlite")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let archive_path = temporary.path().join("LINE.imazingapp");
+    let archive_file = fs::File::create(&archive_path).unwrap();
+    let mut archive = zip::ZipWriter::new(archive_file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    archive.start_file(&database, options).unwrap();
+    let database_bytes = fs::read(source.join(&database)).unwrap();
+    archive.write_all(&database_bytes).unwrap();
+    archive.start_file(&square_database, options).unwrap();
+    archive
+        .write_all(&fs::read(source.join(&square_database)).unwrap())
+        .unwrap();
+    archive
+        .start_file(&unified_group_database, options)
+        .unwrap();
+    archive
+        .write_all(&fs::read(source.join(&unified_group_database)).unwrap())
+        .unwrap();
+    archive
+        .start_file(
+            "Container/AppGroups/group.com.linecorp.line/Message Attachments/c1/99999999.jpg",
+            options,
+        )
+        .unwrap();
+    archive.write_all(b"media should not be staged").unwrap();
+    archive.finish().unwrap();
+
+    let report = inspect_source(&archive_path).unwrap();
+    assert_eq!(report.kind, SourceKind::ImazingArchive);
+    let work = temporary.path().join("work");
+    let prepared = prepare_source(&archive_path, &work).unwrap();
+    assert!(prepared.database_path.is_file());
+    let staged_files = fs::read_dir(prepared.staging_directory.unwrap())
+        .unwrap()
+        .count();
+    assert_eq!(staged_files, 3);
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    assert_eq!(database.list_messages(7, None, 10).unwrap().items.len(), 4);
+    assert!(prepared.square_database_path.unwrap().is_file());
+    assert!(prepared.unified_group_database_path.unwrap().is_file());
+}
+
+#[test]
+fn stages_bounded_image_previews_from_directory_and_archive() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let catalog_path = temporary.path().join("directory-work/catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    let original = catalog
+        .list_attachments(None, 10, Some(AttachmentKind::Original), None)
+        .unwrap()
+        .items
+        .remove(0);
+    let preview = catalog
+        .stage_attachment_preview(&source, SourceKind::Directory, &original.path)
+        .unwrap();
+    assert_eq!(preview.media_type, "image/jpeg");
+    assert_eq!(preview.bytes, original.bytes);
+    assert!(Path::new(&preview.staged_path).is_file());
+
+    let database = inspect_source(&source).unwrap().database_path;
+    let archive_path = temporary.path().join("LINE.imazingapp");
+    let archive_file = fs::File::create(&archive_path).unwrap();
+    let mut archive = zip::ZipWriter::new(archive_file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    archive.start_file(&database, options).unwrap();
+    archive
+        .write_all(&fs::read(source.join(&database)).unwrap())
+        .unwrap();
+    archive.start_file(&original.path, options).unwrap();
+    archive
+        .write_all(&fs::read(source.join(&original.path)).unwrap())
+        .unwrap();
+    archive.finish().unwrap();
+
+    let archive_catalog_path = temporary.path().join("archive-work/catalog.sqlite");
+    let mut archive_catalog = Catalog::open(&archive_catalog_path).unwrap();
+    archive_catalog
+        .scan_source(&archive_path, SourceKind::ImazingArchive, |_| {})
+        .unwrap();
+    let preview = archive_catalog
+        .stage_attachment_preview(&archive_path, SourceKind::ImazingArchive, &original.path)
+        .unwrap();
+    assert_eq!(preview.media_type, "image/jpeg");
+    assert_eq!(
+        fs::read(&preview.staged_path).unwrap(),
+        b"\xff\xd8\xffimage123"
+    );
+    assert!(
+        Path::new(&preview.staged_path)
+            .parent()
+            .unwrap()
+            .ends_with("preview-cache")
+    );
+}
+
+#[test]
+fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    add_square_fixture(&source);
+    let work = temporary.path().join("work");
+    let mut session = NativeSession::open(&source, &work).unwrap();
+    let requests = concat!(
+        "{\"id\":\"1\",\"method\":\"listChats\",\"params\":{\"limit\":1}}\n",
+        "{\"id\":\"2\",\"method\":\"listMessages\",\"params\":{\"chatPk\":7,\"limit\":2}}\n",
+        "{\"id\":\"3\",\"method\":\"searchMessages\",\"params\":{\"query\":\"photo\",\"limit\":10}}\n",
+        "{\"id\":\"4\",\"method\":\"listMessages\",\"params\":{\"chatPk\":7,\"limit\":1001}}\n",
+        "{\"id\":\"5\",\"method\":\"scanCatalog\"}\n",
+        "{\"id\":\"6\",\"method\":\"listAttachments\",\"params\":{\"limit\":10}}\n",
+        "{\"id\":\"7\",\"method\":\"stageAttachmentPreview\",\"params\":{\"path\":\"Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Message Attachments/u1/12345678.jpg\"}}\n",
+        "{\"id\":\"9\",\"method\":\"listMessages\",\"params\":{\"chatPk\":7,\"limit\":10}}\n",
+        "{\"id\":\"10\",\"method\":\"listChats\",\"params\":{\"limit\":10}}\n",
+        "{\"id\":\"11\",\"method\":\"listMessages\",\"params\":{\"source\":\"square\",\"chatPk\":8,\"limit\":10}}\n",
+        "{\"id\":\"8\",\"method\":\"shutdown\"}\n"
+    );
+    let mut input = std::io::BufReader::new(requests.as_bytes());
+    let mut output = Vec::new();
+    serve(&mut session, &mut input, &mut output).unwrap();
+    let rows: Vec<serde_json::Value> = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(rows[0]["event"], "ready");
+    let response = |id: &str| {
+        rows.iter()
+            .find(|row| row["id"] == id)
+            .expect("response ID exists")
+    };
+    assert_eq!(
+        response("1")["result"]["items"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        response("2")["result"]["items"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(response("2")["result"]["items"][0]["isSelf"], false);
+    assert_eq!(response("2")["result"]["items"][1]["isSelf"], true);
+    assert_eq!(response("3")["result"]["items"][0]["id"], "12345678");
+    assert_eq!(response("4")["ok"], false);
+    assert_eq!(response("4")["error"]["code"], "operation_failed");
+    let attachment = response("6")["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["messageId"] == "12345678")
+        .expect("linked attachment exists");
+    assert_eq!(attachment["context"]["text"], "photo context");
+    assert_eq!(response("7")["result"]["mediaType"], "image/jpeg");
+    let photo_message = response("9")["result"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "12345678")
+        .unwrap();
+    assert_eq!(photo_message["attachments"].as_array().unwrap().len(), 2);
+    let chats = response("10")["result"]["items"].as_array().unwrap();
+    assert!(
+        chats
+            .iter()
+            .any(|chat| chat["source"] == "square" && chat["kind"] == "community")
+    );
+    let square_messages = response("11")["result"]["items"].as_array().unwrap();
+    assert_eq!(square_messages.len(), 2);
+    assert_eq!(square_messages[0]["source"], "square");
+    assert_eq!(square_messages[0]["isSelf"], false);
+    assert_eq!(square_messages[1]["isSelf"], true);
+    assert_eq!(response("8")["result"]["shuttingDown"], true);
+}
+
+#[test]
+fn builds_valid_directory_candidate_without_marked_attachment() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let catalog_path = temporary.path().join("work/catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    let thumbnail = catalog
+        .list_attachments(None, 10, Some(AttachmentKind::Thumbnail), None)
+        .unwrap()
+        .items
+        .remove(0);
+    catalog.set_marked(&thumbnail.path, true).unwrap();
+
+    let output = temporary.path().join("LINE-slim.imazingapp");
+    let report = build_candidate(&source, &output, &catalog, true, |_| Ok(())).unwrap();
+    assert_eq!(report.removed_entries, 1);
+    assert!(report.full_crc_verified);
+    assert!(!output.with_extension("imazingapp.partial").exists());
+    let file = fs::File::open(output).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    assert!(archive.by_name(&thumbnail.path).is_err());
+    assert!(
+        archive
+            .file_names()
+            .any(|name| name.ends_with("/Messages/Line.sqlite"))
+    );
+}
+
+#[test]
+fn raw_copies_archive_candidate_and_removes_marked_entry() {
+    let temporary = TempDir::new().unwrap();
+    let source_directory = make_fixture(temporary.path());
+    let database = inspect_source(&source_directory).unwrap().database_path;
+    let removable =
+        "Container/AppGroups/group.com.linecorp.line/Message Thumbnails/c1/99999999.thumb";
+    let archive_path = temporary.path().join("LINE.imazingapp");
+    let archive_file = fs::File::create(&archive_path).unwrap();
+    let mut writer = zip::ZipWriter::new(archive_file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file(".lock", options).unwrap();
+    writer.write_all(b"lock").unwrap();
+    writer
+        .start_file("Payload/LINE.app/Info.plist", options)
+        .unwrap();
+    writer.write_all(b"plist").unwrap();
+    writer.start_file(&database, options).unwrap();
+    writer
+        .write_all(&fs::read(source_directory.join(&database)).unwrap())
+        .unwrap();
+    writer.start_file(removable, options).unwrap();
+    writer.write_all(b"remove me").unwrap();
+    writer.finish().unwrap();
+
+    let catalog_path = temporary.path().join("archive-work/catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&archive_path, SourceKind::ImazingArchive, |_| {})
+        .unwrap();
+    catalog.set_marked(removable, true).unwrap();
+    let output = temporary.path().join("LINE-raw-copy.imazingapp");
+    let report = build_candidate(&archive_path, &output, &catalog, true, |_| Ok(())).unwrap();
+    assert_eq!(report.removed_entries, 1);
+    assert_eq!(report.input_entries - report.output_entries, 1);
+    let mut archive = zip::ZipArchive::new(fs::File::open(output).unwrap()).unwrap();
+    assert!(archive.by_name(removable).is_err());
+    let mut lock = Vec::new();
+    archive
+        .by_name(".lock")
+        .unwrap()
+        .read_to_end(&mut lock)
+        .unwrap();
+    assert_eq!(lock, b"lock");
+}
+
+#[test]
+fn hashes_only_same_size_candidates_and_pages_duplicate_members() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let attachment_root = source.join(
+        "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test",
+    );
+    let first = attachment_root.join("Message Attachments/c999/88888888.bin");
+    let second = attachment_root.join("Message Thumbnails/c999/88888888.thumb");
+    fs::create_dir_all(first.parent().unwrap()).unwrap();
+    fs::create_dir_all(second.parent().unwrap()).unwrap();
+    fs::write(&first, b"duplicate").unwrap();
+    fs::write(&second, b"duplicate").unwrap();
+
+    let catalog_path = temporary.path().join("work/catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    let progress = catalog
+        .hash_duplicate_candidates(&source, SourceKind::Directory, |_| Ok(()))
+        .unwrap();
+    assert_eq!(progress.candidate_files, 2);
+    assert_eq!(progress.processed_files, 2);
+
+    let groups = catalog.list_duplicate_groups(None, 10).unwrap();
+    assert_eq!(groups.items.len(), 1);
+    assert_eq!(groups.items[0].file_count, 2);
+    assert_eq!(groups.items[0].reclaimable_bytes, 9);
+    assert!(groups.items[0].has_original);
+    assert!(groups.items[0].has_thumbnail);
+    let members = catalog
+        .list_duplicate_members(&groups.items[0].sha256, None, 1)
+        .unwrap();
+    assert_eq!(members.items.len(), 1);
+    assert!(members.next_cursor.is_some());
+    let rest = catalog
+        .list_duplicate_members(&groups.items[0].sha256, members.next_cursor, 10)
+        .unwrap();
+    assert_eq!(rest.items.len(), 1);
+
+    let resumed = catalog
+        .hash_duplicate_candidates(&source, SourceKind::Directory, |_| Ok(()))
+        .unwrap();
+    assert_eq!(resumed.candidate_files, 0);
+    assert_eq!(resumed.processed_files, 0);
+}

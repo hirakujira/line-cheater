@@ -1,0 +1,27 @@
+[package]
+name = "line-backup-native"
+version = "0.1.0"
+edition = "2024"
+description = "Bounded-memory native core for browsing and slimming LINE iOS backups"
+license = "MIT"
+
+[lib]
+name = "line_backup_native"
+path = "src/lib.rs"
+
+[[bin]]
+name = "line-backup-native"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+walkdir = "2.5"
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3.23"
