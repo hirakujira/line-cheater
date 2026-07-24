@@ -29,7 +29,7 @@
           </p>
 
           <div class="source-options" aria-label="備份來源類型">
-            <button class="source-option is-recommended" data-source="archive" type="button">
+            <button class="source-option is-recommended" data-source="archive" type="button" aria-pressed="false">
               <span class="source-option-icon" aria-hidden="true">▣</span>
               <span class="source-option-copy">
                 <span class="source-option-title">
@@ -39,7 +39,7 @@
                 <small>iMazing 匯出的完整備份</small>
               </span>
             </button>
-            <button class="source-option" data-source="directory" type="button">
+            <button class="source-option" data-source="directory" type="button" aria-pressed="false">
               <span class="source-option-icon" aria-hidden="true">⌁</span>
               <span class="source-option-copy">
                 <span class="source-option-title">
@@ -152,13 +152,19 @@
                     <h3>聊天室</h3>
                   </div>
                 </div>
+                <div class="panel-status-row">
+                  <p id="chat-list-status" class="panel-status" role="status" aria-live="polite">
+                    載入備份後顯示聊天室。
+                  </p>
+                  <button id="retry-chats" class="retry-button hidden" type="button">重試</button>
+                </div>
                 <div id="chats" class="chat-list" role="listbox" aria-label="聊天室列表">
                   <div class="empty-state">載入備份後顯示聊天室。</div>
                 </div>
                 <nav class="chat-pagination" aria-label="聊天室分頁">
-                  <button id="previous-chats" disabled>上一頁</button>
-                  <span id="chat-page-info">第 1 頁</span>
-                  <button id="next-chats" disabled>下一頁</button>
+                  <button id="previous-chats" type="button" aria-label="聊天室上一頁" disabled>上一頁</button>
+                  <span id="chat-page-info" aria-live="polite">第 1 頁</span>
+                  <button id="next-chats" type="button" aria-label="聊天室下一頁" disabled>下一頁</button>
                 </nav>
               </aside>
 
@@ -169,15 +175,19 @@
                     <p id="selected-chat-meta" class="muted small">請從左側選取聊天室開始。</p>
                   </div>
                   <div class="message-pagination" aria-label="訊息分頁">
-                    <button id="previous-messages" disabled>上一頁</button>
-                    <button id="next-messages" disabled>下一頁</button>
+                    <button id="previous-messages" type="button" aria-label="訊息上一頁" disabled>上一頁</button>
+                    <button id="next-messages" type="button" aria-label="訊息下一頁" disabled>下一頁</button>
                   </div>
                 </div>
                 <form id="search-form" class="search message-search">
                   <input id="search-query" maxlength="1024" placeholder="搜尋目前聊天室的訊息文字">
                   <button type="submit" disabled>搜尋</button>
+                  <button id="clear-search" type="button" disabled>清除</button>
                 </form>
-                <div id="message-status" class="message-status" aria-live="polite"></div>
+                <div class="message-status-row">
+                  <p id="message-status" class="message-status" role="status" aria-live="polite"></p>
+                  <button id="retry-messages" class="retry-button hidden" type="button">重試</button>
+                </div>
                 <div id="messages" class="message-list" aria-live="polite">
                   <div class="empty-state">尚未選取聊天室。</div>
                 </div>

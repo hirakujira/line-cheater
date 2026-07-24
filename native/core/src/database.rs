@@ -252,13 +252,18 @@ impl LineDatabase {
         } else {
             format!(" WHERE {message_count} > 0")
         };
+        let order_by = if before_cursor.is_some() {
+            format!(" ORDER BY {last_updated} ASC, c.Z_PK DESC")
+        } else {
+            format!(" ORDER BY {last_updated} DESC, c.Z_PK ASC")
+        };
         let sql = format!(
             "SELECT CAST(c.Z_PK AS INTEGER), {chat_id}, {chat_type}, {chat_name}, \
              {user_name}, {group_name}, {message_count}, {human_message_count}, \
              {last_updated}, {last_message}, \
              {rename_text} \
              FROM ZCHAT c{joins}{cursor_filter} \
-             ORDER BY {last_updated} DESC, c.Z_PK ASC LIMIT ?3"
+             {order_by} LIMIT ?3"
         );
         let mut statement = self.connection.prepare(&sql)?;
         let cursor = boundary.cloned().unwrap_or(ChatCursor {
@@ -308,6 +313,9 @@ impl LineDatabase {
         let has_extra = items.len() > limit;
         if has_extra {
             items.pop();
+        }
+        if before_cursor.is_some() {
+            items.reverse();
         }
         let next_cursor = if (before_cursor.is_some() && !items.is_empty()) || has_extra {
             items.last().map(|chat| ChatCursor {
@@ -1181,11 +1189,16 @@ impl LineSquareDatabase {
         } else {
             format!(" WHERE {message_count} > 0")
         };
+        let order_by = if before_cursor.is_some() {
+            format!(" ORDER BY {last_updated} ASC, c.Z_PK DESC")
+        } else {
+            format!(" ORDER BY {last_updated} DESC, c.Z_PK ASC")
+        };
         let sql = format!(
             "SELECT CAST(c.Z_PK AS INTEGER), {chat_id}, {chat_type}, {chat_name}, \
              {square_name}, {message_count}, {human_message_count}, {last_updated}, \
              {last_message} FROM ZCHAT c{join}{cursor_filter} \
-             ORDER BY {last_updated} DESC, c.Z_PK ASC LIMIT ?3"
+             {order_by} LIMIT ?3"
         );
         let cursor = boundary.cloned().unwrap_or(ChatCursor {
             last_updated: i64::MAX,
@@ -1227,6 +1240,9 @@ impl LineSquareDatabase {
         let has_extra = items.len() > limit;
         if has_extra {
             items.pop();
+        }
+        if before_cursor.is_some() {
+            items.reverse();
         }
         let next_cursor = if (before_cursor.is_some() && !items.is_empty()) || has_extra {
             items.last().map(|chat| ChatCursor {

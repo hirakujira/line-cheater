@@ -7,22 +7,29 @@ let chatCursor = null;
 let chatBeforeCursor = null;
 let chatPageNumber = 1;
 let chatLoading = false;
+let chatRequestGeneration = 0;
+let chatRetryDirection = "initial";
 let messageCursor = null;
 let messageBeforeCursor = null;
 let messagePageNumber = 1;
 let messageLoading = false;
+let messageRequestGeneration = 0;
+let messageRetryDirection = "initial";
 let selectedChatPk = null;
 let selectedChat = null;
+let selectedChatGeneration = 0;
 let activeSearch = null;
 let activeSourceBytes = 0;
 let activeWorkspaceView = "browse";
 let selectedSourceKind = null;
+let sourceGeneration = 0;
 let messageRenderGeneration = 0;
 let packageInProgress = false;
 let imageModalTrigger = null;
 let cleanupPage = null;
 let cleanupOverview = null;
 let cleanupLoading = false;
+let cleanupReloadPending = false;
 let cleanupSearchTimer = null;
 let cleanupResizeTimer = null;
 let cleanupRenderGeneration = 0;
@@ -76,6 +83,8 @@ const elements = {
   status: document.querySelector("#status"),
   sessionSummary: document.querySelector("#session-summary"),
   chats: document.querySelector("#chats"),
+  chatListStatus: document.querySelector("#chat-list-status"),
+  retryChats: document.querySelector("#retry-chats"),
   messages: document.querySelector("#messages"),
   selectedChatTitle: document.querySelector("#selected-chat-title"),
   selectedChatMeta: document.querySelector("#selected-chat-meta"),
@@ -91,6 +100,8 @@ const elements = {
   searchForm: document.querySelector("#search-form"),
   searchQuery: document.querySelector("#search-query"),
   searchButton: document.querySelector("#search-form button"),
+  clearSearch: document.querySelector("#clear-search"),
+  retryMessages: document.querySelector("#retry-messages"),
   progress: document.querySelector("#progress"),
   catalogSummary: document.querySelector("#catalog-summary"),
   cleanupSearch: document.querySelector("#cleanup-search"),
@@ -399,7 +410,41 @@ function emptyState(message) {
   return empty;
 }
 
+function setRetryVisible(button, visible) {
+  button.classList.toggle("hidden", !visible);
+}
+
+function setChatPanelBusy(isBusy) {
+  elements.chats.setAttribute("aria-busy", String(isBusy));
+  elements.previousChats.disabled = isBusy || !chatBeforeCursor;
+  elements.nextChats.disabled = isBusy || !chatCursor;
+}
+
+function setMessagePanelBusy(isBusy) {
+  elements.messages.setAttribute("aria-busy", String(isBusy));
+  elements.previousMessages.disabled = isBusy || !messageBeforeCursor;
+  elements.nextMessages.disabled = isBusy || !messageCursor;
+  elements.searchButton.disabled = isBusy || !selectedChat;
+  elements.clearSearch.disabled = isBusy || !activeSearch;
+}
+
+function renderChatLoadError() {
+  elements.chatListStatus.textContent = "聊天室載入失敗，請重試。";
+  elements.chatListStatus.classList.add("error");
+  elements.chats.replaceChildren(emptyState("暫時無法載入聊天室。請確認備份仍可讀取，或按「重試」。"));
+  setRetryVisible(elements.retryChats, true);
+}
+
+function renderMessageLoadError() {
+  elements.messageStatus.textContent = "訊息載入失敗，請重試。";
+  elements.messageStatus.classList.add("error");
+  elements.messages.replaceChildren(emptyState("暫時無法載入訊息。請確認備份仍可讀取，或按「重試」。"));
+  setRetryVisible(elements.retryMessages, true);
+}
+
 async function openSource(kind) {
+  const requestSourceGeneration = ++sourceGeneration;
+  const hadProvider = Boolean(provider);
   showLoadModal("請在系統視窗選擇 LINE 備份來源。");
   updateLoadModalProgress(2);
   await waitForUiPaint();
@@ -407,22 +452,28 @@ async function openSource(kind) {
     setStatus("正在開啟備份…");
     const ready = await bridge.selectSource(kind);
     if (!ready) {
-      setStatus("已取消。");
+      setStatus(hadProvider ? "已取消，保留目前備份。" : "已取消選擇備份。");
       closeLoadModal();
       return;
     }
+    if (requestSourceGeneration !== sourceGeneration) return;
     elements.enterWorkspace.disabled = true;
     elements.sourceReadyCard.classList.add("hidden");
     elements.sessionSummary.classList.add("hidden");
     updateLoadModalProgress(12, "正在以唯讀模式開啟 SQLite…");
     provider = new NativeDataProvider(bridge);
+    chatRequestGeneration += 1;
+    messageRequestGeneration += 1;
+    selectedChatGeneration += 1;
     chatCursor = chatBeforeCursor = messageCursor = messageBeforeCursor = null;
     chatPageNumber = messagePageNumber = 1;
+    chatRetryDirection = messageRetryDirection = "initial";
     chatLoading = messageLoading = false;
     selectedChatPk = activeSearch = selectedChat = null;
     advancedReport = null;
     messageRenderGeneration += 1;
     disposeCleanupAlbum();
+    cleanupReloadPending = false;
     cleanupPage = cleanupOverview = null;
     Object.assign(cleanupState, {
       page: 1,
@@ -439,10 +490,14 @@ async function openSource(kind) {
     elements.cleanupSort.value = "recent";
     elements.cleanupList.replaceChildren(emptyState("請先掃描附件。"));
     elements.chats.replaceChildren(emptyState("正在載入聊天室…"));
+    elements.chatListStatus.textContent = "正在整理聊天室…";
+    setRetryVisible(elements.retryChats, false);
     elements.messages.replaceChildren(emptyState("尚未選取聊天室。"));
     elements.selectedChatTitle.textContent = "選取聊天室";
     elements.selectedChatMeta.textContent = "請從左側選取聊天室開始。";
     elements.messageStatus.textContent = "";
+    setRetryVisible(elements.retryMessages, false);
+    elements.clearSearch.disabled = true;
     elements.previousMessages.disabled = true;
     elements.nextMessages.disabled = true;
     const info = await provider.sessionInfo();
@@ -452,7 +507,7 @@ async function openSource(kind) {
     const sourceSize = Number(info.source.sourceBytes) || Number(info.source.databaseBytes) || 0;
     updateLoadModalProgress(20, "正在整理聊天室名稱與附件索引…");
     elements.scanCatalog.disabled = false;
-    elements.searchButton.disabled = false;
+    elements.searchButton.disabled = true;
     setCandidateBuildDisabled(true);
     if (kind !== "sqlite" &&
         (info.catalog.scanStatus !== "complete" || info.catalog.attachmentCount === 0)) {
@@ -481,7 +536,9 @@ async function openSource(kind) {
     elements.sourceReadyCard.classList.remove("hidden");
     elements.enterWorkspace.disabled = false;
     for (const button of document.querySelectorAll("[data-source]")) {
-      button.classList.toggle("is-selected", button.dataset.source === selectedSourceKind);
+      const selected = button.dataset.source === selectedSourceKind;
+      button.classList.toggle("is-selected", selected);
+      button.setAttribute("aria-pressed", String(selected));
     }
     await waitForUiPaint();
     closeLoadModal();
@@ -548,14 +605,26 @@ function renderChatItem(chat) {
 }
 
 async function loadChats(direction = "initial") {
-  if (chatLoading || !provider) return;
+  if (!provider || (chatLoading && direction !== "initial")) return;
+  const currentProvider = provider;
+  const currentSourceGeneration = sourceGeneration;
+  const requestGeneration = ++chatRequestGeneration;
   chatLoading = true;
+  chatRetryDirection = direction;
   const cursor = direction === "next" ? chatCursor : null;
   const beforeCursor = direction === "previous" ? chatBeforeCursor : null;
+  let succeeded = false;
+  setChatPanelBusy(true);
+  elements.chatListStatus.textContent = "正在載入聊天室…";
+  setRetryVisible(elements.retryChats, false);
   try {
-    const page = await provider.listChats({ limit: 100, cursor, beforeCursor });
+    const page = await currentProvider.listChats({ limit: 100, cursor, beforeCursor });
+    if (requestGeneration !== chatRequestGeneration ||
+        currentSourceGeneration !== sourceGeneration ||
+        currentProvider !== provider) return;
     replaceChildren(elements.chats, page.items, renderChatItem);
-    chatBeforeCursor = chatCursorFor(page.items[0]);
+    elements.chatListStatus.classList.remove("error");
+    chatBeforeCursor = page.items.length ? chatCursorFor(page.items[0]) : null;
     chatCursor = page.nextCursor;
     if (direction === "previous") chatPageNumber = Math.max(1, chatPageNumber - 1);
     else if (direction === "next") chatPageNumber += 1;
@@ -565,15 +634,37 @@ async function loadChats(direction = "initial") {
     elements.chatPageInfo.textContent = page.items.length
       ? `第 ${chatPageNumber} 頁 · ${page.items.length.toLocaleString()} 個聊天室`
       : "沒有聊天室";
+    elements.chatListStatus.textContent = page.items.length
+      ? `${page.items.length.toLocaleString()} 個聊天室 · ` +
+        `${page.hasPrevious ? "可往前翻頁" : "已是最前頁"} · ` +
+        `${chatCursor ? "可往後翻頁" : "已是最後頁"}`
+      : "沒有可顯示的聊天室。";
+    setRetryVisible(elements.retryChats, false);
+    succeeded = true;
+  } catch (error) {
+    if (requestGeneration !== chatRequestGeneration ||
+        currentSourceGeneration !== sourceGeneration ||
+        currentProvider !== provider) return;
+    setStatus(`聊天室載入失敗：${error.message}`, true);
+    renderChatLoadError();
   } finally {
-    chatLoading = false;
+    if (requestGeneration === chatRequestGeneration) {
+      chatLoading = false;
+      elements.chats.removeAttribute("aria-busy");
+      if (!succeeded) {
+        elements.previousChats.disabled = true;
+        elements.nextChats.disabled = true;
+      }
+    }
   }
 }
 
 async function selectChat(chat) {
+  const selectionGeneration = ++selectedChatGeneration;
   selectedChat = chat;
   selectedChatPk = chat.pk;
   activeSearch = null;
+  elements.searchQuery.value = "";
   messageCursor = messageBeforeCursor = null;
   messagePageNumber = 1;
   elements.selectedChatTitle.textContent = chat.title;
@@ -587,36 +678,78 @@ async function selectChat(chat) {
   }
   elements.messages.replaceChildren(emptyState("正在讀取訊息…"));
   elements.messageStatus.textContent = "正在讀取訊息…";
+  setRetryVisible(elements.retryMessages, false);
+  elements.clearSearch.disabled = true;
   elements.previousMessages.disabled = true;
   elements.nextMessages.disabled = true;
-  await loadMessages("initial");
+  await loadMessages("initial", selectionGeneration);
 }
 
-async function loadMessages(direction = "initial") {
-  if (messageLoading || !provider) return;
+async function loadMessages(direction = "initial", requestedSelectionGeneration = selectedChatGeneration) {
+  if (!provider || (messageLoading && direction !== "initial")) return;
   if (selectedChatPk === null || !selectedChat) return;
+  const currentProvider = provider;
+  const currentSourceGeneration = sourceGeneration;
+  const currentChat = selectedChat;
+  const currentChatPk = selectedChatPk;
+  const currentSearch = activeSearch;
+  const requestGeneration = ++messageRequestGeneration;
   messageLoading = true;
+  messageRetryDirection = direction;
   const cursor = direction === "next" ? messageCursor : null;
   const beforeCursor = direction === "previous" ? messageBeforeCursor : null;
+  let succeeded = false;
+  setMessagePanelBusy(true);
+  elements.messageStatus.textContent = currentSearch
+    ? `正在搜尋「${currentSearch}」…`
+    : "正在讀取訊息…";
+  setRetryVisible(elements.retryMessages, false);
   try {
-    if (activeSearch) {
-      renderMessagePage(await provider.searchMessages(activeSearch, {
-        chatPk: selectedChatPk,
-        source: selectedChat.source || "line",
+    const page = currentSearch
+      ? await currentProvider.searchMessages(currentSearch, {
+        chatPk: currentChatPk,
+        source: currentChat.source || "line",
         limit: 180,
         cursor,
         beforeCursor
-      }), direction);
-      return;
-    }
-    renderMessagePage(await provider.listMessages(selectedChatPk, {
-      source: selectedChat.source || "line",
-      limit: 180,
-      cursor,
-      beforeCursor
-    }), direction);
+      })
+      : await currentProvider.listMessages(currentChatPk, {
+        source: currentChat.source || "line",
+        limit: 180,
+        cursor,
+        beforeCursor
+      });
+    if (requestGeneration !== messageRequestGeneration ||
+        requestedSelectionGeneration !== selectedChatGeneration ||
+        currentSourceGeneration !== sourceGeneration ||
+        currentProvider !== provider ||
+        currentChat !== selectedChat ||
+        currentChatPk !== selectedChatPk ||
+        currentSearch !== activeSearch) return;
+    renderMessagePage(page, direction);
+    elements.messageStatus.classList.remove("error");
+    setRetryVisible(elements.retryMessages, false);
+    succeeded = true;
+  } catch (error) {
+    if (requestGeneration !== messageRequestGeneration ||
+        requestedSelectionGeneration !== selectedChatGeneration ||
+        currentSourceGeneration !== sourceGeneration ||
+        currentProvider !== provider ||
+        currentChat !== selectedChat ||
+        currentChatPk !== selectedChatPk ||
+        currentSearch !== activeSearch) return;
+    setStatus(`訊息載入失敗：${error.message}`, true);
+    renderMessageLoadError();
   } finally {
-    messageLoading = false;
+    if (requestGeneration === messageRequestGeneration) {
+      messageLoading = false;
+      elements.messages.removeAttribute("aria-busy");
+      if (!succeeded) {
+        elements.previousMessages.disabled = true;
+        elements.nextMessages.disabled = true;
+        elements.searchButton.disabled = !selectedChat;
+      }
+    }
   }
 }
 
@@ -628,16 +761,20 @@ function renderMessagePage(page, direction = "initial") {
   } else {
     void hydrateMessagePreviews(elements.messages, renderGeneration);
   }
-  messageBeforeCursor = messageCursorFor(page.items[0]);
+  messageBeforeCursor = page.items.length ? messageCursorFor(page.items[0]) : null;
   messageCursor = page.nextCursor;
   if (direction === "previous") messagePageNumber = Math.max(1, messagePageNumber - 1);
   else if (direction === "next") messagePageNumber += 1;
   else messagePageNumber = 1;
   elements.messageStatus.textContent = page.items.length
-    ? `第 ${messagePageNumber} 頁 · 本頁顯示 ${page.items.length.toLocaleString()} 則訊息`
+    ? `${activeSearch ? `搜尋「${activeSearch}」 · ` : ""}` +
+      `第 ${messagePageNumber} 頁 · 本頁顯示 ${page.items.length.toLocaleString()} 則訊息`
     : "";
   elements.previousMessages.disabled = !page.hasPrevious;
   elements.nextMessages.disabled = !messageCursor;
+  elements.searchButton.disabled = false;
+  elements.clearSearch.disabled = !activeSearch;
+  setRetryVisible(elements.retryMessages, false);
 }
 
 function safeHttpUrl(value) {
@@ -985,7 +1122,11 @@ function cleanupOptions(overrides) {
 }
 
 async function loadCleanupPage() {
-  if (!provider || cleanupLoading) return;
+  if (!provider) return;
+  if (cleanupLoading) {
+    cleanupReloadPending = true;
+    return;
+  }
   if (cleanupState.groupKey) {
     await loadCleanupAlbum();
     return;
@@ -1013,6 +1154,10 @@ async function loadCleanupPage() {
   } finally {
     cleanupLoading = false;
     elements.cleanupList.removeAttribute("aria-busy");
+    if (cleanupReloadPending && provider) {
+      cleanupReloadPending = false;
+      void loadCleanupPage();
+    }
   }
 }
 
@@ -1180,7 +1325,11 @@ function disposeCleanupAlbum() {
 }
 
 async function loadCleanupAlbum() {
-  if (!provider || cleanupLoading || !cleanupState.groupKey) return;
+  if (!provider || !cleanupState.groupKey) return;
+  if (cleanupLoading) {
+    cleanupReloadPending = true;
+    return;
+  }
   cleanupLoading = true;
   disposeCleanupAlbum();
   const groupKey = cleanupState.groupKey;
@@ -1203,6 +1352,10 @@ async function loadCleanupAlbum() {
   } finally {
     cleanupLoading = false;
     elements.cleanupList.removeAttribute("aria-busy");
+    if (cleanupReloadPending && provider) {
+      cleanupReloadPending = false;
+      void loadCleanupPage();
+    }
   }
 }
 
@@ -1935,6 +2088,8 @@ elements.previousChats.addEventListener("click", () => void loadChats("previous"
 elements.nextChats.addEventListener("click", () => void loadChats("next"));
 elements.previousMessages.addEventListener("click", () => void loadMessages("previous"));
 elements.nextMessages.addEventListener("click", () => void loadMessages("next"));
+elements.retryChats.addEventListener("click", () => void loadChats(chatRetryDirection));
+elements.retryMessages.addEventListener("click", () => void loadMessages(messageRetryDirection));
 elements.advancedMode.addEventListener("change", () => {
   if (elements.advancedMode.checked &&
       !window.confirm(
@@ -1966,11 +2121,20 @@ elements.searchForm.addEventListener("submit", async (event) => {
   activeSearch = elements.searchQuery.value.trim();
   messageCursor = messageBeforeCursor = null;
   messagePageNumber = 1;
+  messageRetryDirection = "initial";
   try {
     await loadMessages("initial");
   } catch (error) {
     setStatus(error.message, true);
   }
+});
+elements.clearSearch.addEventListener("click", () => {
+  if (!activeSearch || !selectedChat) return;
+  activeSearch = null;
+  elements.searchQuery.value = "";
+  messageCursor = messageBeforeCursor = null;
+  messagePageNumber = 1;
+  void loadMessages("initial");
 });
 elements.cleanupKind.addEventListener("change", updateCleanupFilter);
 elements.cleanupCategory.addEventListener("change", updateCleanupFilter);
