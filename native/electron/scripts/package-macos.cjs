@@ -100,11 +100,14 @@ function buildIcon() {
   fs.rmSync(iconset, { recursive: true, force: true });
   fs.mkdirSync(iconset, { recursive: true });
   const metadata = run("/usr/bin/sips", [
-    "-g", "pixelWidth", "-g", "pixelHeight", source
+    "-g", "pixelWidth", "-g", "pixelHeight", "-g", "hasAlpha", source
   ], { capture: true });
   if (!/pixelWidth:\s*1024\b/.test(metadata) ||
       !/pixelHeight:\s*1024\b/.test(metadata)) {
     throw new Error("The macOS icon master must be a square 1024 × 1024 PNG.");
+  }
+  if (!/hasAlpha:\s*(?:yes|true)\b/i.test(metadata)) {
+    throw new Error("The macOS icon master must have transparent rounded corners.");
   }
   for (const [filename, size] of variants) {
     run("/usr/bin/sips", [
