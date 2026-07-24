@@ -90,8 +90,8 @@ signature, verifies the bundle, and produces:
 
 ```text
 native/electron/dist/mac-<arch>/LINE Cheater.app
-native/electron/dist/LINE-Cheater-0.1.1-macOS-<arch>.zip
-native/electron/dist/LINE-Cheater-0.1.1-macOS-<arch>.dmg
+native/electron/dist/LINE-Cheater-<version>-macOS-<arch>.zip
+native/electron/dist/LINE-Cheater-<version>-macOS-<arch>.dmg
 native/electron/dist/SHA256SUMS.txt
 ```
 
@@ -102,6 +102,16 @@ Gatekeeper warning. Public distribution still requires an Apple Developer
 account, a `Developer ID Application` signature, notarization with
 `xcrun notarytool`, and ticket stapling. Build a separate `x64` runtime/sidecar
 or a verified universal bundle before claiming Intel Mac support.
+
+### Automated release
+
+Every push to `main` (including a merged pull request) runs
+`.github/workflows/release-macos-dmg.yml` on an Apple Silicon `macos-14`
+runner. The workflow increments the patch version in
+`native/core/Cargo.toml`, synchronizes `Cargo.lock` and the Electron package
+metadata, commits the version bump, builds and verifies the DMG, then publishes
+the DMG, ZIP, and `SHA256SUMS.txt` to a tag-matched GitHub Release. The
+generated version-bump commit is detected so it does not increment twice.
 
 ## Implemented UI flow
 
