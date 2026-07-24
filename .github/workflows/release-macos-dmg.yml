@@ -81,7 +81,10 @@ jobs:
           test -f "$sums"
           grep -F "  LINE-Cheater-${VERSION}-macOS-arm64.dmg" "$sums"
           grep -F "  LINE-Cheater-${VERSION}-macOS-arm64.zip" "$sums"
-          shasum -a 256 -c "$sums"
+          (
+            cd native/electron/dist
+            shasum -a 256 -c SHA256SUMS.txt
+          )
 
       - name: Publish GitHub release
         env:
