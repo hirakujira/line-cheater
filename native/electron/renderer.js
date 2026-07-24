@@ -1004,13 +1004,16 @@ function renderCleanupGroup(group) {
   toggleAll.dataset.groupKey = group.key;
   toggleAll.textContent = fullyMarked ? "取消刪除全部" : "刪除全部";
   actions.append(toggleAll);
-  if (group.hasOriginal && group.hasThumbnail) {
+  if (group.thumbnailBackedImageCount > 0) {
     const keepThumbnail = document.createElement("button");
     keepThumbnail.type = "button";
     keepThumbnail.className =
       `cleanup-group-action ${group.keepingThumbnails ? "is-cancel" : "is-delete"}`;
     keepThumbnail.dataset.groupAction = "keep_thumbnail";
     keepThumbnail.dataset.groupKey = group.key;
+    keepThumbnail.title = group.keepingThumbnails
+      ? "還原具有對應縮圖的圖片原檔"
+      : "只標記已有非空縮圖的圖片原檔；PDF、影片與無縮圖附件會保留";
     keepThumbnail.textContent = group.keepingThumbnails ? "還原原始圖片" : "只保留縮圖";
     actions.append(keepThumbnail);
   }

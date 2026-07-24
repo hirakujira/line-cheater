@@ -133,6 +133,15 @@ test("opens cleanup thumbnails in the shared image modal", () => {
   assert.match(styles, /\.cleanup-preview-open\s*\{/);
 });
 
+test("offers keep-thumbnail only for thumbnail-backed image originals", () => {
+  assert.match(renderer, /group\.thumbnailBackedImageCount > 0/);
+  assert.match(
+    renderer,
+    /PDF、影片與無縮圖附件會保留/
+  );
+  assert.doesNotMatch(renderer, /group\.hasOriginal && group\.hasThumbnail/);
+});
+
 test("does not duplicate DOM ids in the app shell", () => {
   const ids = Array.from(html.matchAll(/\sid="([^"]+)"/g), (match) => match[1]);
   assert.equal(new Set(ids).size, ids.length);

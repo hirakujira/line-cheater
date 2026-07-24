@@ -244,6 +244,7 @@ pub struct CleanupGroup {
     pub marked_count: u64,
     pub has_original: bool,
     pub has_thumbnail: bool,
+    pub thumbnail_backed_image_count: u64,
     pub keeping_thumbnails: bool,
     pub latest_timestamp: i64,
 }

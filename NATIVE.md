@@ -507,8 +507,10 @@ generated fixture tests:
   independent removal checkboxes.
 - `toggle_all` marks every file unless the group is already fully marked, in
   which case it clears every mark.
-- `keep_thumbnail` marks originals and clears thumbnail marks. Invoking it again
-  while already in that state restores the originals.
+- `keep_thumbnail` only marks SQLite-confirmed image originals with a non-empty
+  thumbnail for the same message ID and path chat. PDFs, videos, missing or
+  empty thumbnails, and unconfirmed media remain untouched. Matching thumbnail
+  marks are cleared; invoking it again restores those image originals.
 
 The UI filters `all/original/thumbnail/marked`, categories
 `all/individual/group/community/unreferenced/unconfirmed`, sorting

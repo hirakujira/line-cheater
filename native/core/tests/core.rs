@@ -440,6 +440,7 @@ fn cleanup_groups_match_web_reference_and_marking_semantics() {
     assert_eq!(referenced_group.key, "chat:u1");
     assert!(referenced_group.has_original);
     assert!(referenced_group.has_thumbnail);
+    assert_eq!(referenced_group.thumbnail_backed_image_count, 1);
     assert!(!referenced_group.keeping_thumbnails);
 
     let reviews = catalog
@@ -490,6 +491,98 @@ fn cleanup_groups_match_web_reference_and_marking_semantics() {
         .apply_cleanup_group_action("chat:u1", "toggle_all")
         .unwrap();
     assert_eq!(overview.marked_count, 0);
+}
+
+#[test]
+fn keep_thumbnail_only_marks_images_with_nonempty_matching_thumbnails() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let private_store = source.join(
+        "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test",
+    );
+    let attachments = private_store.join("Message Attachments/u1");
+    let thumbnails = private_store.join("Message Thumbnails/u1");
+
+    fs::write(attachments.join("22345678.pdf"), b"pdf").unwrap();
+    fs::write(attachments.join("32345678.mp4"), b"video without thumbnail").unwrap();
+    fs::write(attachments.join("42345678.jpg"), b"image without thumbnail").unwrap();
+    fs::write(attachments.join("52345678.mp4"), b"video with thumbnail").unwrap();
+    fs::write(thumbnails.join("52345678.thumb"), b"video thumbnail").unwrap();
+    fs::write(
+        attachments.join("62345678.jpg"),
+        b"image with empty thumbnail",
+    )
+    .unwrap();
+    fs::write(thumbnails.join("62345678.thumb"), b"").unwrap();
+
+    let database_path = private_store.join("Messages/Line.sqlite");
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "
+            INSERT INTO ZMESSAGE VALUES
+                (30, '22345678', 310, 7, 1, 0, 14, 'R', 'pdf', NULL, NULL),
+                (31, '32345678', 320, 7, 1, 0, 2, 'R', 'video no thumbnail', NULL, NULL),
+                (32, '42345678', 330, 7, 1, 0, 1, 'R', 'image no thumbnail', NULL, NULL),
+                (33, '52345678', 340, 7, 1, 0, 2, 'R', 'video thumbnail', NULL, NULL),
+                (34, '62345678', 350, 7, 1, 0, 1, 'R', 'empty thumbnail', NULL, NULL);
+            ",
+        )
+        .unwrap();
+    connection.close().unwrap();
+
+    let prepared = prepare_source(&source, &temporary.path().join("work")).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let mut catalog = Catalog::open(&temporary.path().join("work/cleanup-safety.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .index_attachment_contexts(&database, None, None, |_| {})
+        .unwrap();
+
+    let group = catalog
+        .list_cleanup_groups(1, 24, None, "all", "all", "recent")
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|group| group.key == "chat:u1")
+        .unwrap();
+    assert_eq!(group.thumbnail_backed_image_count, 1);
+
+    let overview = catalog
+        .apply_cleanup_group_action("chat:u1", "keep_thumbnail")
+        .unwrap();
+    assert_eq!(overview.marked_count, 1);
+
+    let reviews = catalog
+        .list_cleanup_reviews("chat:u1", 1, 24, None, "all", "all", "recent")
+        .unwrap();
+    let original_mark = |message_id: &str| {
+        reviews
+            .items
+            .iter()
+            .find(|review| review.message_id == message_id)
+            .unwrap()
+            .files
+            .iter()
+            .find(|file| file.kind == AttachmentKind::Original)
+            .unwrap()
+            .marked_for_removal
+    };
+    assert!(original_mark("12345678"));
+    assert!(!original_mark("22345678"));
+    assert!(!original_mark("32345678"));
+    assert!(!original_mark("42345678"));
+    assert!(!original_mark("52345678"));
+    assert!(!original_mark("62345678"));
+    assert!(
+        reviews
+            .items
+            .iter()
+            .flat_map(|review| &review.files)
+            .all(|file| { file.kind != AttachmentKind::Thumbnail || !file.marked_for_removal })
+    );
 }
 
 #[test]

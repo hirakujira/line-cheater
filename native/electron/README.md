@@ -179,8 +179,11 @@ in the native catalog.
 - Missing/ambiguous IDs and IDs found in another chat are `unconfirmed`.
 - Original and thumbnail checkboxes are separate.
 - “刪除全部” toggles the complete group.
-- “只保留縮圖” marks originals, clears thumbnail marks, and toggles back to
-  restore originals.
+- “只保留縮圖” only marks SQLite-confirmed image originals that have a
+  non-empty thumbnail for the same message and chat. It leaves PDFs, videos,
+  missing/empty-thumbnail attachments, and unconfirmed media untouched, clears
+  marks from the matching thumbnails, and toggles back to restoring those image
+  originals.
 - Filters, category cards, sorting, search, category/group pagination, and
   safety/evidence copy mirror the web UI.
 - Cleanup keeps the app workspace fixed instead of restoring a document-level

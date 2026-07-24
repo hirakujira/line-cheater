@@ -45,6 +45,38 @@ const CLEANUP_CATEGORY_EXPR: &str = "
         ELSE 'unconfirmed'
     END
 ";
+const THUMBNAIL_BACKED_IMAGE_EXPR: &str = "
+    f.attachment_kind = 'original'
+    AND f.reference_status = 'referenced'
+    AND f.message_content_type IN (1, 16, 112)
+    AND f.message_id <> ''
+    AND EXISTS (
+        SELECT 1
+        FROM files thumbnail
+        WHERE thumbnail.attachment_kind = 'thumbnail'
+          AND thumbnail.reference_status = 'referenced'
+          AND thumbnail.message_content_type IN (1, 16, 112)
+          AND thumbnail.bytes > 0
+          AND thumbnail.message_id = f.message_id
+          AND thumbnail.chat_hint = f.chat_hint
+    )
+";
+const IMAGE_THUMBNAIL_WITH_ORIGINAL_EXPR: &str = "
+    f.attachment_kind = 'thumbnail'
+    AND f.reference_status = 'referenced'
+    AND f.message_content_type IN (1, 16, 112)
+    AND f.bytes > 0
+    AND f.message_id <> ''
+    AND EXISTS (
+        SELECT 1
+        FROM files original
+        WHERE original.attachment_kind = 'original'
+          AND original.reference_status = 'referenced'
+          AND original.message_content_type IN (1, 16, 112)
+          AND original.message_id = f.message_id
+          AND original.chat_hint = f.chat_hint
+    )
+";
 const ATTACHMENT_COLUMNS: &str = "
     f.id, f.path, f.bytes, f.modified_ns, f.attachment_kind,
     f.message_id, f.chat_hint, p.path IS NOT NULL, f.reference_status,
@@ -800,7 +832,11 @@ impl Catalog {
             WITH base AS (
                 SELECT f.*, p.path IS NOT NULL AS marked,
                        {CLEANUP_GROUP_EXPR} AS group_key,
-                       {CLEANUP_CATEGORY_EXPR} AS category
+                       {CLEANUP_CATEGORY_EXPR} AS category,
+                       CASE WHEN {THUMBNAIL_BACKED_IMAGE_EXPR} THEN 1 ELSE 0 END
+                           AS thumbnail_backed_image,
+                       CASE WHEN {IMAGE_THUMBNAIL_WITH_ORIGINAL_EXPR} THEN 1 ELSE 0 END
+                           AS image_thumbnail_with_original
                 FROM files f
                 LEFT JOIN removal_plan p ON p.path = f.path
                 WHERE f.attachment_kind IS NOT NULL
@@ -842,12 +878,12 @@ impl Catalog {
                        SUM(CASE WHEN marked THEN 1 ELSE 0 END) AS marked_count,
                        MAX(CASE WHEN attachment_kind = 'original' THEN 1 ELSE 0 END) AS has_original,
                        MAX(CASE WHEN attachment_kind = 'thumbnail' THEN 1 ELSE 0 END) AS has_thumbnail,
+                       SUM(thumbnail_backed_image) AS thumbnail_backed_image_count,
                        CASE
-                           WHEN SUM(CASE WHEN attachment_kind = 'original' THEN 1 ELSE 0 END) > 0
-                            AND SUM(CASE WHEN attachment_kind = 'thumbnail' THEN 1 ELSE 0 END) > 0
-                            AND SUM(CASE WHEN attachment_kind = 'original' AND marked THEN 1 ELSE 0 END)
-                                = SUM(CASE WHEN attachment_kind = 'original' THEN 1 ELSE 0 END)
-                            AND SUM(CASE WHEN attachment_kind = 'thumbnail' AND marked THEN 1 ELSE 0 END) = 0
+                           WHEN SUM(thumbnail_backed_image) > 0
+                            AND SUM(CASE WHEN thumbnail_backed_image AND marked THEN 1 ELSE 0 END)
+                                = SUM(thumbnail_backed_image)
+                            AND SUM(CASE WHEN image_thumbnail_with_original AND marked THEN 1 ELSE 0 END) = 0
                            THEN 1 ELSE 0
                        END AS keeping_thumbnails,
                        COALESCE(MAX(message_timestamp), 0) AS latest_timestamp,
@@ -858,7 +894,8 @@ impl Catalog {
             )
             SELECT group_key, chat_id, chat_title, chat_kind, reference_status,
                    file_count, total_bytes, marked_count, has_original,
-                   has_thumbnail, keeping_thumbnails, latest_timestamp, COUNT(*) OVER()
+                   has_thumbnail, thumbnail_backed_image_count, keeping_thumbnails,
+                   latest_timestamp, COUNT(*) OVER()
             FROM grouped
             ORDER BY
                 CASE WHEN ?4 = 'size' THEN total_bytes END DESC,
@@ -1086,33 +1123,42 @@ impl Catalog {
             bail!("cleanup group action must be `toggle_all` or `keep_thumbnail`");
         }
         let predicate = format!("f.attachment_kind IS NOT NULL AND {CLEANUP_GROUP_EXPR} = ?1");
-        let (total, marked, originals, thumbnails, marked_originals, marked_thumbnails) =
-            self.connection.query_row(
-                &format!(
-                    "
+        let (
+            total,
+            marked,
+            thumbnail_backed_images,
+            marked_thumbnail_backed_images,
+            marked_image_thumbnails,
+        ) = self.connection.query_row(
+            &format!(
+                "
                     SELECT COUNT(*),
                            SUM(CASE WHEN p.path IS NOT NULL THEN 1 ELSE 0 END),
-                           SUM(CASE WHEN f.attachment_kind = 'original' THEN 1 ELSE 0 END),
-                           SUM(CASE WHEN f.attachment_kind = 'thumbnail' THEN 1 ELSE 0 END),
-                           SUM(CASE WHEN f.attachment_kind = 'original' AND p.path IS NOT NULL THEN 1 ELSE 0 END),
-                           SUM(CASE WHEN f.attachment_kind = 'thumbnail' AND p.path IS NOT NULL THEN 1 ELSE 0 END)
+                           SUM(CASE WHEN {THUMBNAIL_BACKED_IMAGE_EXPR} THEN 1 ELSE 0 END),
+                           SUM(CASE
+                               WHEN ({THUMBNAIL_BACKED_IMAGE_EXPR}) AND p.path IS NOT NULL
+                               THEN 1 ELSE 0
+                           END),
+                           SUM(CASE
+                               WHEN ({IMAGE_THUMBNAIL_WITH_ORIGINAL_EXPR}) AND p.path IS NOT NULL
+                               THEN 1 ELSE 0
+                           END)
                     FROM files f
                     LEFT JOIN removal_plan p ON p.path = f.path
                     WHERE {predicate}
                     "
-                ),
-                [group_key],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, i64>(5)?,
-                    ))
-                },
-            )?;
+            ),
+            [group_key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
         if total == 0 {
             bail!("cleanup group does not exist");
         }
@@ -1136,17 +1182,18 @@ impl Catalog {
                 )?;
             }
         } else {
-            if originals == 0 || thumbnails == 0 {
-                bail!("cleanup group does not contain both originals and thumbnails");
+            if thumbnail_backed_images == 0 {
+                bail!("cleanup group does not contain image originals with matching thumbnails");
             }
-            let keeping_thumbnails = marked_originals == originals && marked_thumbnails == 0;
+            let keeping_thumbnails = marked_thumbnail_backed_images == thumbnail_backed_images
+                && marked_image_thumbnails == 0;
             if keeping_thumbnails {
                 self.connection.execute(
                     &format!(
                         "DELETE FROM removal_plan
                          WHERE path IN (
                              SELECT f.path FROM files f
-                             WHERE {predicate} AND f.attachment_kind = 'original'
+                             WHERE {predicate} AND ({THUMBNAIL_BACKED_IMAGE_EXPR})
                          )"
                     ),
                     [group_key],
@@ -1156,7 +1203,7 @@ impl Catalog {
                     &format!(
                         "INSERT OR REPLACE INTO removal_plan(path, marked_at)
                          SELECT f.path, ?2 FROM files f
-                         WHERE {predicate} AND f.attachment_kind = 'original'"
+                         WHERE {predicate} AND ({THUMBNAIL_BACKED_IMAGE_EXPR})"
                     ),
                     params![group_key, now],
                 )?;
@@ -1165,7 +1212,7 @@ impl Catalog {
                         "DELETE FROM removal_plan
                          WHERE path IN (
                              SELECT f.path FROM files f
-                             WHERE {predicate} AND f.attachment_kind = 'thumbnail'
+                             WHERE {predicate} AND ({IMAGE_THUMBNAIL_WITH_ORIGINAL_EXPR})
                          )"
                     ),
                     [group_key],
@@ -1411,12 +1458,18 @@ impl Catalog {
                    SUM(CASE WHEN p.path IS NOT NULL THEN 1 ELSE 0 END) AS marked_count,
                    MAX(CASE WHEN f.attachment_kind = 'original' THEN 1 ELSE 0 END) AS has_original,
                    MAX(CASE WHEN f.attachment_kind = 'thumbnail' THEN 1 ELSE 0 END) AS has_thumbnail,
+                   SUM(CASE WHEN {THUMBNAIL_BACKED_IMAGE_EXPR} THEN 1 ELSE 0 END)
+                       AS thumbnail_backed_image_count,
                    CASE
-                       WHEN SUM(CASE WHEN f.attachment_kind = 'original' THEN 1 ELSE 0 END) > 0
-                        AND SUM(CASE WHEN f.attachment_kind = 'thumbnail' THEN 1 ELSE 0 END) > 0
-                        AND SUM(CASE WHEN f.attachment_kind = 'original' AND p.path IS NOT NULL THEN 1 ELSE 0 END)
-                            = SUM(CASE WHEN f.attachment_kind = 'original' THEN 1 ELSE 0 END)
-                        AND SUM(CASE WHEN f.attachment_kind = 'thumbnail' AND p.path IS NOT NULL THEN 1 ELSE 0 END) = 0
+                       WHEN SUM(CASE WHEN {THUMBNAIL_BACKED_IMAGE_EXPR} THEN 1 ELSE 0 END) > 0
+                        AND SUM(CASE
+                            WHEN ({THUMBNAIL_BACKED_IMAGE_EXPR}) AND p.path IS NOT NULL
+                            THEN 1 ELSE 0
+                        END) = SUM(CASE WHEN {THUMBNAIL_BACKED_IMAGE_EXPR} THEN 1 ELSE 0 END)
+                        AND SUM(CASE
+                            WHEN ({IMAGE_THUMBNAIL_WITH_ORIGINAL_EXPR}) AND p.path IS NOT NULL
+                            THEN 1 ELSE 0
+                        END) = 0
                        THEN 1 ELSE 0
                    END AS keeping_thumbnails,
                    COALESCE(MAX(f.message_timestamp), 0) AS latest_timestamp,
@@ -1676,10 +1729,11 @@ fn cleanup_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(CleanupG
             marked_count: row.get::<_, i64>(7)?.max(0) as u64,
             has_original: row.get::<_, i64>(8)? != 0,
             has_thumbnail: row.get::<_, i64>(9)? != 0,
-            keeping_thumbnails: row.get::<_, i64>(10)? != 0,
-            latest_timestamp: row.get::<_, i64>(11)?,
+            thumbnail_backed_image_count: row.get::<_, i64>(10)?.max(0) as u64,
+            keeping_thumbnails: row.get::<_, i64>(11)? != 0,
+            latest_timestamp: row.get::<_, i64>(12)?,
         },
-        row.get::<_, i64>(12)?.max(0) as u64,
+        row.get::<_, i64>(13)?.max(0) as u64,
     ))
 }
 
