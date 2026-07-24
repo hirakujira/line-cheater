@@ -69,6 +69,18 @@ Build the current machine architecture with:
 npm --prefix native/electron run package:mac
 ```
 
+To install dependencies, package the current macOS architecture, and verify
+the generated DMG by mounting it read-only:
+
+```bash
+native/electron/scripts/package-dmg.sh
+```
+
+Set `SKIP_NPM_CI=1` when dependencies are already installed. The script runs
+the Electron tests, builds the release Rust sidecar, verifies the app
+signature and DMG checksum structure, mounts the DMG, and checks the packaged
+sidecar with `--version`.
+
 The command runs the Electron contract tests, compiles an optimized Rust
 sidecar, copies the Electron runtime, installs the sidecar under
 `Contents/Resources/bin`, validates the full-bleed 1024 × 1024
@@ -111,10 +123,10 @@ or a verified universal bundle before claiming Intel Mac support.
    `UnifiedGroup.sqlite` databases plus rename system messages. Main and
    community chats share a source-aware cursor and keep the source needed to
    route later message requests.
-6. Page chats at 100 rows and messages at 180 rows using the web-style
-   chat/message panel and incoming/outgoing/system bubble layout. Rust supplies
-   `isSelf`; send status is never allowed to turn another identified member
-   into “我”.
+6. Page chats at 100 rows and messages at 180 rows in both directions using
+   the web-style chat/message panel and incoming/outgoing/system bubble
+   layout. Rust supplies `isSelf`; send status is never allowed to turn
+   another identified member into “我”.
 7. Hydrate referenced chat images from catalog-authorized original/thumbnail
    paths with at most four concurrent preview requests. HTTP(S) text is
    linkified, receives a bounded domain/title preview card, and opens in the

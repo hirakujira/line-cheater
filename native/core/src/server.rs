@@ -84,6 +84,8 @@ struct ChatPageParams {
     limit: u32,
     #[serde(default)]
     cursor: Option<ChatCursor>,
+    #[serde(default)]
+    before_cursor: Option<ChatCursor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +98,8 @@ struct MessagePageParams {
     limit: u32,
     #[serde(default)]
     cursor: Option<MessageCursor>,
+    #[serde(default)]
+    before_cursor: Option<MessageCursor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -110,6 +114,8 @@ struct MessageSearchParams {
     limit: u32,
     #[serde(default)]
     cursor: Option<MessageCursor>,
+    #[serde(default)]
+    before_cursor: Option<MessageCursor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,16 +291,30 @@ fn handle_request<W: Write>(
         })),
         "listChats" => {
             let params: ChatPageParams = parse_params(request)?;
-            let mut items = session
-                .database
-                .list_chats(params.cursor.clone(), params.limit)?
-                .items;
+            if params.cursor.is_some() && params.before_cursor.is_some() {
+                anyhow::bail!("chat pagination cannot use both cursor and beforeCursor");
+            }
+            let line_page = if let Some(cursor) = params.before_cursor.clone() {
+                session.database.list_chats_before(cursor, params.limit)?
+            } else {
+                session
+                    .database
+                    .list_chats(params.cursor.clone(), params.limit)?
+            };
+            let mut items = line_page.items;
+            let line_has_next = line_page.next_cursor.is_some();
+            let line_has_previous = line_page.has_previous;
+            let mut square_has_next = false;
+            let mut square_has_previous = false;
             if let Some(square_database) = session.square_database.as_ref() {
-                items.extend(
-                    square_database
-                        .list_chats(params.cursor, params.limit)?
-                        .items,
-                );
+                let square_page = if let Some(cursor) = params.before_cursor.clone() {
+                    square_database.list_chats_before(cursor, params.limit)?
+                } else {
+                    square_database.list_chats(params.cursor.clone(), params.limit)?
+                };
+                square_has_next = square_page.next_cursor.is_some();
+                square_has_previous = square_page.has_previous;
+                items.extend(square_page.items);
             }
             session.database.enrich_chat_titles(
                 &mut items,
@@ -308,8 +328,19 @@ fn handle_request<W: Write>(
                     .then_with(|| left.source.cmp(&right.source))
                     .then_with(|| left.pk.cmp(&right.pk))
             });
+            let combined_len = items.len();
+            let has_next = if params.before_cursor.is_some() {
+                !items.is_empty()
+            } else {
+                combined_len > params.limit as usize || line_has_next || square_has_next
+            };
+            let has_previous = if params.before_cursor.is_some() {
+                combined_len > params.limit as usize || line_has_previous || square_has_previous
+            } else {
+                params.cursor.is_some()
+            };
             items.truncate(params.limit as usize);
-            let next_cursor = if items.len() == params.limit as usize {
+            let next_cursor = if has_next {
                 items.last().map(|chat| ChatCursor {
                     last_updated: chat.last_updated,
                     source: chat.source.clone(),
@@ -318,28 +349,55 @@ fn handle_request<W: Write>(
             } else {
                 None
             };
-            let page = ChatPage { items, next_cursor };
+            let page = ChatPage {
+                items,
+                next_cursor,
+                has_previous,
+            };
             Ok(serde_json::to_value(page)?)
         }
         "listMessages" => {
             let params: MessagePageParams = parse_params(request)?;
+            if params.cursor.is_some() && params.before_cursor.is_some() {
+                anyhow::bail!("message pagination cannot use both cursor and beforeCursor");
+            }
             let mut page = match params.source.as_str() {
-                "line" => session.database.list_messages_for_account(
-                    params.chat_pk,
-                    params.cursor,
-                    params.limit,
-                    session.prepared.account_id.as_deref(),
-                )?,
-                "square" => session
-                    .square_database
-                    .as_ref()
-                    .context("LineSquare.sqlite is not available")?
-                    .list_messages(
+                "line" => match params.before_cursor {
+                    Some(cursor) => session.database.list_messages_for_account_before(
+                        params.chat_pk,
+                        cursor,
+                        params.limit,
+                        session.prepared.account_id.as_deref(),
+                    )?,
+                    None => session.database.list_messages_for_account(
                         params.chat_pk,
                         params.cursor,
                         params.limit,
                         session.prepared.account_id.as_deref(),
                     )?,
+                },
+                "square" => match params.before_cursor {
+                    Some(cursor) => session
+                        .square_database
+                        .as_ref()
+                        .context("LineSquare.sqlite is not available")?
+                        .list_messages_before(
+                            params.chat_pk,
+                            cursor,
+                            params.limit,
+                            session.prepared.account_id.as_deref(),
+                        )?,
+                    None => session
+                        .square_database
+                        .as_ref()
+                        .context("LineSquare.sqlite is not available")?
+                        .list_messages(
+                            params.chat_pk,
+                            params.cursor,
+                            params.limit,
+                            session.prepared.account_id.as_deref(),
+                        )?,
+                },
                 _ => anyhow::bail!("message source must be `line` or `square`"),
             };
             session
@@ -349,25 +407,50 @@ fn handle_request<W: Write>(
         }
         "searchMessages" => {
             let params: MessageSearchParams = parse_params(request)?;
+            if params.cursor.is_some() && params.before_cursor.is_some() {
+                anyhow::bail!("message search pagination cannot use both cursor and beforeCursor");
+            }
             let mut page = match params.source.as_str() {
-                "line" => session.database.search_messages_for_account(
-                    &params.query,
-                    params.chat_pk,
-                    params.cursor,
-                    params.limit,
-                    session.prepared.account_id.as_deref(),
-                )?,
-                "square" => session
-                    .square_database
-                    .as_ref()
-                    .context("LineSquare.sqlite is not available")?
-                    .search_messages(
+                "line" => match params.before_cursor {
+                    Some(cursor) => session.database.search_messages_for_account_before(
+                        &params.query,
+                        params.chat_pk,
+                        cursor,
+                        params.limit,
+                        session.prepared.account_id.as_deref(),
+                    )?,
+                    None => session.database.search_messages_for_account(
                         &params.query,
                         params.chat_pk,
                         params.cursor,
                         params.limit,
                         session.prepared.account_id.as_deref(),
                     )?,
+                },
+                "square" => match params.before_cursor {
+                    Some(cursor) => session
+                        .square_database
+                        .as_ref()
+                        .context("LineSquare.sqlite is not available")?
+                        .search_messages_before(
+                            &params.query,
+                            params.chat_pk,
+                            cursor,
+                            params.limit,
+                            session.prepared.account_id.as_deref(),
+                        )?,
+                    None => session
+                        .square_database
+                        .as_ref()
+                        .context("LineSquare.sqlite is not available")?
+                        .search_messages(
+                            &params.query,
+                            params.chat_pk,
+                            params.cursor,
+                            params.limit,
+                            session.prepared.account_id.as_deref(),
+                        )?,
+                },
                 _ => anyhow::bail!("message source must be `line` or `square`"),
             };
             session

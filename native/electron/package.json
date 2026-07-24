@@ -10,7 +10,8 @@
     "start": "electron .",
     "test": "node --test ../frontend/data-provider.test.js sidecar-client.test.cjs renderer-shell.test.cjs",
     "build:native:mac": "cargo build --manifest-path ../../Cargo.toml -p line-backup-native --release",
-    "package:mac": "npm test && npm run build:native:mac && node scripts/package-macos.cjs"
+    "package:mac": "npm test && npm run build:native:mac && node scripts/package-macos.cjs",
+    "package:dmg": "./scripts/package-dmg.sh"
   },
   "devDependencies": {
     "electron": "43.2.0"

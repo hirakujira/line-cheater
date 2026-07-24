@@ -9,7 +9,8 @@
 **直接使用：<https://line-cheater.gginin.de>**
 
 Apple Silicon macOS 測試版可用
-`npm --prefix native/electron run package:mac` 產生 `.app`、ZIP 與 DMG。
+`native/electron/scripts/package-dmg.sh` 產生並驗證 `.app`、ZIP 與 DMG；
+已有依賴時可設定 `SKIP_NPM_CI=1` 加速執行。
 目前為 ad-hoc 簽章、尚未 Apple Developer ID 簽署或 notarize；公開散布與
 Intel Mac 支援狀態請見 [macOS package 說明](native/electron/README.md#macos-package)。
 

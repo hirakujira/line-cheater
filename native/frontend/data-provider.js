@@ -100,7 +100,8 @@
     options = options || {};
     var page = await this.bridge.request("listChats", {
       limit: boundedLimit(options.limit, 100),
-      cursor: options.cursor || null
+      cursor: options.cursor || null,
+      beforeCursor: options.beforeCursor || null
     });
     return assertPage(page, "listChats");
   };
@@ -112,7 +113,8 @@
       chatPk: Number(chatPk),
       source: boundedMessageSource(options.source),
       limit: boundedLimit(options.limit, 180),
-      cursor: options.cursor || null
+      cursor: options.cursor || null,
+      beforeCursor: options.beforeCursor || null
     });
     return assertPage(page, "listMessages");
   };
@@ -135,7 +137,8 @@
       chatPk: chatPk,
       source: boundedMessageSource(options.source),
       limit: boundedLimit(options.limit, 180),
-      cursor: options.cursor || null
+      cursor: options.cursor || null,
+      beforeCursor: options.beforeCursor || null
     });
     return assertPage(page, "searchMessages");
   };

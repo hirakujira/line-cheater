@@ -139,6 +139,7 @@
                   <div class="empty-state">載入備份後顯示聊天室。</div>
                 </div>
                 <nav class="chat-pagination" aria-label="聊天室分頁">
+                  <button id="previous-chats" disabled>上一頁</button>
                   <span id="chat-page-info">第 1 頁</span>
                   <button id="next-chats" disabled>下一頁</button>
                 </nav>
@@ -150,7 +151,10 @@
                     <h3 id="selected-chat-title">選取聊天室</h3>
                     <p id="selected-chat-meta" class="muted small">請從左側選取聊天室開始。</p>
                   </div>
-                  <button id="next-messages" disabled>載入更多訊息</button>
+                  <div class="message-pagination" aria-label="訊息分頁">
+                    <button id="previous-messages" disabled>上一頁</button>
+                    <button id="next-messages" disabled>下一頁</button>
+                  </div>
                 </div>
                 <form id="search-form" class="search message-search">
                   <input id="search-query" maxlength="1024" placeholder="搜尋目前聊天室的訊息文字">

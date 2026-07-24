@@ -77,6 +77,22 @@ impl LineDatabase {
     }
 
     pub fn list_chats(&self, cursor: Option<ChatCursor>, limit: u32) -> Result<ChatPage> {
+        self.list_chats_with_boundaries(cursor, None, limit)
+    }
+
+    pub fn list_chats_before(&self, cursor: ChatCursor, limit: u32) -> Result<ChatPage> {
+        self.list_chats_with_boundaries(None, Some(cursor), limit)
+    }
+
+    fn list_chats_with_boundaries(
+        &self,
+        after_cursor: Option<ChatCursor>,
+        before_cursor: Option<ChatCursor>,
+        limit: u32,
+    ) -> Result<ChatPage> {
+        if after_cursor.is_some() && before_cursor.is_some() {
+            bail!("chat pagination cannot use both after and before cursors");
+        }
         let limit = checked_page_size(limit)?;
         let chat_id = text_expr("c", &self.chat_columns, &["ZMID", "ZID"]);
         let chat_type = integer_expr("c", &self.chat_columns, "ZTYPE", "0");
@@ -137,11 +153,17 @@ impl LineDatabase {
                 ""
             }
         );
-        let cursor_filter = if let Some(cursor) = cursor.as_ref() {
-            let tie_filter = source_cursor_tie_filter("line", &cursor.source, "c.Z_PK", "?2");
+        let boundary = after_cursor.as_ref().or(before_cursor.as_ref());
+        let cursor_filter = if let Some(cursor) = boundary {
+            let tie_filter = if before_cursor.is_some() {
+                source_cursor_before_filter("line", &cursor.source, "c.Z_PK", "?2")
+            } else {
+                source_cursor_tie_filter("line", &cursor.source, "c.Z_PK", "?2")
+            };
             format!(
                 " WHERE {message_count} > 0 \
-                 AND ({last_updated} < ?1 OR ({last_updated} = ?1 AND {tie_filter}))"
+                 AND ({last_updated} {} ?1 OR ({last_updated} = ?1 AND {tie_filter}))",
+                if before_cursor.is_some() { ">" } else { "<" }
             )
         } else {
             format!(" WHERE {message_count} > 0")
@@ -155,12 +177,13 @@ impl LineDatabase {
              ORDER BY {last_updated} DESC, c.Z_PK ASC LIMIT ?3"
         );
         let mut statement = self.connection.prepare(&sql)?;
-        let cursor = cursor.unwrap_or(ChatCursor {
+        let cursor = boundary.cloned().unwrap_or(ChatCursor {
             last_updated: i64::MAX,
             source: "line".to_string(),
             pk: 0,
         });
-        let mut rows = statement.query(params![cursor.last_updated, cursor.pk, limit as i64])?;
+        let mut rows =
+            statement.query(params![cursor.last_updated, cursor.pk, limit as i64 + 1])?;
         let mut items = Vec::with_capacity(limit);
         while let Some(row) = rows.next()? {
             let id: String = row.get(1)?;
@@ -197,7 +220,11 @@ impl LineDatabase {
                 last_message: row.get(9)?,
             });
         }
-        let next_cursor = if items.len() == limit {
+        let has_extra = items.len() > limit;
+        if has_extra {
+            items.pop();
+        }
+        let next_cursor = if (before_cursor.is_some() && !items.is_empty()) || has_extra {
             items.last().map(|chat| ChatCursor {
                 last_updated: chat.last_updated,
                 source: chat.source.clone(),
@@ -206,7 +233,16 @@ impl LineDatabase {
         } else {
             None
         };
-        Ok(ChatPage { items, next_cursor })
+        let has_previous = if before_cursor.is_some() {
+            has_extra
+        } else {
+            after_cursor.is_some()
+        };
+        Ok(ChatPage {
+            items,
+            next_cursor,
+            has_previous,
+        })
     }
 
     pub fn enrich_chat_titles(
@@ -294,6 +330,15 @@ impl LineDatabase {
         self.list_messages_for_account(chat_pk, cursor, limit, None)
     }
 
+    pub fn list_messages_before(
+        &self,
+        chat_pk: i64,
+        cursor: MessageCursor,
+        limit: u32,
+    ) -> Result<MessagePage> {
+        self.list_messages_for_account_before(chat_pk, cursor, limit, None)
+    }
+
     pub fn list_messages_for_account(
         &self,
         chat_pk: i64,
@@ -301,6 +346,36 @@ impl LineDatabase {
         limit: u32,
         account_id: Option<&str>,
     ) -> Result<MessagePage> {
+        self.list_messages_for_account_with_boundaries(chat_pk, cursor, None, limit, account_id)
+    }
+
+    pub fn list_messages_for_account_before(
+        &self,
+        chat_pk: i64,
+        cursor: MessageCursor,
+        limit: u32,
+        account_id: Option<&str>,
+    ) -> Result<MessagePage> {
+        self.list_messages_for_account_with_boundaries(
+            chat_pk,
+            None,
+            Some(cursor),
+            limit,
+            account_id,
+        )
+    }
+
+    fn list_messages_for_account_with_boundaries(
+        &self,
+        chat_pk: i64,
+        after_cursor: Option<MessageCursor>,
+        before_cursor: Option<MessageCursor>,
+        limit: u32,
+        account_id: Option<&str>,
+    ) -> Result<MessagePage> {
+        if after_cursor.is_some() && before_cursor.is_some() {
+            bail!("message pagination cannot use both after and before cursors");
+        }
         let limit = checked_page_size(limit)?;
         if !self.message_columns.contains("ZCHAT") {
             bail!("ZMESSAGE does not contain ZCHAT");
@@ -340,21 +415,44 @@ impl LineDatabase {
              {timestamp}, {sender_pk}, {sender_name}, {sender_id}, {send_status}, {content_type}, \
              {message_type}, {text}, {latitude}, {longitude} \
              FROM ZMESSAGE m{join} \
-             WHERE m.ZCHAT = ?1 AND ({timestamp} > ?2 OR ({timestamp} = ?2 AND m.Z_PK > ?3)) \
-             ORDER BY {timestamp} ASC, m.Z_PK ASC LIMIT ?4"
+             WHERE m.ZCHAT = ?1 AND ({timestamp} {} ?2 OR ({timestamp} = ?2 AND m.Z_PK {} ?3)) \
+             ORDER BY {timestamp} {}, m.Z_PK {} LIMIT ?4",
+            if before_cursor.is_some() { "<" } else { ">" },
+            if before_cursor.is_some() { "<" } else { ">" },
+            if before_cursor.is_some() {
+                "DESC"
+            } else {
+                "ASC"
+            },
+            if before_cursor.is_some() {
+                "DESC"
+            } else {
+                "ASC"
+            }
         );
-        let cursor = cursor.unwrap_or(MessageCursor {
+        let cursor = after_cursor.or(before_cursor).unwrap_or(MessageCursor {
             timestamp: i64::MIN,
             pk: 0,
         });
         let mut statement = self.connection.prepare(&sql)?;
-        let mut rows =
-            statement.query(params![chat_pk, cursor.timestamp, cursor.pk, limit as i64])?;
+        let mut rows = statement.query(params![
+            chat_pk,
+            cursor.timestamp,
+            cursor.pk,
+            limit as i64 + 1
+        ])?;
         let mut items = Vec::with_capacity(limit);
         while let Some(row) = rows.next()? {
             items.push(message_from_row(row, "line", account_id)?);
         }
-        let next_cursor = if items.len() == limit {
+        let has_extra = items.len() > limit;
+        if has_extra {
+            items.pop();
+        }
+        if before_cursor.is_some() {
+            items.reverse();
+        }
+        let next_cursor = if (before_cursor.is_some() && !items.is_empty()) || has_extra {
             items.last().map(|message| MessageCursor {
                 timestamp: message.timestamp,
                 pk: message.pk,
@@ -362,7 +460,16 @@ impl LineDatabase {
         } else {
             None
         };
-        Ok(MessagePage { items, next_cursor })
+        let has_previous = if before_cursor.is_some() {
+            has_extra
+        } else {
+            after_cursor.is_some()
+        };
+        Ok(MessagePage {
+            items,
+            next_cursor,
+            has_previous,
+        })
     }
 
     pub fn search_messages(
@@ -375,6 +482,16 @@ impl LineDatabase {
         self.search_messages_for_account(query, chat_pk, cursor, limit, None)
     }
 
+    pub fn search_messages_before(
+        &self,
+        query: &str,
+        chat_pk: Option<i64>,
+        cursor: MessageCursor,
+        limit: u32,
+    ) -> Result<MessagePage> {
+        self.search_messages_for_account_before(query, chat_pk, cursor, limit, None)
+    }
+
     pub fn search_messages_for_account(
         &self,
         query: &str,
@@ -383,6 +500,41 @@ impl LineDatabase {
         limit: u32,
         account_id: Option<&str>,
     ) -> Result<MessagePage> {
+        self.search_messages_for_account_with_boundaries(
+            query, chat_pk, cursor, None, limit, account_id,
+        )
+    }
+
+    pub fn search_messages_for_account_before(
+        &self,
+        query: &str,
+        chat_pk: Option<i64>,
+        cursor: MessageCursor,
+        limit: u32,
+        account_id: Option<&str>,
+    ) -> Result<MessagePage> {
+        self.search_messages_for_account_with_boundaries(
+            query,
+            chat_pk,
+            None,
+            Some(cursor),
+            limit,
+            account_id,
+        )
+    }
+
+    fn search_messages_for_account_with_boundaries(
+        &self,
+        query: &str,
+        chat_pk: Option<i64>,
+        after_cursor: Option<MessageCursor>,
+        before_cursor: Option<MessageCursor>,
+        limit: u32,
+        account_id: Option<&str>,
+    ) -> Result<MessagePage> {
+        if after_cursor.is_some() && before_cursor.is_some() {
+            bail!("message search pagination cannot use both after and before cursors");
+        }
         let query = validated_search_pattern(query)?;
         let limit = checked_page_size(limit)?;
         if !self.message_columns.contains("ZCHAT") {
@@ -428,10 +580,22 @@ impl LineDatabase {
              FROM ZMESSAGE m{join} \
              WHERE {text} LIKE ?1 ESCAPE '\\' \
                AND (?2 IS NULL OR m.ZCHAT = ?2) \
-               AND ({timestamp} > ?3 OR ({timestamp} = ?3 AND m.Z_PK > ?4)) \
-             ORDER BY {timestamp} ASC, m.Z_PK ASC LIMIT ?5"
+               AND ({timestamp} {} ?3 OR ({timestamp} = ?3 AND m.Z_PK {} ?4)) \
+             ORDER BY {timestamp} {}, m.Z_PK {} LIMIT ?5",
+            if before_cursor.is_some() { "<" } else { ">" },
+            if before_cursor.is_some() { "<" } else { ">" },
+            if before_cursor.is_some() {
+                "DESC"
+            } else {
+                "ASC"
+            },
+            if before_cursor.is_some() {
+                "DESC"
+            } else {
+                "ASC"
+            }
         );
-        let cursor = cursor.unwrap_or(MessageCursor {
+        let cursor = after_cursor.or(before_cursor).unwrap_or(MessageCursor {
             timestamp: i64::MIN,
             pk: 0,
         });
@@ -441,13 +605,20 @@ impl LineDatabase {
             chat_pk,
             cursor.timestamp,
             cursor.pk,
-            limit as i64
+            limit as i64 + 1
         ])?;
         let mut items = Vec::with_capacity(limit);
         while let Some(row) = rows.next()? {
             items.push(message_from_row(row, "line", account_id)?);
         }
-        let next_cursor = if items.len() == limit {
+        let has_extra = items.len() > limit;
+        if has_extra {
+            items.pop();
+        }
+        if before_cursor.is_some() {
+            items.reverse();
+        }
+        let next_cursor = if (before_cursor.is_some() && !items.is_empty()) || has_extra {
             items.last().map(|message| MessageCursor {
                 timestamp: message.timestamp,
                 pk: message.pk,
@@ -455,7 +626,16 @@ impl LineDatabase {
         } else {
             None
         };
-        Ok(MessagePage { items, next_cursor })
+        let has_previous = if before_cursor.is_some() {
+            has_extra
+        } else {
+            after_cursor.is_some()
+        };
+        Ok(MessagePage {
+            items,
+            next_cursor,
+            has_previous,
+        })
     }
 
     pub fn attachment_contexts(
@@ -713,6 +893,22 @@ impl LineSquareDatabase {
     }
 
     pub fn list_chats(&self, cursor: Option<ChatCursor>, limit: u32) -> Result<ChatPage> {
+        self.list_chats_with_boundaries(cursor, None, limit)
+    }
+
+    pub fn list_chats_before(&self, cursor: ChatCursor, limit: u32) -> Result<ChatPage> {
+        self.list_chats_with_boundaries(None, Some(cursor), limit)
+    }
+
+    fn list_chats_with_boundaries(
+        &self,
+        after_cursor: Option<ChatCursor>,
+        before_cursor: Option<ChatCursor>,
+        limit: u32,
+    ) -> Result<ChatPage> {
+        if after_cursor.is_some() && before_cursor.is_some() {
+            bail!("chat pagination cannot use both after and before cursors");
+        }
         let limit = checked_page_size(limit)?;
         let chat_id = text_expr("c", &self.chat_columns, &["ZMID", "ZID"]);
         let chat_type = integer_expr("c", &self.chat_columns, "ZTYPE", "100");
@@ -761,11 +957,17 @@ impl LineSquareDatabase {
         } else {
             "0".to_string()
         };
-        let cursor_filter = if let Some(cursor) = cursor.as_ref() {
-            let tie_filter = source_cursor_tie_filter("square", &cursor.source, "c.Z_PK", "?2");
+        let boundary = after_cursor.as_ref().or(before_cursor.as_ref());
+        let cursor_filter = if let Some(cursor) = boundary {
+            let tie_filter = if before_cursor.is_some() {
+                source_cursor_before_filter("square", &cursor.source, "c.Z_PK", "?2")
+            } else {
+                source_cursor_tie_filter("square", &cursor.source, "c.Z_PK", "?2")
+            };
             format!(
                 " WHERE {message_count} > 0 \
-                 AND ({last_updated} < ?1 OR ({last_updated} = ?1 AND {tie_filter}))"
+                 AND ({last_updated} {} ?1 OR ({last_updated} = ?1 AND {tie_filter}))",
+                if before_cursor.is_some() { ">" } else { "<" }
             )
         } else {
             format!(" WHERE {message_count} > 0")
@@ -776,13 +978,14 @@ impl LineSquareDatabase {
              {last_message} FROM ZCHAT c{join}{cursor_filter} \
              ORDER BY {last_updated} DESC, c.Z_PK ASC LIMIT ?3"
         );
-        let cursor = cursor.unwrap_or(ChatCursor {
+        let cursor = boundary.cloned().unwrap_or(ChatCursor {
             last_updated: i64::MAX,
             source: "line".to_string(),
             pk: 0,
         });
         let mut statement = self.connection.prepare(&sql)?;
-        let mut rows = statement.query(params![cursor.last_updated, cursor.pk, limit as i64])?;
+        let mut rows =
+            statement.query(params![cursor.last_updated, cursor.pk, limit as i64 + 1])?;
         let mut items = Vec::with_capacity(limit);
         while let Some(row) = rows.next()? {
             let id: String = row.get(1)?;
@@ -811,7 +1014,11 @@ impl LineSquareDatabase {
                 last_message: row.get(8)?,
             });
         }
-        let next_cursor = if items.len() == limit {
+        let has_extra = items.len() > limit;
+        if has_extra {
+            items.pop();
+        }
+        let next_cursor = if (before_cursor.is_some() && !items.is_empty()) || has_extra {
             items.last().map(|chat| ChatCursor {
                 last_updated: chat.last_updated,
                 source: chat.source.clone(),
@@ -820,7 +1027,16 @@ impl LineSquareDatabase {
         } else {
             None
         };
-        Ok(ChatPage { items, next_cursor })
+        let has_previous = if before_cursor.is_some() {
+            has_extra
+        } else {
+            after_cursor.is_some()
+        };
+        Ok(ChatPage {
+            items,
+            next_cursor,
+            has_previous,
+        })
     }
 
     pub fn list_messages(
@@ -830,6 +1046,30 @@ impl LineSquareDatabase {
         limit: u32,
         account_id: Option<&str>,
     ) -> Result<MessagePage> {
+        self.list_messages_with_boundaries(chat_pk, cursor, None, limit, account_id)
+    }
+
+    pub fn list_messages_before(
+        &self,
+        chat_pk: i64,
+        cursor: MessageCursor,
+        limit: u32,
+        account_id: Option<&str>,
+    ) -> Result<MessagePage> {
+        self.list_messages_with_boundaries(chat_pk, None, Some(cursor), limit, account_id)
+    }
+
+    fn list_messages_with_boundaries(
+        &self,
+        chat_pk: i64,
+        after_cursor: Option<MessageCursor>,
+        before_cursor: Option<MessageCursor>,
+        limit: u32,
+        account_id: Option<&str>,
+    ) -> Result<MessagePage> {
+        if after_cursor.is_some() && before_cursor.is_some() {
+            bail!("message pagination cannot use both after and before cursors");
+        }
         let limit = checked_page_size(limit)?;
         if !self.message_columns.contains("ZCHAT") {
             bail!("LineSquare.ZMESSAGE does not contain ZCHAT");
@@ -865,21 +1105,44 @@ impl LineSquareDatabase {
              {timestamp}, {sender_pk}, {sender_name}, {sender_id}, {send_status}, {content_type}, \
              {message_type}, {text}, {latitude}, {longitude} \
              FROM ZMESSAGE m{join} \
-             WHERE m.ZCHAT = ?1 AND ({timestamp} > ?2 OR ({timestamp} = ?2 AND m.Z_PK > ?3)) \
-             ORDER BY {timestamp} ASC, m.Z_PK ASC LIMIT ?4"
+             WHERE m.ZCHAT = ?1 AND ({timestamp} {} ?2 OR ({timestamp} = ?2 AND m.Z_PK {} ?3)) \
+             ORDER BY {timestamp} {}, m.Z_PK {} LIMIT ?4",
+            if before_cursor.is_some() { "<" } else { ">" },
+            if before_cursor.is_some() { "<" } else { ">" },
+            if before_cursor.is_some() {
+                "DESC"
+            } else {
+                "ASC"
+            },
+            if before_cursor.is_some() {
+                "DESC"
+            } else {
+                "ASC"
+            }
         );
-        let cursor = cursor.unwrap_or(MessageCursor {
+        let cursor = after_cursor.or(before_cursor).unwrap_or(MessageCursor {
             timestamp: i64::MIN,
             pk: 0,
         });
         let mut statement = self.connection.prepare(&sql)?;
-        let mut rows =
-            statement.query(params![chat_pk, cursor.timestamp, cursor.pk, limit as i64])?;
+        let mut rows = statement.query(params![
+            chat_pk,
+            cursor.timestamp,
+            cursor.pk,
+            limit as i64 + 1
+        ])?;
         let mut items = Vec::with_capacity(limit);
         while let Some(row) = rows.next()? {
             items.push(message_from_row(row, "square", account_id)?);
         }
-        let next_cursor = if items.len() == limit {
+        let has_extra = items.len() > limit;
+        if has_extra {
+            items.pop();
+        }
+        if before_cursor.is_some() {
+            items.reverse();
+        }
+        let next_cursor = if (before_cursor.is_some() && !items.is_empty()) || has_extra {
             items.last().map(|message| MessageCursor {
                 timestamp: message.timestamp,
                 pk: message.pk,
@@ -887,7 +1150,16 @@ impl LineSquareDatabase {
         } else {
             None
         };
-        Ok(MessagePage { items, next_cursor })
+        let has_previous = if before_cursor.is_some() {
+            has_extra
+        } else {
+            after_cursor.is_some()
+        };
+        Ok(MessagePage {
+            items,
+            next_cursor,
+            has_previous,
+        })
     }
 
     pub fn search_messages(
@@ -898,6 +1170,32 @@ impl LineSquareDatabase {
         limit: u32,
         account_id: Option<&str>,
     ) -> Result<MessagePage> {
+        self.search_messages_with_boundaries(query, chat_pk, cursor, None, limit, account_id)
+    }
+
+    pub fn search_messages_before(
+        &self,
+        query: &str,
+        chat_pk: Option<i64>,
+        cursor: MessageCursor,
+        limit: u32,
+        account_id: Option<&str>,
+    ) -> Result<MessagePage> {
+        self.search_messages_with_boundaries(query, chat_pk, None, Some(cursor), limit, account_id)
+    }
+
+    fn search_messages_with_boundaries(
+        &self,
+        query: &str,
+        chat_pk: Option<i64>,
+        after_cursor: Option<MessageCursor>,
+        before_cursor: Option<MessageCursor>,
+        limit: u32,
+        account_id: Option<&str>,
+    ) -> Result<MessagePage> {
+        if after_cursor.is_some() && before_cursor.is_some() {
+            bail!("message search pagination cannot use both after and before cursors");
+        }
         let query = validated_search_pattern(query)?;
         let limit = checked_page_size(limit)?;
         if !self.message_columns.contains("ZCHAT") || !self.message_columns.contains("ZTEXT") {
@@ -936,10 +1234,22 @@ impl LineSquareDatabase {
              FROM ZMESSAGE m{join} \
              WHERE {text} LIKE ?1 ESCAPE '\\' \
                AND (?2 IS NULL OR m.ZCHAT = ?2) \
-               AND ({timestamp} > ?3 OR ({timestamp} = ?3 AND m.Z_PK > ?4)) \
-             ORDER BY {timestamp} ASC, m.Z_PK ASC LIMIT ?5"
+               AND ({timestamp} {} ?3 OR ({timestamp} = ?3 AND m.Z_PK {} ?4)) \
+             ORDER BY {timestamp} {}, m.Z_PK {} LIMIT ?5",
+            if before_cursor.is_some() { "<" } else { ">" },
+            if before_cursor.is_some() { "<" } else { ">" },
+            if before_cursor.is_some() {
+                "DESC"
+            } else {
+                "ASC"
+            },
+            if before_cursor.is_some() {
+                "DESC"
+            } else {
+                "ASC"
+            }
         );
-        let cursor = cursor.unwrap_or(MessageCursor {
+        let cursor = after_cursor.or(before_cursor).unwrap_or(MessageCursor {
             timestamp: i64::MIN,
             pk: 0,
         });
@@ -949,13 +1259,20 @@ impl LineSquareDatabase {
             chat_pk,
             cursor.timestamp,
             cursor.pk,
-            limit as i64
+            limit as i64 + 1
         ])?;
         let mut items = Vec::with_capacity(limit);
         while let Some(row) = rows.next()? {
             items.push(message_from_row(row, "square", account_id)?);
         }
-        let next_cursor = if items.len() == limit {
+        let has_extra = items.len() > limit;
+        if has_extra {
+            items.pop();
+        }
+        if before_cursor.is_some() {
+            items.reverse();
+        }
+        let next_cursor = if (before_cursor.is_some() && !items.is_empty()) || has_extra {
             items.last().map(|message| MessageCursor {
                 timestamp: message.timestamp,
                 pk: message.pk,
@@ -963,7 +1280,16 @@ impl LineSquareDatabase {
         } else {
             None
         };
-        Ok(MessagePage { items, next_cursor })
+        let has_previous = if before_cursor.is_some() {
+            has_extra
+        } else {
+            after_cursor.is_some()
+        };
+        Ok(MessagePage {
+            items,
+            next_cursor,
+            has_previous,
+        })
     }
 
     pub fn attachment_contexts(
@@ -1137,6 +1463,19 @@ fn source_cursor_tie_filter(
         std::cmp::Ordering::Greater => "1 = 1".to_string(),
         std::cmp::Ordering::Equal => format!("{pk_expression} > {pk_parameter}"),
         std::cmp::Ordering::Less => "1 = 0".to_string(),
+    }
+}
+
+fn source_cursor_before_filter(
+    source: &str,
+    cursor_source: &str,
+    pk_expression: &str,
+    pk_parameter: &str,
+) -> String {
+    match source.cmp(cursor_source) {
+        std::cmp::Ordering::Greater => "1 = 0".to_string(),
+        std::cmp::Ordering::Equal => format!("{pk_expression} < {pk_parameter}"),
+        std::cmp::Ordering::Less => "1 = 1".to_string(),
     }
 }
 

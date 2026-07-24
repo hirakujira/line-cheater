@@ -24,10 +24,41 @@ test("forwards bounded cursor pages without accumulating state", async () => {
       chatPk: 7,
       source: "line",
       limit: 25,
-      cursor: { timestamp: 5, pk: 2 }
+      cursor: { timestamp: 5, pk: 2 },
+      beforeCursor: null
     }
   }]);
   assert.equal(Object.hasOwn(provider, "messages"), false);
+});
+
+test("forwards previous-page cursors for chats and messages", async () => {
+  const calls = [];
+  const provider = new NativeDataProvider({
+    request: async (method, params) => {
+      calls.push({ method, params });
+      return { items: [], nextCursor: null, hasPrevious: true };
+    }
+  });
+  const beforeChat = { lastUpdated: 200, source: "line", pk: 7 };
+  const beforeMessage = { timestamp: 100, pk: 2 };
+  await provider.listChats({ beforeCursor: beforeChat });
+  await provider.listMessages(7, { beforeCursor: beforeMessage });
+  assert.deepEqual(calls, [
+    {
+      method: "listChats",
+      params: { limit: 100, cursor: null, beforeCursor: beforeChat }
+    },
+    {
+      method: "listMessages",
+      params: {
+        chatPk: 7,
+        source: "line",
+        limit: 180,
+        cursor: null,
+        beforeCursor: beforeMessage
+      }
+    }
+  ]);
 });
 
 test("rejects renderer requests above the native page limit", async () => {
@@ -68,7 +99,14 @@ test("validates and forwards bounded message searches", async () => {
   await provider.searchMessages(" photo ", { chatPk: 7, limit: 20 });
   assert.deepEqual(calls[0], {
     method: "searchMessages",
-    params: { query: "photo", chatPk: 7, source: "line", limit: 20, cursor: null }
+    params: {
+      query: "photo",
+      chatPk: 7,
+      source: "line",
+      limit: 20,
+      cursor: null,
+      beforeCursor: null
+    }
   });
   await provider.searchMessages("photo", { chatPk: 8, source: "square", limit: 20 });
   assert.equal(calls[1].params.source, "square");

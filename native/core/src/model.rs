@@ -37,6 +37,8 @@ pub struct Chat {
 pub struct ChatPage {
     pub items: Vec<Chat>,
     pub next_cursor: Option<ChatCursor>,
+    #[serde(default)]
+    pub has_previous: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +81,8 @@ pub struct MessageAttachment {
 pub struct MessagePage {
     pub items: Vec<Message>,
     pub next_cursor: Option<MessageCursor>,
+    #[serde(default)]
+    pub has_previous: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -15,6 +15,10 @@ const macPackager = fs.readFileSync(
   path.join(root, "scripts", "package-macos.cjs"),
   "utf8"
 );
+const dmgPackager = fs.readFileSync(
+  path.join(root, "scripts", "package-dmg.sh"),
+  "utf8"
+);
 const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 
 test("uses LINE Cheater consistently as the desktop product name", () => {
@@ -84,6 +88,19 @@ test("keeps community chats source-aware and trusts native sender ownership", ()
     renderer,
     /return Number\(message\.sendStatus\) === 1 \|\|/
   );
+});
+
+test("keeps chat and message browsing bidirectionally paginated", () => {
+  assert.match(html, /id="previous-chats"/);
+  assert.match(html, /id="next-chats"/);
+  assert.match(html, /id="previous-messages"/);
+  assert.match(html, /id="next-messages"/);
+  assert.match(renderer, /beforeCursor/);
+  assert.match(renderer, /loadChats\("previous"\)/);
+  assert.match(renderer, /loadMessages\("previous"\)/);
+  assert.match(renderer, /elements\.previousChats\.disabled = !page\.hasPrevious/);
+  assert.match(renderer, /elements\.previousMessages\.disabled = !page\.hasPrevious/);
+  assert.match(styles, /\.message-pagination\s*\{/);
 });
 
 test("renders HTTP links as previews and opens only safe external URLs", () => {
@@ -157,4 +174,16 @@ test("packages the release sidecar inside a verified macOS bundle", () => {
   assert.match(macPackager, /line-cheater\.icns/);
   assert.match(macPackager, /"assets", "icon\.png"/);
   assert.match(macPackager, /pixelWidth:\\s\*1024/);
+});
+
+test("provides a self-checking DMG packaging script", () => {
+  assert.equal(packageJson.scripts["package:dmg"], "./scripts/package-dmg.sh");
+  assert.match(dmgPackager, /npm --prefix \"\$electron_root\" ci/);
+  assert.match(dmgPackager, /SKIP_NPM_CI/);
+  assert.match(dmgPackager, /electron_installer/);
+  assert.match(dmgPackager, /hdiutil verify/);
+  assert.match(dmgPackager, /hdiutil attach/);
+  assert.match(dmgPackager, /mounted_sidecar/);
+  assert.match(dmgPackager, /--version/);
+  assert.equal(fs.statSync(path.join(root, "scripts", "package-dmg.sh")).mode & 0o111, 0o111);
 });

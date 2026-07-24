@@ -77,9 +77,9 @@ Verified implementation:
 - [x] Open source SQLite with `SQLITE_OPEN_READ_ONLY` and `PRAGMA query_only`.
 - [x] Bound SQLite page cache and temp behavior independently of database size.
 - [x] List main and `LineSquare.sqlite` community chats through one
-  `(last_updated, source, pk)` cursor. Each chat carries its source so message
-  pages are routed back to the correct database.
-- [x] List messages with a `(timestamp, pk)` keyset cursor.
+  `(last_updated, source, pk)` keyset cursor in both directions. Each chat
+  carries its source so message pages are routed back to the correct database.
+- [x] List messages with a `(timestamp, pk)` keyset cursor in both directions.
 - [x] Reject pages larger than 1,000 records.
 - [x] Store file metadata, attachment classification, and removal selections in
   a separate `catalog.sqlite`.
@@ -349,8 +349,11 @@ cargo run -p line-backup-native -- \
 
 CLI cursor components are an atomic pair. Supplying only one component is an
 error. The sidecar's chat cursor additionally includes `source`; renderer code
-must round-trip the complete opaque cursor. The UI must replace old windows of
-data instead of accumulating every returned page.
+must round-trip the complete opaque cursor. The desktop sidecar accepts either
+`cursor` (next page) or `beforeCursor` (previous page), returns `hasPrevious`,
+and the UI replaces old bounded windows instead of accumulating every returned
+page. Queries fetch one extra row so an exact multiple of the page size does
+not expose a phantom next page.
 
 ## Sidecar protocol v1
 
@@ -367,7 +370,7 @@ Request and success response:
 
 ```json
 {"id":"42","method":"listMessages","params":{"source":"square","chatPk":7,"limit":180}}
-{"id":"42","ok":true,"result":{"items":[],"nextCursor":null}}
+{"id":"42","ok":true,"result":{"items":[],"nextCursor":null,"hasPrevious":false}}
 ```
 
 Structured error:
@@ -549,6 +552,10 @@ WHERE ZCHAT = ?
 ORDER BY timestamp, Z_PK
 LIMIT ?
 ```
+
+Previous-page requests invert the comparison and sort order, then reverse the
+bounded result before returning it. Search pages use the same bidirectional
+`(timestamp, pk)` cursor contract.
 
 LINE schema differs by version, so query construction checks table columns
 before referring to optional fields. New schema variants must be added with

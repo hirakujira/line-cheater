@@ -4,7 +4,13 @@ const bridge = window.lineNativeBridge;
 const NativeDataProvider = window.LineNativeDataProvider;
 let provider = null;
 let chatCursor = null;
+let chatBeforeCursor = null;
+let chatPageNumber = 1;
+let chatLoading = false;
 let messageCursor = null;
+let messageBeforeCursor = null;
+let messagePageNumber = 1;
+let messageLoading = false;
 let selectedChatPk = null;
 let selectedChat = null;
 let activeSearch = null;
@@ -56,7 +62,9 @@ const elements = {
   selectedChatMeta: document.querySelector("#selected-chat-meta"),
   messageStatus: document.querySelector("#message-status"),
   chatPageInfo: document.querySelector("#chat-page-info"),
+  previousChats: document.querySelector("#previous-chats"),
   nextChats: document.querySelector("#next-chats"),
+  previousMessages: document.querySelector("#previous-messages"),
   nextMessages: document.querySelector("#next-messages"),
   scanCatalog: document.querySelector("#scan-catalog"),
   buildCandidate: document.querySelector("#build-candidate"),
@@ -378,7 +386,9 @@ async function openSource(kind) {
     elements.sessionSummary.classList.add("hidden");
     updateLoadModalProgress(12, "正在以唯讀模式開啟 SQLite…");
     provider = new NativeDataProvider(bridge);
-    chatCursor = messageCursor = null;
+    chatCursor = chatBeforeCursor = messageCursor = messageBeforeCursor = null;
+    chatPageNumber = messagePageNumber = 1;
+    chatLoading = messageLoading = false;
     selectedChatPk = activeSearch = selectedChat = null;
     messageRenderGeneration += 1;
     disposeCleanupAlbum();
@@ -401,6 +411,8 @@ async function openSource(kind) {
     elements.selectedChatTitle.textContent = "選取聊天室";
     elements.selectedChatMeta.textContent = "請從左側選取聊天室開始。";
     elements.messageStatus.textContent = "";
+    elements.previousMessages.disabled = true;
+    elements.nextMessages.disabled = true;
     const info = await provider.sessionInfo();
     activeSourceBytes = Number(info.source.sourceBytes) || 0;
     const sourceName = sourceDisplayName(info.source.sourcePath, info.source.kind);
@@ -425,7 +437,7 @@ async function openSource(kind) {
     const finalInfo = await provider.sessionInfo();
     renderSessionSummary(finalInfo);
     updateLoadModalProgress(93, "正在顯示聊天室…");
-    await loadChats(null);
+    await loadChats("initial");
     updateLoadModalProgress(100, "完整備份解析完成。");
     setStatus("備份已以唯讀模式開啟，可以進入工作區。");
     selectedSourceKind = kind;
@@ -452,43 +464,75 @@ async function openSource(kind) {
   }
 }
 
-async function loadChats(cursor) {
-  const page = await provider.listChats({ limit: 100, cursor });
-  replaceChildren(elements.chats, page.items, (chat) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    const selected = selectedChatPk === chat.pk &&
-      (selectedChat ? selectedChat.source : "line") === (chat.source || "line");
-    button.className = `chat-item${selected ? " selected" : ""}`;
-    button.dataset.chatPk = String(chat.pk);
-    button.dataset.chatSource = chat.source || "line";
-    button.setAttribute("role", "option");
-    button.setAttribute("aria-selected", String(selected));
-    const title = document.createElement("span");
-    title.className = "chat-item-title";
-    title.textContent = chat.title;
-    const meta = document.createElement("span");
-    meta.className = "chat-item-meta";
-    const count = document.createElement("span");
-    count.textContent = `${chat.humanMessageCount.toLocaleString()} 則`;
-    const date = document.createElement("span");
-    date.textContent = formatTimestamp(chat.lastUpdated);
-    meta.append(count, date);
-    button.append(title, meta);
-    button.addEventListener("click", () => void selectChat(chat));
-    return button;
-  });
-  chatCursor = page.nextCursor;
-  elements.nextChats.disabled = !chatCursor;
-  elements.chatPageInfo.textContent =
-    `${page.items.length.toLocaleString()} 個聊天室${chatCursor ? " · 尚有下一頁" : ""}`;
+function chatCursorFor(chat) {
+  if (!chat) return null;
+  return {
+    lastUpdated: Number(chat.lastUpdated) || 0,
+    source: chat.source || "line",
+    pk: Number(chat.pk) || 0
+  };
+}
+
+function messageCursorFor(message) {
+  if (!message) return null;
+  return {
+    timestamp: Number(message.timestamp) || 0,
+    pk: Number(message.pk) || 0
+  };
+}
+
+async function loadChats(direction = "initial") {
+  if (chatLoading || !provider) return;
+  chatLoading = true;
+  const cursor = direction === "next" ? chatCursor : null;
+  const beforeCursor = direction === "previous" ? chatBeforeCursor : null;
+  try {
+    const page = await provider.listChats({ limit: 100, cursor, beforeCursor });
+    replaceChildren(elements.chats, page.items, (chat) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      const selected = selectedChatPk === chat.pk &&
+        (selectedChat ? selectedChat.source : "line") === (chat.source || "line");
+      button.className = `chat-item${selected ? " selected" : ""}`;
+      button.dataset.chatPk = String(chat.pk);
+      button.dataset.chatSource = chat.source || "line";
+      button.setAttribute("role", "option");
+      button.setAttribute("aria-selected", String(selected));
+      const title = document.createElement("span");
+      title.className = "chat-item-title";
+      title.textContent = chat.title;
+      const meta = document.createElement("span");
+      meta.className = "chat-item-meta";
+      const count = document.createElement("span");
+      count.textContent = `${chat.humanMessageCount.toLocaleString()} 則`;
+      const date = document.createElement("span");
+      date.textContent = formatTimestamp(chat.lastUpdated);
+      meta.append(count, date);
+      button.append(title, meta);
+      button.addEventListener("click", () => void selectChat(chat));
+      return button;
+    });
+    chatBeforeCursor = chatCursorFor(page.items[0]);
+    chatCursor = page.nextCursor;
+    if (direction === "previous") chatPageNumber = Math.max(1, chatPageNumber - 1);
+    else if (direction === "next") chatPageNumber += 1;
+    else chatPageNumber = 1;
+    elements.previousChats.disabled = !page.hasPrevious;
+    elements.nextChats.disabled = !chatCursor;
+    elements.chatPageInfo.textContent = page.items.length
+      ? `第 ${chatPageNumber} 頁 · ${page.items.length.toLocaleString()} 個聊天室`
+      : "沒有聊天室";
+  } finally {
+    chatLoading = false;
+  }
 }
 
 async function selectChat(chat) {
   selectedChat = chat;
   selectedChatPk = chat.pk;
   activeSearch = null;
-  messageCursor = null;
+  messageCursor = messageBeforeCursor = null;
+  messagePageNumber = 1;
   elements.selectedChatTitle.textContent = chat.title;
   elements.selectedChatMeta.textContent =
     `${chatKindLabel(chat.kind)} · ${chat.humanMessageCount.toLocaleString()} 則人類訊息 · 名稱來源：${titleSourceLabel(chat.titleSource)}`;
@@ -500,38 +544,55 @@ async function selectChat(chat) {
   }
   elements.messages.replaceChildren(emptyState("正在讀取訊息…"));
   elements.messageStatus.textContent = "正在讀取訊息…";
-  await loadMessages(null);
+  elements.previousMessages.disabled = true;
+  elements.nextMessages.disabled = true;
+  await loadMessages("initial");
 }
 
-async function loadMessages(cursor) {
-  if (activeSearch) {
-    renderMessagePage(await provider.searchMessages(activeSearch, {
-      chatPk: selectedChatPk,
+async function loadMessages(direction = "initial") {
+  if (messageLoading || !provider) return;
+  if (selectedChatPk === null || !selectedChat) return;
+  messageLoading = true;
+  const cursor = direction === "next" ? messageCursor : null;
+  const beforeCursor = direction === "previous" ? messageBeforeCursor : null;
+  try {
+    if (activeSearch) {
+      renderMessagePage(await provider.searchMessages(activeSearch, {
+        chatPk: selectedChatPk,
+        source: selectedChat.source || "line",
+        limit: 180,
+        cursor,
+        beforeCursor
+      }), direction);
+      return;
+    }
+    renderMessagePage(await provider.listMessages(selectedChatPk, {
       source: selectedChat.source || "line",
       limit: 180,
-      cursor
-    }));
-    return;
+      cursor,
+      beforeCursor
+    }), direction);
+  } finally {
+    messageLoading = false;
   }
-  if (selectedChatPk === null) return;
-  renderMessagePage(await provider.listMessages(selectedChatPk, {
-    source: selectedChat.source || "line",
-    limit: 180,
-    cursor
-  }));
 }
 
-function renderMessagePage(page) {
+function renderMessagePage(page, direction = "initial") {
   const renderGeneration = ++messageRenderGeneration;
   replaceChildren(elements.messages, page.items, renderMessage);
   if (!page.items.length) {
     elements.messages.replaceChildren(emptyState("這個聊天室沒有可顯示的訊息。"));
   }
-  elements.messageStatus.textContent = page.items.length
-    ? `本頁顯示 ${page.items.length.toLocaleString()} 則訊息`
-    : "";
   void hydrateMessagePreviews(elements.messages, renderGeneration);
+  messageBeforeCursor = messageCursorFor(page.items[0]);
   messageCursor = page.nextCursor;
+  if (direction === "previous") messagePageNumber = Math.max(1, messagePageNumber - 1);
+  else if (direction === "next") messagePageNumber += 1;
+  else messagePageNumber = 1;
+  elements.messageStatus.textContent = page.items.length
+    ? `第 ${messagePageNumber} 頁 · 本頁顯示 ${page.items.length.toLocaleString()} 則訊息`
+    : "";
+  elements.previousMessages.disabled = !page.hasPrevious;
   elements.nextMessages.disabled = !messageCursor;
 }
 
@@ -1626,8 +1687,10 @@ for (const button of sidebarItems) {
     sidebarItems[next].focus();
   });
 }
-elements.nextChats.addEventListener("click", () => void loadChats(chatCursor));
-elements.nextMessages.addEventListener("click", () => void loadMessages(messageCursor));
+elements.previousChats.addEventListener("click", () => void loadChats("previous"));
+elements.nextChats.addEventListener("click", () => void loadChats("next"));
+elements.previousMessages.addEventListener("click", () => void loadMessages("previous"));
+elements.nextMessages.addEventListener("click", () => void loadMessages("next"));
 elements.scanCatalog.addEventListener("click", () => void scanCatalog());
 elements.buildCandidate.addEventListener("click", () => void buildCandidate());
 elements.packageModalClose.addEventListener("click", closePackageModal);
@@ -1644,10 +1707,10 @@ document.addEventListener("keydown", (event) => {
 elements.searchForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   activeSearch = elements.searchQuery.value.trim();
-  messageCursor = null;
-  if (!activeSearch) return;
+  messageCursor = messageBeforeCursor = null;
+  messagePageNumber = 1;
   try {
-    await loadMessages(null);
+    await loadMessages("initial");
   } catch (error) {
     setStatus(error.message, true);
   }

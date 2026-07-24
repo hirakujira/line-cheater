@@ -329,6 +329,7 @@ progress { width: 100%; height: 8px; }
 .chat-pagination { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: auto; padding-top: 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.78rem; }
 .message-heading { min-height: 50px; }
 .message-heading .muted { margin: 4px 0 0; }
+.message-pagination { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .message-search { margin-bottom: 10px; }
 .message-status { min-height: 24px; color: var(--muted); font-size: 0.8rem; }
 .message-list { min-height: 0; flex: 1 1 auto; overflow: auto; padding: 4px 4px 12px; border-top: 1px solid var(--line); }

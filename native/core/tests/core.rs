@@ -203,14 +203,59 @@ fn inspects_private_store_database_and_opens_read_only() {
 fn pages_chats_and_messages_with_bounded_limits() {
     let temporary = TempDir::new().unwrap();
     let source = make_fixture(temporary.path());
+    let database_path = source.join(inspect_source(&source).unwrap().database_path);
+    let connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "
+            INSERT INTO ZUSER VALUES (3, 'u2', 'Bob');
+            INSERT INTO ZUSER VALUES (4, 'u3', 'Carol');
+            INSERT INTO ZCHAT VALUES (8, 'u2', 0, 400, 'third');
+            INSERT INTO ZCHAT VALUES (9, 'u3', 0, 300, 'third');
+            INSERT INTO ZMESSAGE VALUES (5, 'm5', 400, 8, 3, 1, 0, 'R', 'third', NULL, NULL);
+            INSERT INTO ZMESSAGE VALUES (6, 'm6', 300, 9, 4, 1, 0, 'R', 'third', NULL, NULL);
+            ",
+        )
+        .unwrap();
+    connection.close().unwrap();
     let prepared = prepare_source(&source, &temporary.path().join("work")).unwrap();
     let database = LineDatabase::open(&prepared.database_path).unwrap();
 
+    let first_chats = database.list_chats(None, 2).unwrap();
+    assert_eq!(first_chats.items.len(), 2);
+    assert_eq!(first_chats.items[0].title, "Bob");
+    assert!(first_chats.next_cursor.is_some());
+    assert!(!first_chats.has_previous);
+    let second_chats = database.list_chats(first_chats.next_cursor, 2).unwrap();
+    assert_eq!(second_chats.items.len(), 1);
+    assert_eq!(second_chats.items[0].title, "Alice");
+    assert!(second_chats.next_cursor.is_none());
+    assert!(second_chats.has_previous);
+    let previous_chats = database
+        .list_chats_before(
+            ChatCursor {
+                last_updated: second_chats.items[0].last_updated,
+                source: second_chats.items[0].source.clone(),
+                pk: second_chats.items[0].pk,
+            },
+            2,
+        )
+        .unwrap();
+    assert_eq!(
+        previous_chats
+            .items
+            .iter()
+            .map(|chat| chat.title.as_str())
+            .collect::<Vec<_>>(),
+        ["Bob", "Carol"]
+    );
+    assert!(!previous_chats.has_previous);
+
     let chats = database.list_chats(None, 10).unwrap();
-    assert_eq!(chats.items.len(), 1);
-    assert_eq!(chats.items[0].source, "line");
-    assert_eq!(chats.items[0].title, "Alice");
-    assert_eq!(chats.items[0].message_count, 4);
+    assert_eq!(chats.items.len(), 3);
+    assert_eq!(chats.items[2].source, "line");
+    assert_eq!(chats.items[2].title, "Alice");
+    assert_eq!(chats.items[2].message_count, 4);
 
     let first = database
         .list_messages_for_account(7, None, 2, prepared.account_id.as_deref())
@@ -236,12 +281,34 @@ fn pages_chats_and_messages_with_bounded_limits() {
             .collect::<Vec<_>>(),
         ["m3", "12345678"]
     );
+    assert!(second.next_cursor.is_none());
+    assert!(second.has_previous);
+    let previous = database
+        .list_messages_for_account_before(
+            7,
+            MessageCursor {
+                timestamp: second.items[0].timestamp,
+                pk: second.items[0].pk,
+            },
+            2,
+            prepared.account_id.as_deref(),
+        )
+        .unwrap();
+    assert_eq!(
+        previous
+            .items
+            .iter()
+            .map(|message| message.id.as_str())
+            .collect::<Vec<_>>(),
+        ["m1", "m2"]
+    );
+    assert!(!previous.has_previous);
     assert!(database.list_messages(7, None, 1_001).is_err());
 
     let after = ChatCursor {
-        last_updated: chats.items[0].last_updated,
-        source: chats.items[0].source.clone(),
-        pk: chats.items[0].pk,
+        last_updated: chats.items[2].last_updated,
+        source: chats.items[2].source.clone(),
+        pk: chats.items[2].pk,
     };
     assert!(
         database
@@ -779,6 +846,9 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
         "{\"id\":\"9\",\"method\":\"listMessages\",\"params\":{\"chatPk\":7,\"limit\":10}}\n",
         "{\"id\":\"10\",\"method\":\"listChats\",\"params\":{\"limit\":10}}\n",
         "{\"id\":\"11\",\"method\":\"listMessages\",\"params\":{\"source\":\"square\",\"chatPk\":8,\"limit\":10}}\n",
+        "{\"id\":\"12\",\"method\":\"listMessages\",\"params\":{\"chatPk\":7,\"limit\":2,\"cursor\":{\"timestamp\":100,\"pk\":2}}}\n",
+        "{\"id\":\"13\",\"method\":\"listMessages\",\"params\":{\"chatPk\":7,\"limit\":2,\"beforeCursor\":{\"timestamp\":200,\"pk\":3}}}\n",
+        "{\"id\":\"14\",\"method\":\"listChats\",\"params\":{\"limit\":1,\"beforeCursor\":{\"lastUpdated\":200,\"source\":\"line\",\"pk\":7}}}\n",
         "{\"id\":\"8\",\"method\":\"shutdown\"}\n"
     );
     let mut input = std::io::BufReader::new(requests.as_bytes());
@@ -834,6 +904,15 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
     assert_eq!(square_messages[0]["source"], "square");
     assert_eq!(square_messages[0]["isSelf"], false);
     assert_eq!(square_messages[1]["isSelf"], true);
+    assert_eq!(response("12")["result"]["items"][0]["id"], "m3");
+    assert_eq!(
+        response("12")["result"]["nextCursor"],
+        serde_json::Value::Null
+    );
+    assert_eq!(response("12")["result"]["hasPrevious"], true);
+    assert_eq!(response("13")["result"]["items"][0]["id"], "m1");
+    assert_eq!(response("13")["result"]["hasPrevious"], false);
+    assert_eq!(response("14")["result"]["items"][0]["source"], "square");
     assert_eq!(response("8")["result"]["shuttingDown"], true);
 }
 
@@ -954,6 +1033,7 @@ fn hashes_only_same_size_candidates_and_pages_duplicate_members() {
         .list_duplicate_members(&groups.items[0].sha256, members.next_cursor, 10)
         .unwrap();
     assert_eq!(rest.items.len(), 1);
+    assert!(rest.next_cursor.is_none());
 
     let resumed = catalog
         .hash_duplicate_candidates(&source, SourceKind::Directory, |_| Ok(()))

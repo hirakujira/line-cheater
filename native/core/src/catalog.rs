@@ -354,12 +354,16 @@ impl Catalog {
                 cursor.map(|value| value.id).unwrap_or(0),
                 kind_value,
                 search,
-                limit as i64
+                limit as i64 + 1
             ],
             attachment_from_row,
         )?;
-        let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        let next_cursor = if items.len() == limit {
+        let mut items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_extra = items.len() > limit;
+        if has_extra {
+            items.pop();
+        }
+        let next_cursor = if has_extra {
             items
                 .last()
                 .map(|attachment| AttachmentCursor { id: attachment.id })
@@ -1372,7 +1376,7 @@ impl Catalog {
         let reclaimable_cursor = i64::try_from(cursor.reclaimable_bytes).unwrap_or(i64::MAX);
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map(
-            params![reclaimable_cursor, cursor.sha256, limit as i64],
+            params![reclaimable_cursor, cursor.sha256, limit as i64 + 1],
             |row| {
                 Ok(DuplicateGroup {
                     sha256: row.get(0)?,
@@ -1384,8 +1388,12 @@ impl Catalog {
                 })
             },
         )?;
-        let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        let next_cursor = if items.len() == limit {
+        let mut items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_extra = items.len() > limit;
+        if has_extra {
+            items.pop();
+        }
+        let next_cursor = if has_extra {
             items.last().map(|group| DuplicateGroupCursor {
                 reclaimable_bytes: group.reclaimable_bytes,
                 sha256: group.sha256.clone(),
@@ -1419,12 +1427,16 @@ impl Catalog {
             params![
                 sha256,
                 cursor.map(|value| value.id).unwrap_or(0),
-                limit as i64
+                limit as i64 + 1
             ],
             attachment_from_row,
         )?;
-        let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-        let next_cursor = if items.len() == limit {
+        let mut items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_extra = items.len() > limit;
+        if has_extra {
+            items.pop();
+        }
+        let next_cursor = if has_extra {
             items
                 .last()
                 .map(|attachment| AttachmentCursor { id: attachment.id })
