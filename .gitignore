@@ -4,3 +4,8 @@ __pycache__/
 *.zip
 *.imazingapp
 LINE
+.line-reader-work/
+native/target/
+/target/
+native/electron/node_modules/
+native/electron/dist/

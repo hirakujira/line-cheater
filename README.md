@@ -1,6 +1,18 @@
 # LINE Cheater｜GitHub Pages 部署包
 
+> 超大型備份與桌面版 Rust core 的架構、目前進度、驗證紀錄及接手說明請見
+> [NATIVE.md](NATIVE.md)。
+
+> 可執行的 Electron + Rust 開發預覽、啟動方式與安全邊界請見
+> [native/electron/README.md](native/electron/README.md)。
+
 **直接使用：<https://line-cheater.gginin.de>**
+
+Apple Silicon macOS 測試版可用
+`native/electron/scripts/package-dmg.sh` 產生並驗證 `.app`、ZIP 與 DMG；
+已有依賴時可設定 `SKIP_NPM_CI=1` 加速執行。
+目前為 ad-hoc 簽章、尚未 Apple Developer ID 簽署或 notarize；公開散布與
+Intel Mac 支援狀態請見 [macOS package 說明](native/electron/README.md#macos-package)。
 
 這個資料夾包含可直接上傳到 GitHub Pages 的純前端版本，以及供本機使用的 CLI。GitHub Pages 只會發布 HTML／CSS／JavaScript，不會執行 `cli/`。
 
@@ -60,6 +72,7 @@ LINE iOS App Container 備份檔案可透過 iMazing 備份軟體取得；本工
 - 支援 File System Access API 的瀏覽器（桌面版 Chrome／Edge）會直接寫入檔案；其他瀏覽器對超過 256 MB 的輸出會阻止 Blob 下載，以避免記憶體峰值。
 - 重新建立 ZIP 可能改變 ZIP metadata；已成功透過 iMazing 還原到手機，但仍請保留原始 `.imazingapp` 備份以防意外。
 - 刪除縮圖通常只會移除預覽；刪除原始附件可能導致 LINE 無法開啟媒體。
+- 「只保留縮圖」只會標記 SQLite 已確認為圖片、且同一訊息確實有非空縮圖的原檔；PDF、影片、無縮圖、空縮圖與無法確認類型的附件都會保留。
 - 部分舊附件在目前的 `Line.sqlite` 中已找不到對應訊息；介面仍會依路徑中的聊天室 ID 分組並顯示縮圖，但會明確標示「找不到對應訊息」，不會把檔案修改時間誤稱為傳送時間。
 - JSON 與純文字操作計畫會附上可辨識的聊天室、訊息時間、傳送者與摘要，實際刪除目標仍以完整封存路徑為準。
 

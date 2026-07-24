@@ -1,0 +1,545 @@
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File};
+use std::io::{BufReader, Read};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use walkdir::WalkDir;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZIP64_BYTES_THR, ZipArchive, ZipWriter};
+
+use crate::catalog::Catalog;
+use crate::source::{SourceKind, inspect_source};
+
+const HASH_BUFFER_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateProgress {
+    pub processed_bytes: u64,
+    pub total_bytes: u64,
+    pub processed_entries: u64,
+    pub total_entries: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateReport {
+    pub source_path: String,
+    pub output_path: String,
+    pub input_entries: u64,
+    pub output_entries: u64,
+    pub removed_entries: u64,
+    pub output_bytes: u64,
+    pub used_zip64: bool,
+    pub full_crc_verified: bool,
+    pub protected_entries_verified: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileFingerprint {
+    bytes: u64,
+    modified_ns: u128,
+}
+
+struct ArchiveBuildInfo {
+    entries: u64,
+    compressed_bytes: u64,
+    protected_hashes: HashMap<String, String>,
+    warnings: Vec<String>,
+}
+
+pub fn build_candidate<F>(
+    source: &Path,
+    output: &Path,
+    catalog: &Catalog,
+    full_crc: bool,
+    mut on_progress: F,
+) -> Result<CandidateReport>
+where
+    F: FnMut(CandidateProgress) -> Result<()>,
+{
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("source does not exist: {}", source.display()))?;
+    let report = inspect_source(&source)?;
+    if report.kind == SourceKind::Sqlite {
+        bail!("a direct Line.sqlite is not a complete backup and cannot become .imazingapp");
+    }
+    validate_catalog_source(catalog, &source)?;
+    validate_output(&source, output, report.kind)?;
+    let marked: HashSet<String> = catalog.marked_paths()?.into_iter().collect();
+    for path in &marked {
+        if !is_removable_attachment(path) || is_protected(path) {
+            bail!("removal plan contains a protected or non-attachment path: {path}");
+        }
+    }
+
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = partial_path(output);
+    if temporary.exists() {
+        bail!(
+            "partial output already exists; inspect or remove it before retrying: {}",
+            temporary.display()
+        );
+    }
+
+    let build_result = match report.kind {
+        SourceKind::Directory => {
+            build_from_directory(&source, &temporary, &marked, full_crc, &mut on_progress)
+        }
+        SourceKind::ImazingArchive => {
+            build_from_archive(&source, &temporary, &marked, full_crc, &mut on_progress)
+        }
+        SourceKind::Sqlite => unreachable!(),
+    };
+    match build_result {
+        Ok(mut candidate) => {
+            fs::rename(&temporary, output)?;
+            candidate.source_path = source.display().to_string();
+            candidate.output_path = output.display().to_string();
+            candidate.output_bytes = fs::metadata(output)?.len();
+            Ok(candidate)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+fn build_from_archive<F>(
+    source: &Path,
+    temporary: &Path,
+    marked: &HashSet<String>,
+    full_crc: bool,
+    on_progress: &mut F,
+) -> Result<CandidateReport>
+where
+    F: FnMut(CandidateProgress) -> Result<()>,
+{
+    let before_fingerprint = file_fingerprint(source)?;
+    let build_info = inspect_archive_for_build(source)?;
+    let input_entries = build_info.entries;
+    let total_bytes = build_info.compressed_bytes;
+    let protected_before = build_info.protected_hashes;
+    let warnings = build_info.warnings;
+    if !protected_before
+        .keys()
+        .any(|path| path.ends_with("/Messages/Line.sqlite"))
+    {
+        bail!("source archive does not contain a protected Messages/Line.sqlite");
+    }
+
+    let input = File::open(source)?;
+    let mut archive = ZipArchive::new(input)?;
+    let output_file = File::create(temporary)?;
+    let mut writer = ZipWriter::new(output_file).set_auto_large_file();
+    let mut removed_found = HashSet::new();
+    let mut processed_bytes = 0_u64;
+    let mut output_entries = 0_u64;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        ensure_stable_archive_name(&entry)?;
+        let name = entry.name().to_string();
+        processed_bytes = processed_bytes.saturating_add(entry.compressed_size());
+        if marked.contains(&name) {
+            removed_found.insert(name);
+            on_progress(CandidateProgress {
+                processed_bytes,
+                total_bytes,
+                processed_entries: (index + 1) as u64,
+                total_entries: input_entries,
+            })?;
+            continue;
+        }
+        writer.raw_copy_file(entry)?;
+        output_entries += 1;
+        on_progress(CandidateProgress {
+            processed_bytes,
+            total_bytes,
+            processed_entries: (index + 1) as u64,
+            total_entries: input_entries,
+        })?;
+    }
+    let output = writer.finish()?;
+    output.sync_all()?;
+
+    if removed_found.len() != marked.len() {
+        let missing: Vec<&String> = marked.difference(&removed_found).collect();
+        bail!("removal plan paths were not found in source archive: {missing:?}");
+    }
+    if file_fingerprint(source)? != before_fingerprint {
+        bail!("source .imazingapp changed while candidate was being written");
+    }
+    verify_candidate(
+        temporary,
+        marked,
+        &protected_before,
+        full_crc,
+        output_entries,
+    )?;
+    let output_bytes = fs::metadata(temporary)?.len();
+    let mut protected_entries_verified: Vec<String> = protected_before.keys().cloned().collect();
+    protected_entries_verified.sort();
+    Ok(CandidateReport {
+        source_path: String::new(),
+        output_path: String::new(),
+        input_entries,
+        output_entries,
+        removed_entries: removed_found.len() as u64,
+        output_bytes,
+        used_zip64: output_bytes >= ZIP64_BYTES_THR || output_entries >= u16::MAX as u64,
+        full_crc_verified: full_crc,
+        protected_entries_verified,
+        warnings,
+    })
+}
+
+fn build_from_directory<F>(
+    source: &Path,
+    temporary: &Path,
+    marked: &HashSet<String>,
+    full_crc: bool,
+    on_progress: &mut F,
+) -> Result<CandidateReport>
+where
+    F: FnMut(CandidateProgress) -> Result<()>,
+{
+    let protected_before = hash_directory_protected(source)?;
+    if !protected_before
+        .keys()
+        .any(|path| path.ends_with("/Messages/Line.sqlite"))
+    {
+        bail!("source directory does not contain a protected Messages/Line.sqlite");
+    }
+    let stats = catalog_directory_work(source, marked)?;
+    let output_file = File::create(temporary)?;
+    let mut writer = ZipWriter::new(output_file).set_auto_large_file();
+    let mut processed_bytes = 0_u64;
+    let mut processed_entries = 0_u64;
+    let mut output_entries = 0_u64;
+    let mut removed_found = HashSet::new();
+
+    for entry in WalkDir::new(source).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = normalized_relative_path(source, entry.path())?;
+        processed_entries += 1;
+        if marked.contains(&relative) {
+            removed_found.insert(relative);
+            on_progress(CandidateProgress {
+                processed_bytes,
+                total_bytes: stats.1,
+                processed_entries,
+                total_entries: stats.0,
+            })?;
+            continue;
+        }
+        let before = file_fingerprint(entry.path())?;
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .large_file(before.bytes >= ZIP64_BYTES_THR);
+        writer.start_file(&relative, options)?;
+        let mut input = BufReader::with_capacity(HASH_BUFFER_BYTES, File::open(entry.path())?);
+        let copied = std::io::copy(&mut input, &mut writer)?;
+        if copied != before.bytes || file_fingerprint(entry.path())? != before {
+            bail!("source file changed while it was being copied: {relative}");
+        }
+        processed_bytes = processed_bytes.saturating_add(copied);
+        output_entries += 1;
+        on_progress(CandidateProgress {
+            processed_bytes,
+            total_bytes: stats.1,
+            processed_entries,
+            total_entries: stats.0,
+        })?;
+    }
+    let output = writer.finish()?;
+    output.sync_all()?;
+    if removed_found.len() != marked.len() {
+        let missing: Vec<&String> = marked.difference(&removed_found).collect();
+        bail!("removal plan paths were not found in source directory: {missing:?}");
+    }
+    let protected_after = hash_directory_protected(source)?;
+    if protected_after != protected_before {
+        bail!("protected source files changed while candidate was being written");
+    }
+    verify_candidate(
+        temporary,
+        marked,
+        &protected_before,
+        full_crc,
+        output_entries,
+    )?;
+    let output_bytes = fs::metadata(temporary)?.len();
+    let mut protected_entries_verified: Vec<String> = protected_before.keys().cloned().collect();
+    protected_entries_verified.sort();
+    Ok(CandidateReport {
+        source_path: String::new(),
+        output_path: String::new(),
+        input_entries: stats.0,
+        output_entries,
+        removed_entries: removed_found.len() as u64,
+        output_bytes,
+        used_zip64: output_bytes >= ZIP64_BYTES_THR || output_entries >= u16::MAX as u64,
+        full_crc_verified: full_crc,
+        protected_entries_verified,
+        warnings: vec![
+            "directory sources are stored without compression; ZIP metadata may differ from iMazing"
+                .to_string(),
+        ],
+    })
+}
+
+fn validate_catalog_source(catalog: &Catalog, source: &Path) -> Result<()> {
+    let catalog_source = catalog
+        .source_path()?
+        .context("catalog has not been scanned yet")?
+        .canonicalize()
+        .context("catalog source no longer exists")?;
+    if catalog_source != source {
+        bail!("catalog belongs to another source");
+    }
+    Ok(())
+}
+
+fn validate_output(source: &Path, output: &Path, kind: SourceKind) -> Result<()> {
+    if output.exists() {
+        bail!("output already exists: {}", output.display());
+    }
+    if source == output {
+        bail!("output must not overwrite the source");
+    }
+    if kind == SourceKind::Directory {
+        let absolute_output = if output.is_absolute() {
+            output.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(output)
+        };
+        if absolute_output.starts_with(source) {
+            bail!("directory candidate output must be outside the source tree");
+        }
+    }
+    let output_name = output
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if !output_name.ends_with(".imazingapp") && !output_name.ends_with(".imazingapp.candidate") {
+        bail!("candidate output must end with .imazingapp or .imazingapp.candidate");
+    }
+    Ok(())
+}
+
+fn partial_path(output: &Path) -> PathBuf {
+    let mut name = output.as_os_str().to_os_string();
+    name.push(".partial");
+    PathBuf::from(name)
+}
+
+fn is_removable_attachment(path: &str) -> bool {
+    let wrapped = format!("/{}/", path.trim_matches('/'));
+    wrapped.contains("/Message Attachments/") || wrapped.contains("/Message Thumbnails/")
+}
+
+fn is_protected(path: &str) -> bool {
+    path == ".lock"
+        || path == "iTunesArtwork"
+        || path == "iTunesMetadata.plist"
+        || path == "Payload/LINE.app/Info.plist"
+        || path.ends_with("/Messages/Line.sqlite")
+        || path.ends_with("/Messages/Line.sqlite-wal")
+        || path.ends_with("/Messages/Line.sqlite-shm")
+}
+
+fn inspect_archive_for_build(source: &Path) -> Result<ArchiveBuildInfo> {
+    let file = File::open(source)?;
+    let mut archive = ZipArchive::new(file)?;
+    let mut names = HashSet::with_capacity(archive.len());
+    let mut protected_names = Vec::new();
+    let mut total_bytes = 0_u64;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index)?;
+        ensure_stable_archive_name(&entry)?;
+        if entry.encrypted() {
+            bail!("encrypted ZIP entries are not supported: {}", entry.name());
+        }
+        let name = entry.name().to_string();
+        if !names.insert(name.clone()) {
+            bail!("source archive contains duplicate entry path: {name}");
+        }
+        if is_protected(&name) && !entry.is_dir() {
+            protected_names.push(name);
+        }
+        total_bytes = total_bytes.saturating_add(entry.compressed_size());
+    }
+    let mut protected = HashMap::new();
+    for name in protected_names {
+        protected.insert(name.clone(), hash_archive_entry(source, &name)?);
+    }
+    let mut warnings = Vec::new();
+    if !protected.contains_key(".lock") {
+        warnings.push("source archive does not contain .lock".to_string());
+    }
+    if !protected.contains_key("Payload/LINE.app/Info.plist") {
+        warnings.push("source archive does not contain Payload/LINE.app/Info.plist".to_string());
+    }
+    Ok(ArchiveBuildInfo {
+        entries: archive.len() as u64,
+        compressed_bytes: total_bytes,
+        protected_hashes: protected,
+        warnings,
+    })
+}
+
+fn ensure_stable_archive_name<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> Result<()> {
+    let raw = std::str::from_utf8(entry.name_raw())
+        .context("archive contains a non-UTF-8 entry path; refusing to rewrite it")?;
+    if raw != entry.name() {
+        bail!(
+            "archive entry name does not round-trip without metadata changes: {}",
+            entry.name()
+        );
+    }
+    Ok(())
+}
+
+fn verify_candidate(
+    candidate: &Path,
+    marked: &HashSet<String>,
+    protected_before: &HashMap<String, String>,
+    full_crc: bool,
+    expected_entries: u64,
+) -> Result<()> {
+    let file = File::open(candidate)?;
+    let mut archive = ZipArchive::new(file)?;
+    if archive.len() as u64 != expected_entries {
+        bail!(
+            "candidate entry count mismatch: expected {expected_entries}, got {}",
+            archive.len()
+        );
+    }
+    let mut names = HashSet::with_capacity(archive.len());
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        ensure_stable_archive_name(&entry)?;
+        let name = entry.name().to_string();
+        if marked.contains(&name) {
+            bail!("candidate still contains a marked removal: {name}");
+        }
+        if !names.insert(name.clone()) {
+            bail!("candidate contains duplicate entry path: {name}");
+        }
+        if full_crc && !entry.is_dir() {
+            std::io::copy(&mut entry, &mut std::io::sink())
+                .with_context(|| format!("CRC validation failed for {name}"))?;
+        }
+    }
+    for (name, expected_hash) in protected_before {
+        let actual = hash_archive_entry(candidate, name)?;
+        if &actual != expected_hash {
+            bail!("protected entry hash changed in candidate: {name}");
+        }
+    }
+    Ok(())
+}
+
+fn hash_directory_protected(root: &Path) -> Result<HashMap<String, String>> {
+    let mut protected = HashMap::new();
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = normalized_relative_path(root, entry.path())?;
+        if is_protected(&relative) {
+            protected.insert(relative, hash_reader(File::open(entry.path())?)?);
+        }
+    }
+    Ok(protected)
+}
+
+fn hash_archive_entry(archive_path: &Path, name: &str) -> Result<String> {
+    let file = File::open(archive_path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let entry = archive
+        .by_name(name)
+        .with_context(|| format!("candidate is missing protected entry: {name}"))?;
+    hash_reader(entry)
+}
+
+fn hash_reader(mut reader: impl Read) -> Result<String> {
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn catalog_directory_work(root: &Path, marked: &HashSet<String>) -> Result<(u64, u64)> {
+    let mut entries = 0_u64;
+    let mut bytes = 0_u64;
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        entries += 1;
+        let relative = normalized_relative_path(root, entry.path())?;
+        if !marked.contains(&relative) {
+            bytes = bytes.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok((entries, bytes))
+}
+
+fn normalized_relative_path(root: &Path, path: &Path) -> Result<String> {
+    let relative = path
+        .strip_prefix(root)
+        .with_context(|| format!("path escaped source root: {}", path.display()))?;
+    let value = relative
+        .to_str()
+        .context("source contains a non-UTF-8 path; refusing to rewrite it")?
+        .replace('\\', "/");
+    if value.is_empty()
+        || value
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        bail!("source contains an unsafe relative path: {value}");
+    }
+    Ok(value)
+}
+
+fn file_fingerprint(path: &Path) -> Result<FileFingerprint> {
+    let metadata = fs::metadata(path)?;
+    Ok(FileFingerprint {
+        bytes: metadata.len(),
+        modified_ns: metadata
+            .modified()
+            .ok()
+            .and_then(system_time_ns)
+            .unwrap_or(0),
+    })
+}
+
+fn system_time_ns(value: SystemTime) -> Option<u128> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|value| value.as_nanos())
+}

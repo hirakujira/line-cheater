@@ -279,8 +279,10 @@
       var shouldMarkAll = action === "remove" && !isCleanupGroupFullyMarked(group);
       var shouldRestoreOriginals = action === "keep-thumbnail" && isCleanupGroupKeepingThumbnails(group);
       group.reviews.forEach(function (review) {
+        var thumbnailBackedImage = cleanupReviewHasThumbnailBackedImage(review);
         review.files.forEach(function (descriptor) {
           if (action === "keep-thumbnail") {
+            if (!thumbnailBackedImage) return;
             if (descriptor.kind === "original") {
               if (shouldRestoreOriginals) state.attachmentsMarkedForRemoval.delete(descriptor.path);
               else state.attachmentsMarkedForRemoval.add(descriptor.path);
@@ -1480,6 +1482,7 @@
       chatPk: numberOrNull(row.chatPk),
       timestamp: normalizeTimestamp(row.timestamp),
       sender: isSelf ? "我" : (sender ? sender.name : "未知傳送者"),
+      contentType: numberOrNull(row.contentType),
       contentLabel: cleanupContentLabel(row.contentType),
       summary: text || "沒有文字內容（" + cleanupContentLabel(row.contentType) + "）",
       source: row.source || "line",
@@ -1945,21 +1948,30 @@
     });
   }
 
-  function cleanupGroupHasOriginalAndThumbnail(group) {
-    var hasOriginal = false;
-    var hasThumbnail = false;
-    group.reviews.forEach(function (review) {
-      review.files.forEach(function (descriptor) {
-        if (descriptor.kind === "original") hasOriginal = true;
-        if (descriptor.kind === "thumbnail") hasThumbnail = true;
-      });
+  function cleanupReviewHasThumbnailBackedImage(review) {
+    if (review.referenceStatus !== "referenced" ||
+        !review.message ||
+        !review.messageId ||
+        !isImageContentType(review.message.contentType)) {
+      return false;
+    }
+    var hasOriginal = review.files.some(function (descriptor) {
+      return descriptor.kind === "original";
     });
-    return hasOriginal && hasThumbnail;
+    var hasNonemptyThumbnail = review.files.some(function (descriptor) {
+      return descriptor.kind === "thumbnail" && Number(descriptor.file.size) > 0;
+    });
+    return hasOriginal && hasNonemptyThumbnail;
+  }
+
+  function cleanupGroupHasThumbnailBackedImage(group) {
+    return group.reviews.some(cleanupReviewHasThumbnailBackedImage);
   }
 
   function isCleanupGroupKeepingThumbnails(group) {
-    if (!cleanupGroupHasOriginalAndThumbnail(group)) return false;
+    if (!cleanupGroupHasThumbnailBackedImage(group)) return false;
     return group.reviews.every(function (review) {
+      if (!cleanupReviewHasThumbnailBackedImage(review)) return true;
       return review.files.every(function (descriptor) {
         return descriptor.kind === "original"
           ? state.attachmentsMarkedForRemoval.has(descriptor.path)
@@ -1981,8 +1993,8 @@
       var actionLabel = fullyMarked ? "取消刪除全部" : "刪除全部";
       var actionState = fullyMarked ? " is-cancel" : " is-delete";
       var keepingThumbnails = isCleanupGroupKeepingThumbnails(group);
-      var keepThumbnailAction = cleanupGroupHasOriginalAndThumbnail(group)
-        ? '<button class="cleanup-group-open cleanup-group-action-button' + (keepingThumbnails ? " is-cancel" : " is-delete") + '" type="button" data-cleanup-group-action="keep-thumbnail" data-cleanup-group="' + encodedGroupKey + '" title="' + (keepingThumbnails ? "取消原始圖片的刪除標記" : "標記刪除原始附件，保留縮圖") + '">' + (keepingThumbnails ? "還原原始圖片" : "只保留縮圖") + '</button>'
+      var keepThumbnailAction = cleanupGroupHasThumbnailBackedImage(group)
+        ? '<button class="cleanup-group-open cleanup-group-action-button' + (keepingThumbnails ? " is-cancel" : " is-delete") + '" type="button" data-cleanup-group-action="keep-thumbnail" data-cleanup-group="' + encodedGroupKey + '" title="' + (keepingThumbnails ? "還原具有對應縮圖的圖片原檔" : "只標記已有非空縮圖的圖片原檔；PDF、影片與無縮圖附件會保留") + '">' + (keepingThumbnails ? "還原原始圖片" : "只保留縮圖") + '</button>'
         : "";
       return '<article class="cleanup-group-card' + specialClass + '"><div class="cleanup-group-row"><button class="cleanup-group-open-button" type="button" data-cleanup-open-group="' + encodedGroupKey + '"><span class="cleanup-chat-avatar" aria-hidden="true">' + escapeHtml(cleanupChatIcon(group.chat.type)) + '</span><span class="cleanup-group-main"><span class="cleanup-group-heading"><strong>' + escapeHtml(group.chat.title) + '</strong><span class="cleanup-chat-type">' + escapeHtml(cleanupReferenceStatusLabel(group.referenceStatus)) + '</span></span><small>' + escapeHtml(group.referenceStatus === "referenced" ? typeLabel(group.chat.type) : cleanupReferenceSummary(group.referenceStatus)) + '</small><span>' + formatNumber(group.fileCount) + ' 個檔案 · ' + escapeHtml(formatBytes(group.totalBytes)) + (markedCount ? ' · <b>已標記 ' + formatNumber(markedCount) + ' 個</b>' : '') + '</span></span></button><div class="cleanup-group-actions"><button class="cleanup-group-open cleanup-group-action-button' + actionState + '" type="button" data-cleanup-group-action="remove" data-cleanup-group="' + encodedGroupKey + '">' + actionLabel + '</button>' + keepThumbnailAction + '<button class="cleanup-group-open cleanup-group-view-button" type="button" data-cleanup-open-group="' + encodedGroupKey + '">查看</button></div></div></article>';
     }).join("") + '</div>';
