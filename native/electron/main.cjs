@@ -232,12 +232,16 @@ async function registerIpc() {
 }
 
 function createWindow() {
+  const windowIcon = process.platform === "win32"
+    ? path.join(__dirname, "assets", "icon.ico")
+    : path.join(__dirname, "assets", "icon.png");
   mainWindow = new BrowserWindow({
     title: "LINE Cheater",
     width: 1180,
     height: 820,
     minWidth: 840,
     minHeight: 620,
+    icon: windowIcon,
     show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),

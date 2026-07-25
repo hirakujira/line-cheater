@@ -19,6 +19,10 @@ const dmgPackager = fs.readFileSync(
   path.join(root, "scripts", "package-dmg.sh"),
   "utf8"
 );
+const windowsPackager = fs.readFileSync(
+  path.join(root, "scripts", "package-windows.cjs"),
+  "utf8"
+);
 const macEntitlements = fs.readFileSync(
   path.join(root, "entitlements.mac.plist"),
   "utf8"
@@ -48,6 +52,14 @@ test("reuses the macOS app icon for in-app branding", () => {
     /path\.join\(packagedSourceRoot, "native", "electron", "assets", "icon\.png"\)/
   );
   assert.match(styles, /\.brand-mark\s*\{[^}]*object-fit: cover/);
+});
+
+test("selects the platform-native desktop icon and packages Windows assets", () => {
+  assert.match(main, /process\.platform === "win32"/);
+  assert.match(main, /path\.join\(__dirname, "assets", "icon\.ico"\)/);
+  assert.match(main, /path\.join\(__dirname, "assets", "icon\.png"\)/);
+  assert.match(windowsPackager, /assets", "icon\.ico/);
+  assert.match(windowsPackager, /rcedit-x64\.exe/);
 });
 
 test("separates source selection from the sidebar workspace", () => {
@@ -263,6 +275,17 @@ test("provides a self-checking DMG packaging script", () => {
   assert.match(dmgPackager, /Resources\/bin\/line-cheater/);
   assert.match(dmgPackager, /--version/);
   assert.equal(fs.statSync(path.join(root, "scripts", "package-dmg.sh")).mode & 0o111, 0o111);
+});
+
+test("provides a GitHub Actions Windows packaging workflow", () => {
+  const workflow = fs.readFileSync(
+    path.join(root, "../../.github/workflows/build-windows.yml"),
+    "utf8"
+  );
+  assert.match(workflow, /windows-2022/);
+  assert.match(workflow, /npm run package:win/);
+  assert.match(workflow, /actions\/upload-artifact@v4/);
+  assert.match(workflow, /Windows-x64\.zip/);
 });
 
 test("prefers the current debug sidecar during development", () => {

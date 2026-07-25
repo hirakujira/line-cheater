@@ -107,7 +107,7 @@ jobs:
           else
             gh release create "$tag" "$dmg" "$zip" "$sums" \
               --target "$VERSION_COMMIT" \
-              --title "LINE Cheater ${VERSION}" \
+              --title "LINE Cheater v${VERSION}" \
               --notes "$notes" \
               --generate-notes
           fi
