@@ -7,7 +7,7 @@ on:
       - "Cargo.lock"
       - "native/**"
       - ".github/workflows/build-macos.yml"
-      - ".github/workflows/release-macos-dmg.yml"
+      - ".github/workflows/release-macos.yml"
   push:
     branches:
       - main
@@ -16,7 +16,7 @@ on:
       - "Cargo.lock"
       - "native/**"
       - ".github/workflows/build-macos.yml"
-      - ".github/workflows/release-macos-dmg.yml"
+      - ".github/workflows/release-macos.yml"
   workflow_dispatch:
 
 permissions:

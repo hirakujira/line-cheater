@@ -20,7 +20,7 @@ const dmgPackager = fs.readFileSync(
   "utf8"
 );
 const macWorkflow = fs.readFileSync(
-  path.join(root, "../../.github/workflows/release-macos-dmg.yml"),
+  path.join(root, "../../.github/workflows/release-macos.yml"),
   "utf8"
 );
 const windowsPackager = fs.readFileSync(

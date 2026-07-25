@@ -108,7 +108,7 @@ or a verified universal bundle before claiming Intel Mac support.
 ### Automated release
 
 Every push to `main` (including a merged pull request) runs
-`.github/workflows/release-macos-dmg.yml` on an Apple Silicon `macos-14`
+`.github/workflows/release-macos.yml` on an Apple Silicon `macos-14`
 runner. The workflow increments the patch version in
 `native/core/Cargo.toml`, synchronizes `Cargo.lock` and the Electron package
 metadata, commits the version bump, builds and verifies the DMG, then publishes
