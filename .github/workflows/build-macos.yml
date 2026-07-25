@@ -6,7 +6,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "native/**"
-      - ".github/workflows/ci-macos.yml"
+      - ".github/workflows/build-macos.yml"
       - ".github/workflows/release-macos-dmg.yml"
   push:
     branches:
@@ -15,7 +15,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "native/**"
-      - ".github/workflows/ci-macos.yml"
+      - ".github/workflows/build-macos.yml"
       - ".github/workflows/release-macos-dmg.yml"
   workflow_dispatch:
 
