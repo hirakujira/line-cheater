@@ -1,0 +1,109 @@
+name: Build macOS arm64
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "native/**"
+      - ".github/workflows/build-macos.yml"
+      - ".github/workflows/release-macos.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "native/**"
+      - ".github/workflows/build-macos.yml"
+      - ".github/workflows/release-macos.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-macos-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: macos-14
+
+    steps:
+      - name: Check out PR source
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: native/electron/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Electron dependencies
+        working-directory: native/electron
+        run: npm ci
+
+      - name: Install Electron runtime
+        working-directory: native/electron
+        run: node node_modules/electron/install.js
+
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Run Rust tests
+        run: cargo test --workspace
+
+      - name: Run Rust clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run Electron tests
+        working-directory: native/electron
+        run: npm test
+
+      - name: Audit production dependencies
+        working-directory: native/electron
+        run: npm audit --omit=dev
+
+      - name: Build and verify macOS app and DMG
+        working-directory: native/electron
+        env:
+          SKIP_NPM_CI: "1"
+        run: npm run package:mac
+
+      - name: Verify macOS package outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./native/electron/package.json').version")"
+          app="native/electron/dist/mac-arm64/LINE Cheater.app"
+          dmg="native/electron/dist/LINE-Cheater-${version}-macOS-arm64.dmg"
+          zip="native/electron/dist/LINE-Cheater-${version}-macOS-arm64.zip"
+          sums="native/electron/dist/SHA256SUMS.txt"
+          test -d "$app"
+          test -f "$dmg"
+          test -f "$zip"
+          test -f "$sums"
+          /usr/bin/codesign --verify --deep --strict "$app"
+          "$app/Contents/Resources/bin/line-cheater" --version
+          (
+            cd native/electron/dist
+            shasum -a 256 -c SHA256SUMS.txt
+          )
+          /usr/bin/hdiutil verify "$dmg"
+
+      - name: Upload macOS test artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: line-cheater-macos-ci-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            native/electron/dist/LINE-Cheater-*-macOS-arm64.dmg
+            native/electron/dist/LINE-Cheater-*-macOS-arm64.zip
+            native/electron/dist/SHA256SUMS.txt

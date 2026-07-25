@@ -32,6 +32,12 @@ const allowedMethods = new Set([
   "listDuplicateMembers",
   "buildCandidate"
 ]);
+const jobMethods = new Set([
+  "scanCatalog",
+  "searchMessages",
+  "hashDuplicateCandidates",
+  "buildCandidate"
+]);
 const assetFiles = new Map([
   ["/assets/icon.png", path.join("assets", "icon.png")],
   ["/renderer.html", "renderer.html"],
@@ -47,6 +53,8 @@ protocol.registerSchemesAsPrivileged([{
 
 let mainWindow = null;
 let sidecar = null;
+let activeSource = null;
+let activeOperation = null;
 const outputTokens = new Map();
 const previewTokens = new Map();
 const MAX_PREVIEW_TOKENS = 128;
@@ -110,12 +118,13 @@ async function replaceSidecar(source) {
   if (sidecar) await sidecar.dispose();
   outputTokens.clear();
   previewTokens.clear();
-  const workKey = crypto.createHash("sha256").update(path.resolve(source)).digest("hex");
+  activeSource = path.resolve(source);
+  const workKey = crypto.createHash("sha256").update(activeSource).digest("hex");
   const workDir = path.join(app.getPath("userData"), "sessions", workKey);
   fs.mkdirSync(workDir, { recursive: true });
   const client = await SidecarClient.start(rustBinaryPath(), [
     "--work-dir", workDir,
-    "serve", "--source", source
+    "serve", "--source", activeSource
   ]);
   client.on("sidecarEvent", (event) => {
     if (event.event !== "ready" && mainWindow && !mainWindow.isDestroyed()) {
@@ -131,7 +140,38 @@ async function replaceSidecar(source) {
     }
   });
   sidecar = client;
+  try {
+    await client.request("recoverInterruptedOperations", {});
+  } catch (error) {
+    if (sidecar === client) sidecar = null;
+    await client.dispose();
+    throw error;
+  }
   return client.ready;
+}
+
+function cleanCancelledOperation(operation) {
+  if (!operation) return true;
+  try {
+    if (operation.method === "buildCandidate" && operation.output) {
+      fs.rmSync(`${operation.output}.partial`, {
+        force: true,
+        maxRetries: 10,
+        retryDelay: 100
+      });
+    }
+    if (operation.workDir) {
+      fs.rmSync(path.join(operation.workDir, "candidate-databases"), {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 100
+      });
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function registerIpc() {
@@ -157,6 +197,20 @@ async function registerIpc() {
     const token = crypto.randomUUID();
     outputTokens.set(token, result.filePath);
     return { token, displayName: path.basename(result.filePath) };
+  });
+
+  ipcMain.handle("line-native:cancel-operation", async (event) => {
+    assertTrustedSender(event);
+    if (!sidecar || !activeSource) return false;
+    const current = sidecar;
+    const source = activeSource;
+    const operation = activeOperation;
+    sidecar = null;
+    activeOperation = null;
+    await current.cancel();
+    const cleanupComplete = cleanCancelledOperation(operation);
+    await replaceSidecar(source);
+    return { restarted: true, cleanupComplete };
   });
 
   ipcMain.handle("line-native:attachment-preview", async (event, attachmentPath) => {
@@ -227,7 +281,27 @@ async function registerIpc() {
       outputTokens.delete(token);
       safeParams.output = output;
     }
-    return sidecar.request(method, safeParams);
+    const client = sidecar;
+    const workDir = path.join(
+      app.getPath("userData"),
+      "sessions",
+      crypto.createHash("sha256").update(path.resolve(activeSource)).digest("hex")
+    );
+    const jobId = jobMethods.has(method) ? crypto.randomUUID() : null;
+    const operation = { method, jobId, output: safeParams.output, workDir };
+    activeOperation = operation;
+    if (jobId && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("line-native:event", {
+        event: "operationStarted",
+        method,
+        jobId
+      });
+    }
+    try {
+      return await client.request(method, safeParams, { jobId });
+    } finally {
+      if (activeOperation === operation) activeOperation = null;
+    }
   });
 }
 
@@ -261,6 +335,8 @@ function createWindow() {
     mainWindow = null;
     if (sidecar) void sidecar.dispose();
     sidecar = null;
+    activeSource = null;
+    activeOperation = null;
   });
   void mainWindow.loadURL(`${APP_ORIGIN}/renderer.html`);
 }

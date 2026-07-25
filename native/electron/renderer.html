@@ -105,6 +105,17 @@
               <small>審核並建立瘦身檔</small>
             </span>
           </button>
+          <button class="sidebar-item" data-view="duplicates" type="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="8" cy="8" r="3"></circle>
+              <circle cx="16" cy="16" r="3"></circle>
+              <path d="m10.2 10.2 3.6 3.6M13.8 10.2l-3.6 3.6"></path>
+            </svg>
+            <span>
+              <strong>重複附件</strong>
+              <small>找出可回收的副本</small>
+            </span>
+          </button>
           <button class="sidebar-item" data-view="advanced" type="button">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M12 3v3M12 18v3M3 12h3M18 12h3"></path>
@@ -284,6 +295,40 @@
             </div>
           </section>
 
+          <section id="duplicates-view" class="workspace-view hidden" aria-labelledby="duplicates-heading-title">
+            <div class="panel duplicates-panel">
+              <div class="section-title">
+                <div>
+                  <p class="section-kicker">EXACT DUPLICATES</p>
+                  <h2 id="duplicates-heading-title">重複附件</h2>
+                  <p class="muted">
+                    只把大小相同且 SHA-256 完全一致的檔案視為重複；來源備份保持唯讀，請逐組勾選要標記的副本。
+                  </p>
+                </div>
+                <div class="duplicates-actions">
+                  <button id="hash-duplicates" type="button" disabled>掃描完全相同附件</button>
+                  <button id="cancel-duplicate-scan" class="secondary-button hidden" type="button">
+                    取消掃描
+                  </button>
+                  <span id="duplicate-progress-label" class="muted small" role="status" aria-live="polite"></span>
+                </div>
+              </div>
+              <div class="duplicates-warning">
+                <strong>雜湊是證據，不是刪除決策</strong>
+                <span>同一份內容可能出現在原始附件與縮圖中；請保留至少一份，並確認標記後的釋放容量。</span>
+              </div>
+              <div id="duplicate-summary" class="duplicate-summary hidden" aria-live="polite"></div>
+              <div id="duplicate-groups" class="duplicate-groups" aria-live="polite">
+                <div class="empty-state">先掃描附件，找出完全相同的檔案。</div>
+              </div>
+              <nav class="duplicate-pagination" aria-label="重複附件分頁">
+                <button id="duplicate-prev" type="button" disabled>上一頁</button>
+                <span id="duplicate-page-info">第 1 頁</span>
+                <button id="duplicate-next" type="button" disabled>下一頁</button>
+              </nav>
+            </div>
+          </section>
+
           <section id="advanced-view" class="workspace-view hidden" aria-labelledby="advanced-heading-title">
             <div class="panel advanced-panel">
               <div class="section-title">
@@ -385,11 +430,14 @@
         正在準備選取的檔案，請勿關閉此視窗。
       </p>
       <div class="package-modal-progress-track">
-        <div id="load-modal-progress" class="package-modal-progress" role="progressbar"
+      <div id="load-modal-progress" class="package-modal-progress" role="progressbar"
              aria-label="讀取進度" aria-valuemin="0" aria-valuemax="100"
              aria-valuenow="0"></div>
       </div>
       <p id="load-modal-progress-label" class="package-modal-progress-label">0%</p>
+      <button id="load-modal-cancel" class="secondary-button package-modal-cancel" type="button">
+        取消
+      </button>
     </section>
   </div>
 
@@ -412,6 +460,9 @@
              aria-valuenow="0"></div>
       </div>
       <p id="package-modal-progress-label" class="package-modal-progress-label">0%</p>
+      <button id="package-modal-cancel" class="secondary-button package-modal-cancel" type="button">
+        取消建立
+      </button>
       <button id="package-modal-close" class="package-modal-close hidden" type="button">完成</button>
     </section>
   </div>

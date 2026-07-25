@@ -49,6 +49,20 @@ const resourceEditor = path.join(
   "bin",
   "rcedit-x64.exe"
 );
+const requiredPackageFiles = [
+  `${productName}.exe`,
+  path.join("resources", "app", "package.json"),
+  path.join("resources", "app", "native", "electron", "main.cjs"),
+  path.join("resources", "app", "native", "electron", "preload.cjs"),
+  path.join("resources", "app", "native", "electron", "renderer.html"),
+  path.join("resources", "app", "native", "electron", "renderer.js"),
+  path.join("resources", "app", "native", "electron", "sidecar-client.cjs"),
+  path.join("resources", "app", "native", "electron", "styles.css"),
+  path.join("resources", "app", "native", "electron", "assets", "icon.ico"),
+  path.join("resources", "app", "native", "electron", "assets", "icon.png"),
+  path.join("resources", "app", "native", "frontend", "data-provider.js"),
+  path.join("resources", "bin", "line-cheater.exe")
+];
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -121,19 +135,25 @@ function verifyZip() {
     run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script]);
 
     const verifiedApp = path.join(verificationRoot, productName);
-    const verifiedExecutable = path.join(verifiedApp, `${productName}.exe`);
-    const verifiedSidecar = path.join(
-      verifiedApp,
-      "resources",
-      "bin",
-      "line-cheater.exe"
+    for (const relativePath of requiredPackageFiles) {
+      const filePath = path.join(verifiedApp, relativePath);
+      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+        throw new Error(`ZIP does not contain required file: ${relativePath}`);
+      }
+    }
+
+    const verifiedMetadata = JSON.parse(
+      fs.readFileSync(path.join(verifiedApp, "resources", "app", "package.json"), "utf8")
     );
-    if (!fs.existsSync(verifiedExecutable)) {
-      throw new Error(`ZIP does not contain ${productName}.exe.`);
+    if (
+      verifiedMetadata.productName !== productName ||
+      verifiedMetadata.version !== version ||
+      verifiedMetadata.main !== "native/electron/main.cjs"
+    ) {
+      throw new Error("ZIP contains invalid packaged Electron metadata.");
     }
-    if (!fs.existsSync(verifiedSidecar)) {
-      throw new Error("ZIP does not contain the Rust sidecar.");
-    }
+
+    const verifiedSidecar = path.join(verifiedApp, "resources", "bin", "line-cheater.exe");
     run(verifiedSidecar, ["--version"]);
   } finally {
     fs.rmSync(verificationRoot, {

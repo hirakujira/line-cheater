@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, MAIN_DB, OpenFlags, OptionalExtension, Row, params};
@@ -30,6 +30,225 @@ pub struct LineSquareDatabase {
 pub struct UnifiedGroupDatabase {
     connection: Connection,
     group_columns: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchMessageRecord {
+    pub source: &'static str,
+    pub pk: i64,
+    pub id: String,
+    pub chat_pk: i64,
+    pub timestamp: i64,
+    pub sender_pk: Option<i64>,
+    pub sender_name: String,
+    pub sender_id: String,
+    pub send_status: Option<i64>,
+    pub content_type: Option<i64>,
+    pub message_type: String,
+    pub text: String,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+}
+
+pub struct Fts5MessageIndex {
+    path: PathBuf,
+    connection: Connection,
+}
+
+impl Fts5MessageIndex {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let connection = Connection::open(path)?;
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "NORMAL")?;
+        connection.pragma_update(None, "temp_store", "FILE")?;
+        connection.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS fts_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                text,
+                source UNINDEXED,
+                pk UNINDEXED,
+                id UNINDEXED,
+                chat_pk UNINDEXED,
+                timestamp UNINDEXED,
+                sender_pk UNINDEXED,
+                sender_name UNINDEXED,
+                sender_id UNINDEXED,
+                send_status UNINDEXED,
+                content_type UNINDEXED,
+                message_type UNINDEXED,
+                latitude UNINDEXED,
+                longitude UNINDEXED,
+                tokenize = 'unicode61'
+            );
+            ",
+        )?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            connection,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn ensure_built<F>(
+        &mut self,
+        source_key: &str,
+        line: &LineDatabase,
+        square: Option<&LineSquareDatabase>,
+        mut on_progress: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(u64),
+    {
+        let indexed_key: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT value FROM fts_meta WHERE key = 'source_key'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if indexed_key.as_deref() == Some(source_key) {
+            return Ok(false);
+        }
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM messages_fts", [])?;
+        let mut insert = transaction.prepare(
+            "INSERT INTO messages_fts(
+                 text, source, pk, id, chat_pk, timestamp, sender_pk, sender_name,
+                 sender_id, send_status, content_type, message_type, latitude, longitude
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        )?;
+        let mut processed = 0_u64;
+        line.for_each_searchable_message(|record| {
+            insert_search_record(&mut insert, &record)?;
+            processed += 1;
+            on_progress(processed);
+            Ok(())
+        })?;
+        if let Some(square) = square {
+            square.for_each_searchable_message(|record| {
+                insert_search_record(&mut insert, &record)?;
+                processed += 1;
+                on_progress(processed);
+                Ok(())
+            })?;
+        }
+        drop(insert);
+        transaction.execute(
+            "INSERT INTO fts_meta(key, value) VALUES ('source_key', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [source_key],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn search(
+        &self,
+        query: &str,
+        source: &str,
+        chat_pk: Option<i64>,
+        after_cursor: Option<MessageCursor>,
+        before_cursor: Option<MessageCursor>,
+        limit: u32,
+        account_id: Option<&str>,
+    ) -> Result<MessagePage> {
+        if after_cursor.is_some() && before_cursor.is_some() {
+            bail!("message search pagination cannot use both after and before cursors");
+        }
+        let limit = checked_page_size(limit)?;
+        let pattern = validated_fts_pattern(query)?;
+        let cursor = after_cursor.or(before_cursor).unwrap_or(MessageCursor {
+            timestamp: i64::MIN,
+            pk: 0,
+        });
+        let before = before_cursor.is_some();
+        let timestamp_operator = if before { "<" } else { ">" };
+        let order = if before { "DESC" } else { "ASC" };
+        let sql = format!(
+            "SELECT pk, id, chat_pk, timestamp, sender_pk, sender_name, sender_id,
+                    send_status, content_type, message_type, text, latitude, longitude
+             FROM messages_fts
+             WHERE messages_fts MATCH ?1
+               AND source = ?2
+               AND (?3 IS NULL OR CAST(chat_pk AS INTEGER) = ?3)
+               AND (CAST(timestamp AS INTEGER) {timestamp_operator} ?4
+                    OR (CAST(timestamp AS INTEGER) = ?4 AND CAST(pk AS INTEGER) {timestamp_operator} ?5))
+             ORDER BY CAST(timestamp AS INTEGER) {order}, CAST(pk AS INTEGER) {order}
+             LIMIT ?6"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut rows = statement.query(params![
+            pattern,
+            source,
+            chat_pk,
+            cursor.timestamp,
+            cursor.pk,
+            limit as i64 + 1,
+        ])?;
+        let mut items = Vec::with_capacity(limit);
+        while let Some(row) = rows.next()? {
+            items.push(message_from_fts_row(row, source, account_id)?);
+        }
+        let has_extra = items.len() > limit;
+        if has_extra {
+            items.pop();
+        }
+        if before {
+            items.reverse();
+        }
+        let next_cursor = if (before && !items.is_empty()) || has_extra {
+            items.last().map(|message| MessageCursor {
+                timestamp: message.timestamp,
+                pk: message.pk,
+            })
+        } else {
+            None
+        };
+        Ok(MessagePage {
+            items,
+            next_cursor,
+            has_previous: if before {
+                has_extra
+            } else {
+                after_cursor.is_some()
+            },
+        })
+    }
+}
+
+fn insert_search_record(
+    statement: &mut rusqlite::Statement<'_>,
+    record: &SearchMessageRecord,
+) -> rusqlite::Result<()> {
+    statement.execute(params![
+        record.text,
+        record.source,
+        record.pk,
+        record.id,
+        record.chat_pk,
+        record.timestamp,
+        record.sender_pk,
+        record.sender_name,
+        record.sender_id,
+        record.send_status,
+        record.content_type,
+        record.message_type,
+        record.latitude,
+        record.longitude,
+    ])?;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +302,58 @@ impl LineDatabase {
         Ok(self
             .connection
             .query_row("PRAGMA quick_check", [], |row| row.get(0))?)
+    }
+
+    pub fn for_each_searchable_message<F>(&self, mut on_record: F) -> Result<()>
+    where
+        F: FnMut(SearchMessageRecord) -> Result<()>,
+    {
+        if !self.message_columns.contains("ZCHAT") || !self.message_columns.contains("ZTEXT") {
+            return Ok(());
+        }
+        let message_id = text_expr("m", &self.message_columns, &["ZID"]);
+        let timestamp = integer_expr("m", &self.message_columns, "ZTIMESTAMP", "0");
+        let sender_pk = nullable_integer_expr("m", &self.message_columns, "ZSENDER");
+        let send_status = nullable_integer_expr("m", &self.message_columns, "ZSENDSTATUS");
+        let content_type = nullable_integer_expr("m", &self.message_columns, "ZCONTENTTYPE");
+        let message_type = text_expr("m", &self.message_columns, &["ZMESSAGETYPE"]);
+        let text = text_expr("m", &self.message_columns, &["ZTEXT"]);
+        let latitude = nullable_real_expr("m", &self.message_columns, "ZLATITUDE");
+        let longitude = nullable_real_expr("m", &self.message_columns, "ZLONGITUDE");
+        let can_join_user =
+            self.message_columns.contains("ZSENDER") && self.user_columns.contains("Z_PK");
+        let sender_name = if can_join_user {
+            coalesced_text_expr(
+                "u",
+                &self.user_columns,
+                &["ZCUSTOMNAME", "ZADDRESSBOOKNAME", "ZNAME", "ZMID"],
+            )
+        } else {
+            "''".to_string()
+        };
+        let sender_id = if can_join_user {
+            text_expr("u", &self.user_columns, &["ZMID"])
+        } else {
+            "''".to_string()
+        };
+        let join = if can_join_user {
+            " LEFT JOIN ZUSER u ON u.Z_PK = m.ZSENDER"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT CAST(m.Z_PK AS INTEGER), {message_id}, CAST(m.ZCHAT AS INTEGER),
+                    {timestamp}, {sender_pk}, {sender_name}, {sender_id}, {send_status},
+                    {content_type}, {message_type}, {text}, {latitude}, {longitude}
+             FROM ZMESSAGE m{join}
+             WHERE {text} <> '' ORDER BY m.Z_PK ASC"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            on_record(search_record_from_row(row, "line")?)?;
+        }
+        Ok(())
     }
 
     pub fn chat_for_cleanup(&self, chat_pk: i64) -> Result<Chat> {
@@ -986,6 +1257,54 @@ impl LineSquareDatabase {
         })
     }
 
+    pub fn for_each_searchable_message<F>(&self, mut on_record: F) -> Result<()>
+    where
+        F: FnMut(SearchMessageRecord) -> Result<()>,
+    {
+        if !self.message_columns.contains("ZCHAT") || !self.message_columns.contains("ZTEXT") {
+            return Ok(());
+        }
+        let message_id = text_expr("m", &self.message_columns, &["ZID"]);
+        let timestamp = integer_expr("m", &self.message_columns, "ZTIMESTAMP", "0");
+        let sender_pk = nullable_integer_expr("m", &self.message_columns, "ZSENDER");
+        let send_status = nullable_integer_expr("m", &self.message_columns, "ZSENDSTATUS");
+        let content_type = nullable_integer_expr("m", &self.message_columns, "ZCONTENTTYPE");
+        let message_type = text_expr("m", &self.message_columns, &["ZMESSAGETYPE"]);
+        let text = text_expr("m", &self.message_columns, &["ZTEXT"]);
+        let latitude = nullable_real_expr("m", &self.message_columns, "ZLATITUDE");
+        let longitude = nullable_real_expr("m", &self.message_columns, "ZLONGITUDE");
+        let can_join_sender =
+            self.message_columns.contains("ZSENDER") && self.member_columns.contains("Z_PK");
+        let sender_name = if can_join_sender {
+            coalesced_text_expr("sm", &self.member_columns, &["ZDISPLAYNAME", "ZMID"])
+        } else {
+            "''".to_string()
+        };
+        let sender_id = if can_join_sender {
+            text_expr("sm", &self.member_columns, &["ZMID"])
+        } else {
+            "''".to_string()
+        };
+        let join = if can_join_sender {
+            " LEFT JOIN ZSQUAREMEMBER sm ON sm.Z_PK = m.ZSENDER"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT CAST(m.Z_PK AS INTEGER), {message_id}, CAST(m.ZCHAT AS INTEGER),
+                    {timestamp}, {sender_pk}, {sender_name}, {sender_id}, {send_status},
+                    {content_type}, {message_type}, {text}, {latitude}, {longitude}
+             FROM ZMESSAGE m{join}
+             WHERE {text} <> '' ORDER BY m.Z_PK ASC"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            on_record(search_record_from_row(row, "square")?)?;
+        }
+        Ok(())
+    }
+
     pub fn chat_for_cleanup(&self, chat_pk: i64) -> Result<Chat> {
         self.cleanup_chats(Some(chat_pk), false)?
             .into_iter()
@@ -1706,7 +2025,66 @@ fn source_cursor_before_filter(
     }
 }
 
+fn search_record_from_row(
+    row: &Row<'_>,
+    source: &'static str,
+) -> rusqlite::Result<SearchMessageRecord> {
+    Ok(SearchMessageRecord {
+        source,
+        pk: row.get(0)?,
+        id: row.get(1)?,
+        chat_pk: row.get(2)?,
+        timestamp: row.get(3)?,
+        sender_pk: row.get(4)?,
+        sender_name: row.get(5)?,
+        sender_id: row.get(6)?,
+        send_status: row.get(7)?,
+        content_type: row.get(8)?,
+        message_type: row.get(9)?,
+        text: row.get(10)?,
+        latitude: row.get(11)?,
+        longitude: row.get(12)?,
+    })
+}
+
 fn message_from_row(
+    row: &Row<'_>,
+    source: &str,
+    account_id: Option<&str>,
+) -> rusqlite::Result<Message> {
+    let id: String = row.get(1)?;
+    let sender_pk: Option<i64> = row.get(4)?;
+    let sender_name: String = row.get(5)?;
+    let sender_id: String = row.get(6)?;
+    let send_status: Option<i64> = row.get(7)?;
+    let content_type: Option<i64> = row.get(8)?;
+    let message_type: String = row.get(9)?;
+    let is_system = content_type.is_some_and(|value| [7, 18, 96, 111].contains(&value))
+        || (sender_pk.is_none() && send_status == Some(0) && id.is_empty());
+    let is_self = account_id.is_some_and(|account| !sender_id.is_empty() && sender_id == account)
+        || (sender_pk.is_none()
+            && !is_system
+            && (send_status == Some(1) || message_type.eq_ignore_ascii_case("S")));
+    Ok(Message {
+        pk: row.get(0)?,
+        source: source.to_string(),
+        id,
+        chat_pk: row.get(2)?,
+        timestamp: row.get(3)?,
+        sender_pk,
+        sender_name,
+        is_self,
+        send_status,
+        content_type,
+        message_type,
+        text: row.get(10)?,
+        latitude: row.get(11)?,
+        longitude: row.get(12)?,
+        attachments: Vec::new(),
+    })
+}
+
+fn message_from_fts_row(
     row: &Row<'_>,
     source: &str,
     account_id: Option<&str>,
@@ -1826,6 +2204,17 @@ fn validated_search_pattern(query: &str) -> Result<String> {
             .replace('%', "\\%")
             .replace('_', "\\_")
     ))
+}
+
+fn validated_fts_pattern(query: &str) -> Result<String> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("search query cannot be empty");
+    }
+    if query.len() > 1_024 {
+        bail!("search query cannot exceed 1,024 UTF-8 bytes");
+    }
+    Ok(format!("\"{}\"*", query.replace('"', "\"\"")))
 }
 
 fn human_message_predicate(alias: &str, message_columns: &HashSet<String>) -> String {

@@ -97,22 +97,28 @@ native/electron/dist/SHA256SUMS.txt
 ```
 
 The 2026-07-24 artifact is `arm64`, for Apple Silicon Macs running macOS 12 or
-later. It is ad-hoc signed but not Developer ID signed or notarized. It is
-suitable for direct testing, but a recipient may see an unidentified-developer
-Gatekeeper warning. Public distribution still requires an Apple Developer
-account, a `Developer ID Application` signature, notarization with
-`xcrun notarytool`, and ticket stapling. Build a separate `x64` runtime/sidecar
+later. Without signing secrets it is ad-hoc signed and suitable for direct
+testing, but a recipient may see an unidentified-developer Gatekeeper warning.
+The macOS release workflow can import a passwordless
+`MACOS_CERTIFICATE_BASE64` P12 and use `MACOS_SIGN_IDENTITY` for a Developer ID
+signature. Public distribution still requires Apple notarization with
+`xcrun notarytool` and ticket stapling. Build a separate `x64` runtime/sidecar
 or a verified universal bundle before claiming Intel Mac support.
 
 ### Automated release
 
 Every push to `main` (including a merged pull request) runs
-`.github/workflows/release-macos-dmg.yml` on an Apple Silicon `macos-14`
+`.github/workflows/release-macos.yml` on an Apple Silicon `macos-14`
 runner. The workflow increments the patch version in
 `native/core/Cargo.toml`, synchronizes `Cargo.lock` and the Electron package
 metadata, commits the version bump, builds and verifies the DMG, then publishes
 the DMG, ZIP, and `SHA256SUMS.txt` to a tag-matched GitHub Release. The
 generated version-bump commit is detected so it does not increment twice.
+
+Windows x64 packaging runs from `.github/workflows/build-windows.yml` on pull
+requests and from `.github/workflows/release-windows.yml` after the macOS
+release workflow succeeds. It publishes an unsigned ZIP and checksum file; a
+Windows environment is not required on the developer machine.
 
 ## Implemented UI flow
 
@@ -238,21 +244,24 @@ unsupported original to its thumbnail.
 
 ## Known gaps before a desktop release
 
-- Add job IDs and cancellation for catalog, hash, and candidate operations.
-- Port cleanup-plan exports, duplicate review, and the remaining analysis UI.
+- Add an in-process cancellation token. Current protocol job IDs, restart-based
+  directory/hash resumption, and safe candidate partial cleanup are implemented;
+  candidate ZIP output intentionally restarts from zero.
+- Port cleanup-plan exports and the remaining analysis UI.
 - Coalesce the same normalized chat ID across the main and community databases
   if a future fixture contains one. The current real fixture had zero such
   overlaps; source-aware community listing and message routing are implemented.
-- Add the resumable on-disk FTS5 index.
+- Extend the on-disk FTS5 index with richer tokenization and visible build
+  counts. It is already isolated in `search.sqlite` and falls back to `LIKE`.
 - Manually regress directory, SQLite, and `.imazingapp` selection plus preview
   rendering through native file pickers on macOS, Windows, and Linux.
 - Add Developer ID signing/notarization, Intel/universal macOS, Windows signing,
   Linux packages, and update policy. The repeatable macOS arm64 ad-hoc package
   already bundles the optimized Rust sidecar and icon.
-- Measure Electron main/renderer and Rust sidecar peak RSS separately with a
-  synthetic large fixture.
-- Validate a native-built candidate through an actual iMazing restore before
-  presenting the operation as production-safe.
+- Use `scripts/measure-peak-rss.sh` to record Rust process-tree peak RSS for a
+  synthetic large fixture; separate Electron main/renderer measurement remains.
+- Repeat iMazing restore checks across more backup variants; one real restore
+  path has already been verified, but that does not cover every backup shape.
 
 ## Tests
 

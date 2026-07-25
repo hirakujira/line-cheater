@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-macos-dmg
+  group: release-macos
   cancel-in-progress: false
 
 jobs:
@@ -32,6 +32,34 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Import optional macOS signing certificate
+        id: signing
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MACOS_CERTIFICATE_BASE64}" || -z "${MACOS_SIGN_IDENTITY}" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Developer ID certificate is not configured; using an ad-hoc signature."
+            exit 0
+          fi
+
+          keychain_path="$RUNNER_TEMP/line-cheater-build.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          certificate_path="$RUNNER_TEMP/line-cheater-signing.p12"
+          printf '%s' "$MACOS_CERTIFICATE_BASE64" | base64 -D > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" -P "" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security list-keychain -d user -s "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain_path"
+          echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: Bump patch version after merge
         id: version
@@ -66,6 +94,7 @@ jobs:
       - name: Build and verify DMG
         env:
           SKIP_NPM_CI: "0"
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: native/electron/scripts/package-dmg.sh
 
       - name: Verify release artifacts
@@ -91,6 +120,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.version }}
           VERSION_COMMIT: ${{ steps.version.outputs.version_commit }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: |
           set -euo pipefail
           tag="v${VERSION}"
@@ -98,7 +128,13 @@ jobs:
           zip="native/electron/dist/LINE-Cheater-${VERSION}-macOS-arm64.zip"
           sums="native/electron/dist/SHA256SUMS.txt"
 
-          notes=$'LINE Cheater macOS 12+ Apple Silicon (arm64) 測試封裝。\n\n來源備份以唯讀方式開啟，候選輸出另存，不會覆寫原始檔。此版本使用 ad-hoc code signature，尚未使用 Apple Developer ID 簽署或 notarize。\n\n完整功能、安全規則與限制請參考 README：'
+          if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
+            signing_note="此版本使用 Developer ID Application 簽署，但仍需完成 Apple notarization。"
+          else
+            signing_note="此版本使用 ad-hoc code signature，尚未使用 Apple Developer ID 簽署或 notarize。"
+          fi
+          notes=$'LINE Cheater macOS 12+ Apple Silicon (arm64) 測試封裝。\n\n來源備份以唯讀方式開啟，候選輸出另存，不會覆寫原始檔。\n\n'
+          notes+="$signing_note"$'\n\n完整功能、安全規則與限制請參考 README：'
           notes+="https://github.com/${GITHUB_REPOSITORY}/blob/main/README.md"
 
           if gh release view "$tag" >/dev/null 2>&1; then
@@ -111,3 +147,10 @@ jobs:
               --notes "$notes" \
               --generate-notes
           fi
+
+      - name: Remove temporary macOS signing material
+        if: ${{ always() && steps.signing.outputs.available == 'true' }}
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/line-cheater-build.keychain-db" || true
+          rm -f "$RUNNER_TEMP/line-cheater-signing.p12"

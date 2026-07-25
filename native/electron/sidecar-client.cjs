@@ -51,10 +51,13 @@ class SidecarClient extends EventEmitter {
     });
   }
 
-  request(method, params) {
+  request(method, params, options) {
     if (this.closed) return Promise.reject(new Error("Rust sidecar is closed."));
+    options = options || {};
     const id = String(this.nextId++);
-    const line = JSON.stringify({ id, method, params: params || {} }) + "\n";
+    const request = { id, method, params: params || {} };
+    if (options.jobId) request.jobId = options.jobId;
+    const line = JSON.stringify(request) + "\n";
     if (Buffer.byteLength(line) > MAX_REQUEST_BYTES) {
       return Promise.reject(new RangeError("Sidecar request exceeds 1 MiB."));
     }
@@ -119,6 +122,34 @@ class SidecarClient extends EventEmitter {
 
   consumeStderr(chunk) {
     this.stderrTail = (this.stderrTail + chunk.toString("utf8")).slice(-STDERR_TAIL_BYTES);
+  }
+
+  async cancel(reason = "Rust sidecar operation was cancelled.") {
+    if (this.closed) return;
+    const error = new Error(reason);
+    error.code = "operation_cancelled";
+    this.closed = true;
+    clearTimeout(this.readyTimer);
+    if (!this.readySettled) {
+      this.readySettled = true;
+      this.rejectReady(error);
+    }
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
+
+    await new Promise((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      this.child.once("exit", finish);
+      this.child.once("error", finish);
+      setTimeout(finish, 2_000);
+      if (!this.child.killed) this.child.kill();
+      else finish();
+    });
   }
 
   fail(error) {

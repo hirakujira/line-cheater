@@ -19,6 +19,10 @@ const dmgPackager = fs.readFileSync(
   path.join(root, "scripts", "package-dmg.sh"),
   "utf8"
 );
+const macWorkflow = fs.readFileSync(
+  path.join(root, "../../.github/workflows/release-macos.yml"),
+  "utf8"
+);
 const windowsPackager = fs.readFileSync(
   path.join(root, "scripts", "package-windows.cjs"),
   "utf8"
@@ -63,6 +67,26 @@ test("selects the platform-native desktop icon and packages Windows assets", () 
   assert.match(windowsPackager, /node_modules",\s+"electron",\s+"install\.js/);
 });
 
+test("verifies the complete Windows package payload", () => {
+  assert.match(windowsPackager, /const requiredPackageFiles = \[/);
+  assert.match(windowsPackager, /required file: \$\{relativePath\}/);
+  assert.match(windowsPackager, /verifiedMetadata\.productName !== productName/);
+  assert.match(windowsPackager, /verifiedMetadata\.version !== version/);
+  assert.match(windowsPackager, /verifiedMetadata\.main !== "native\/electron\/main\.cjs"/);
+  for (const packagedFile of [
+    "renderer.html",
+    "renderer.js",
+    "sidecar-client.cjs",
+    "styles.css",
+    "icon.ico",
+    "icon.png",
+    "data-provider.js",
+    "line-cheater.exe"
+  ]) {
+    assert.match(windowsPackager, new RegExp(`"${packagedFile.replace('.', "\\.")}"`));
+  }
+});
+
 test("separates source selection from the sidebar workspace", () => {
   assert.match(html, /id="welcome-screen"/);
   assert.match(html, /id="enter-workspace"[^>]*disabled/);
@@ -96,6 +120,36 @@ test("keeps browse, cleanup, and advanced as mutually exclusive native views", (
   assert.match(renderer, /elements\.advancedView\.classList\.toggle\("hidden", view !== "advanced"\)/);
   assert.match(styles, /\.workspace-screen\s*\{/);
   assert.match(styles, /\.workspace-sidebar\s*\{/);
+});
+
+test("surfaces the existing exact-duplicate engine as a reviewable native view", () => {
+  assert.match(html, /data-view="duplicates"/);
+  assert.match(html, /id="duplicates-view" class="workspace-view hidden"/);
+  assert.match(html, /id="hash-duplicates"/);
+  assert.match(renderer, /provider\.hashDuplicateCandidates\(\)/);
+  assert.match(renderer, /provider\.listDuplicateGroups\(/);
+  assert.match(renderer, /provider\.listDuplicateMembers\(/);
+  assert.match(renderer, /至少要保留一份/);
+  assert.match(preload, /"duplicateHashProgress"/);
+  assert.match(html, /id="cancel-duplicate-scan"/);
+  assert.match(renderer, /cancelCurrentOperation\("duplicate"\)/);
+  assert.match(styles, /\.duplicate-group-card\s*\{/);
+});
+
+test("can cancel long-running native work and recover its sidecar", () => {
+  assert.match(html, /id="load-modal-cancel"/);
+  assert.match(html, /id="package-modal-cancel"/);
+  assert.match(preload, /cancelOperation\(\)/);
+  assert.match(renderer, /isOperationCancelled\(error\)/);
+  assert.match(main, /await current\.cancel\(\)/);
+  assert.match(main, /recoverInterruptedOperations/);
+  assert.match(main, /\.partial/);
+});
+
+test("does not reuse an attachment catalog after the source metadata changes", () => {
+  assert.match(renderer, /catalogSourceCurrent/);
+  assert.match(renderer, /!info\.catalogSourceCurrent/);
+  assert.match(renderer, /需要重新掃描/);
 });
 
 test("keeps community chats source-aware and trusts native sender ownership", () => {
@@ -278,6 +332,16 @@ test("provides a self-checking DMG packaging script", () => {
   if (process.platform !== "win32") {
     assert.equal(fs.statSync(path.join(root, "scripts", "package-dmg.sh")).mode & 0o111, 0o111);
   }
+});
+
+test("imports optional macOS signing material without weakening the ad-hoc fallback", () => {
+  assert.match(macWorkflow, /MACOS_CERTIFICATE_BASE64/);
+  assert.match(macWorkflow, /base64 -D/);
+  assert.match(macWorkflow, /security import .* -P \"\"/s);
+  assert.match(macWorkflow, /MACOS_SIGN_IDENTITY:/);
+  assert.match(macWorkflow, /ad-hoc code signature/);
+  assert.match(macWorkflow, /Developer ID Application/);
+  assert.match(macWorkflow, /delete-keychain/);
 });
 
 test("provides a GitHub Actions Windows packaging workflow", () => {

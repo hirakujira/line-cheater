@@ -51,3 +51,33 @@ setInterval(() => {}, 1000);
   assert.match(error.message, /response line exceeds/);
   assert.equal(client.closed, true);
 });
+
+test("sends an optional job ID with long-running requests", async () => {
+  const fixture = String.raw`
+process.stdout.write(JSON.stringify({event:"ready",protocolVersion:1}) + "\n");
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", chunk => {
+  const request = JSON.parse(chunk);
+  process.stdout.write(JSON.stringify({id:request.id,ok:true,result:{jobId:request.jobId}}) + "\n");
+});
+`;
+  const client = await SidecarClient.start(process.execPath, ["-e", fixture]);
+  assert.deepEqual(
+    await client.request("scanCatalog", {}, { jobId: "job-123" }),
+    { jobId: "job-123" }
+  );
+  await client.dispose();
+});
+
+test("cancels an in-flight sidecar request and terminates the child", async () => {
+  const fixture = String.raw`
+process.stdout.write(JSON.stringify({event:"ready",protocolVersion:1}) + "\n");
+setInterval(() => {}, 1000);
+`;
+  const client = await SidecarClient.start(process.execPath, ["-e", fixture]);
+  const pending = client.request("longOperation", {});
+  const cancellation = client.cancel();
+  await assert.rejects(pending, (error) => error.code === "operation_cancelled");
+  await cancellation;
+  assert.equal(client.closed, true);
+});
