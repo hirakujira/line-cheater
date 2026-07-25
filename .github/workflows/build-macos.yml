@@ -50,6 +50,10 @@ jobs:
         working-directory: native/electron
         run: npm ci
 
+      - name: Install Electron runtime
+        working-directory: native/electron
+        run: node node_modules/electron/install.js
+
       - name: Check Rust formatting
         run: cargo fmt --all --check
 
