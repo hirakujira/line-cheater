@@ -101,9 +101,13 @@ later. Without signing secrets it is ad-hoc signed and suitable for direct
 testing, but a recipient may see an unidentified-developer Gatekeeper warning.
 The macOS release workflow can import a passwordless
 `MACOS_CERTIFICATE_BASE64` P12 and use `MACOS_SIGN_IDENTITY` for a Developer ID
-signature. Public distribution still requires Apple notarization with
-`xcrun notarytool` and ticket stapling. Build a separate `x64` runtime/sidecar
-or a verified universal bundle before claiming Intel Mac support.
+signature. When `MACOS_NOTARY_APPLE_ID`, `MACOS_NOTARY_TEAM_ID`, and
+`MACOS_NOTARY_APP_SPECIFIC_PASSWORD` are configured, the workflow submits the
+DMG with `xcrun notarytool`, waits for acceptance, staples the ticket, and
+validates the stapled DMG. The local `package:mac` command only signs and
+packages; it does not contact Apple notarization. Build a separate `x64`
+runtime/sidecar or a verified universal bundle before claiming Intel Mac
+support.
 
 ### Automated release
 

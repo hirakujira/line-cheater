@@ -2,6 +2,12 @@ name: Test macOS Developer ID signing
 
 on:
   workflow_dispatch:
+    inputs:
+      notarize:
+        description: Submit the DMG to Apple and staple the notarization ticket
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -94,6 +100,30 @@ jobs:
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: native/electron/scripts/package-dmg.sh
 
+      - name: Notarize and staple test DMG
+        if: ${{ inputs.notarize }}
+        env:
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          MACOS_NOTARY_APP_SPECIFIC_PASSWORD: ${{ secrets.MACOS_NOTARY_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./native/electron/package.json').version")"
+          dmg="native/electron/dist/LINE-Cheater-${version}-macOS-arm64.dmg"
+          native/electron/scripts/notarize-dmg.sh "$dmg"
+
+      - name: Refresh checksums after DMG stapling
+        if: ${{ inputs.notarize }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./native/electron/package.json').version")"
+          cd native/electron/dist
+          shasum -a 256 \
+            "LINE-Cheater-${version}-macOS-arm64.zip" \
+            "LINE-Cheater-${version}-macOS-arm64.dmg" \
+            > SHA256SUMS.txt
+
       - name: Verify signed app and DMG
         shell: bash
         env:
@@ -118,12 +148,19 @@ jobs:
           printf '%s\n' "$details" | grep -E "Signed Time=|Timestamp="
           "$app/Contents/Resources/bin/line-cheater" --version
           hdiutil verify "$dmg"
+          if [[ "${{ inputs.notarize }}" == "true" ]]; then
+            xcrun stapler validate "$dmg"
+          fi
           (
             cd native/electron/dist
             shasum -a 256 -c SHA256SUMS.txt
           )
 
-          echo "Signature verification passed. Notarization is not performed by this test."
+          if [[ "${{ inputs.notarize }}" == "true" ]]; then
+            echo "Signature and notarization verification passed."
+          else
+            echo "Signature verification passed. Notarization was not requested."
+          fi
           spctl --assess --type execute --verbose=4 "$app" || \
             echo "spctl did not accept the app; this is expected before notarization."
 

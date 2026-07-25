@@ -19,6 +19,10 @@ const dmgPackager = fs.readFileSync(
   path.join(root, "scripts", "package-dmg.sh"),
   "utf8"
 );
+const dmgNotarizer = fs.readFileSync(
+  path.join(root, "scripts", "notarize-dmg.sh"),
+  "utf8"
+);
 const macWorkflow = fs.readFileSync(
   path.join(root, "../../.github/workflows/release-macos.yml"),
   "utf8"
@@ -342,6 +346,19 @@ test("imports optional macOS signing material without weakening the ad-hoc fallb
   assert.match(macWorkflow, /ad-hoc code signature/);
   assert.match(macWorkflow, /Developer ID Application/);
   assert.match(macWorkflow, /delete-keychain/);
+});
+
+test("notarizes and staples the macOS DMG with GitHub Secrets", () => {
+  assert.match(macWorkflow, /MACOS_NOTARY_APPLE_ID/);
+  assert.match(macWorkflow, /MACOS_NOTARY_TEAM_ID/);
+  assert.match(macWorkflow, /MACOS_NOTARY_APP_SPECIFIC_PASSWORD/);
+  assert.match(macWorkflow, /notarize-dmg\.sh/);
+  assert.match(macWorkflow, /Refresh checksums after DMG stapling/);
+  assert.match(dmgNotarizer, /notarytool store-credentials/);
+  assert.match(dmgNotarizer, /notarytool submit/);
+  assert.match(dmgNotarizer, /stapler staple/);
+  assert.match(dmgNotarizer, /stapler validate/);
+  assert.equal(fs.statSync(path.join(root, "scripts", "notarize-dmg.sh")).mode & 0o111, 0o111);
 });
 
 test("provides a GitHub Actions Windows packaging workflow", () => {

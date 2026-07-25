@@ -96,7 +96,7 @@ macOS 12 以上的 Apple Silicon 測試封裝可在 macOS 上重複建立：
 native/electron/scripts/package-dmg.sh
 ```
 
-已有依賴時可設定 `SKIP_NPM_CI=1`。沒有簽章 secrets 時輸出為 ad-hoc 簽章；GitHub Actions 可使用 passwordless `MACOS_CERTIFICATE_BASE64` P12 與 `MACOS_SIGN_IDENTITY` 進行 Developer ID 簽署，但仍需另外完成 notarization。Windows x64 ZIP 由 [Windows GitHub Actions workflow](.github/workflows/build-windows.yml) 建立與驗證；目前未配置 Windows code signing。請參考 [Electron package 說明](native/electron/README.md#macos-package)。
+已有依賴時可設定 `SKIP_NPM_CI=1`。沒有簽章 secrets 時輸出為 ad-hoc 簽章；GitHub Actions 可使用 passwordless `MACOS_CERTIFICATE_BASE64` P12 與 `MACOS_SIGN_IDENTITY` 進行 Developer ID 簽署，並使用 `MACOS_NOTARY_APPLE_ID`、`MACOS_NOTARY_TEAM_ID` 與 `MACOS_NOTARY_APP_SPECIFIC_PASSWORD` 對 DMG 完成 notarization 與 ticket stapling。Windows x64 ZIP 由 [Windows GitHub Actions workflow](.github/workflows/build-windows.yml) 建立與驗證；目前未配置 Windows code signing。請參考 [Electron package 說明](native/electron/README.md#macos-package)。
 
 桌面版提供聊天與訊息瀏覽、受限原圖預覽、附件清理、完全相同附件審核，以及受保護的進階模式。重複附件以檔案大小與 SHA-256 分組，標記前會要求至少保留一份。進階模式可規劃移除選定聊天室及其附件，或掃描空聊天室、僅含系統訊息的聊天室與沒有對應聊天列的 `LineSquare` 訊息。SQLite 只會在新建候選檔中重寫與 `VACUUM`，原始資料庫不會被修改。
 

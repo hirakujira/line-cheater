@@ -104,6 +104,30 @@ jobs:
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: native/electron/scripts/package-dmg.sh
 
+      - name: Notarize and staple DMG
+        id: notarization
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+          MACOS_NOTARY_APP_SPECIFIC_PASSWORD: ${{ secrets.MACOS_NOTARY_APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          dmg="native/electron/dist/LINE-Cheater-${VERSION}-macOS-arm64.dmg"
+          native/electron/scripts/notarize-dmg.sh "$dmg"
+          echo "notarized=true" >> "$GITHUB_OUTPUT"
+
+      - name: Refresh checksums after DMG stapling
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd native/electron/dist
+          shasum -a 256 \
+            "LINE-Cheater-${VERSION}-macOS-arm64.zip" \
+            "LINE-Cheater-${VERSION}-macOS-arm64.dmg" \
+            > SHA256SUMS.txt
+
       - name: Verify release artifacts
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -128,6 +152,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           VERSION_COMMIT: ${{ steps.version.outputs.version_commit }}
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          NOTARIZED: ${{ steps.notarization.outputs.notarized }}
         run: |
           set -euo pipefail
           tag="v${VERSION}"
@@ -135,8 +160,10 @@ jobs:
           zip="native/electron/dist/LINE-Cheater-${VERSION}-macOS-arm64.zip"
           sums="native/electron/dist/SHA256SUMS.txt"
 
-          if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
-            signing_note="此版本使用 Developer ID Application 簽署，但仍需完成 Apple notarization。"
+          if [[ "${NOTARIZED:-}" == "true" ]]; then
+            signing_note="此版本使用 Developer ID Application 簽署並完成 Apple notarization，DMG 已 stapled ticket。"
+          elif [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
+            signing_note="此版本使用 Developer ID Application 簽署，但尚未完成 Apple notarization。"
           else
             signing_note="此版本使用 ad-hoc code signature，尚未使用 Apple Developer ID 簽署或 notarize。"
           fi
