@@ -119,10 +119,10 @@ metadata, commits the version bump, builds and verifies the DMG, then publishes
 the DMG, ZIP, and `SHA256SUMS.txt` to a tag-matched GitHub Release. The
 generated version-bump commit is detected so it does not increment twice.
 
-Windows x64 packaging runs from `.github/workflows/build-windows.yml` on pull
-requests and from `.github/workflows/release-windows.yml` after the macOS
-release workflow succeeds. It publishes an unsigned ZIP and checksum file; a
-Windows environment is not required on the developer machine.
+Windows x64 packaging runs from `.github/workflows/release-windows.yml` on pull
+requests and after the macOS release workflow succeeds. It publishes an
+unsigned ZIP and checksum file; a Windows environment is not required on the
+developer machine.
 
 ## Implemented UI flow
 

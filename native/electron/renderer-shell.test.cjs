@@ -363,7 +363,7 @@ test("notarizes and staples the macOS DMG with GitHub Secrets", () => {
 
 test("provides a GitHub Actions Windows packaging workflow", () => {
   const workflow = fs.readFileSync(
-    path.join(root, "../../.github/workflows/build-windows.yml"),
+    path.join(root, "../../.github/workflows/release-windows.yml"),
     "utf8"
   );
   assert.match(workflow, /windows-2022/);
