@@ -46,7 +46,8 @@ const artifactBase = `LINE-Cheater-${version}-macOS-${architecture}`;
 const zipPath = path.join(distRoot, `${artifactBase}.zip`);
 const dmgPath = path.join(distRoot, `${artifactBase}.dmg`);
 const electronEntitlements = path.join(electronRoot, "entitlements.mac.plist");
-const identity = process.env.MACOS_SIGN_IDENTITY;
+const identity = process.env.MACOS_SIGN_IDENTITY || "-";
+const usesDeveloperId = identity !== "-";
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -147,13 +148,11 @@ function sha256(file) {
 }
 
 function sign(target, entitlements) {
-  const arguments_ = [
-    "--force",
-    "--sign", identity,
-    "--options", "runtime",
-    "--timestamp"
-  ];
-  if (entitlements) arguments_.push("--entitlements", entitlements);
+  const arguments_ = ["--force", "--sign", identity];
+  if (usesDeveloperId) {
+    arguments_.push("--options", "runtime", "--timestamp");
+    if (entitlements) arguments_.push("--entitlements", entitlements);
+  }
   arguments_.push(target);
   run("/usr/bin/codesign", arguments_);
 }
@@ -196,6 +195,7 @@ function signElectronRuntime() {
 }
 
 function verifySignature(target, label) {
+  if (!usesDeveloperId) return;
   run("/usr/bin/codesign", ["--verify", "--strict", "--verbose=2", target]);
   const details = capture("/usr/bin/codesign", ["-dvvv", target]);
   const teamIdentifier = identity.match(/\(([A-Z0-9]{10})\)$/)?.[1];
@@ -216,12 +216,12 @@ if (!fs.existsSync(releaseBinary)) {
 if (!fs.existsSync(electronEntitlements)) {
   throw new Error("Electron entitlements are missing.");
 }
-if (!identity || !identity.startsWith("Developer ID Application:")) {
+if (usesDeveloperId && !identity.startsWith("Developer ID Application:")) {
   throw new Error(
     "Set MACOS_SIGN_IDENTITY to a Developer ID Application certificate before packaging."
   );
 }
-if (!capture("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"])
+if (usesDeveloperId && !capture("/usr/bin/security", ["find-identity", "-v", "-p", "codesigning"])
   .includes(`"${identity}"`)) {
   throw new Error(`Developer ID certificate is unavailable in the keychain: ${identity}`);
 }
@@ -307,7 +307,7 @@ plist("Set :CFBundleIconFile line-cheater.icns");
 signElectronRuntime();
 const sidecarPath = path.join(resourcesPath, "bin", "line-cheater");
 sign(sidecarPath);
-sign(appPath, electronEntitlements);
+sign(appPath, usesDeveloperId ? electronEntitlements : undefined);
 run("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=2", appPath]);
 verifySignature(newExecutable, "App executable");
 verifySignature(sidecarPath, "Rust sidecar");
@@ -340,4 +340,6 @@ fs.writeFileSync(path.join(distRoot, "SHA256SUMS.txt"), `${checksums.join("\n")}
 console.log(`Packaged ${appPath}`);
 console.log(`Created ${zipPath}`);
 console.log(`Created ${dmgPath}`);
-console.log(`Signature: ${identity} (notarization still required)`);
+console.log(usesDeveloperId
+  ? `Signature: ${identity} (notarization still required)`
+  : "Signature: ad hoc (not notarized)");

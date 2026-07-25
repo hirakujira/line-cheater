@@ -223,12 +223,13 @@ test("does not duplicate DOM ids in the app shell", () => {
   assert.equal(new Set(ids).size, ids.length);
 });
 
-test("packages the release sidecar with notarization-ready macOS signatures", () => {
+test("supports ad-hoc and Developer ID macOS signatures", () => {
   assert.match(packageJson.scripts["package:mac"], /build:native:mac/);
   assert.match(main, /path\.join\(process\.resourcesPath, "bin", executable\)/);
   assert.match(macPackager, /"target",\s*"release",\s*"line-cheater"/);
+  assert.match(macPackager, /MACOS_SIGN_IDENTITY \|\| "-"/);
   assert.match(macPackager, /MACOS_SIGN_IDENTITY to a Developer ID Application/);
-  assert.doesNotMatch(macPackager, /MACOS_SIGN_IDENTITY \|\| "-"/);
+  assert.match(macPackager, /usesDeveloperId/);
   assert.match(macPackager, /function signElectronRuntime\(\)/);
   assert.match(macPackager, /"--options", "runtime"/);
   assert.match(macPackager, /"--timestamp"/);
@@ -242,6 +243,7 @@ test("packages the release sidecar with notarization-ready macOS signatures", ()
   assert.match(macPackager, /"assets", "icon\.png"/);
   assert.match(macPackager, /pixelWidth:\\s\*1024/);
   assert.match(macPackager, /hasAlpha:\\s\*\(\?:yes\|true\)/);
+  assert.match(macPackager, /Signature: ad hoc \(not notarized\)/);
 });
 
 test("uses only the Electron JIT entitlements needed for hardened runtime", () => {
