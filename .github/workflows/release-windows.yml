@@ -1,0 +1,104 @@
+name: Build and release Windows ZIP
+
+on:
+  workflow_run:
+    workflows:
+      - Build and release macOS DMG
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-windows-release
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main') }}
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out latest main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: native/electron/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Read release version
+        id: version
+        shell: pwsh
+        run: |
+          $version = node -p "require('./native/electron/package.json').version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Install Electron dependencies
+        shell: bash
+        working-directory: native/electron
+        run: npm ci
+
+      - name: Install Electron runtime
+        shell: bash
+        working-directory: native/electron
+        run: node node_modules/electron/install.js
+
+      - name: Build and verify Windows package
+        shell: bash
+        working-directory: native/electron
+        run: npm run package:win
+
+      - name: Verify release artifacts
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "native/electron/dist/LINE-Cheater-$env:VERSION-Windows-x64.zip"
+          $sums = "native/electron/dist/SHA256SUMS-Windows-x64.txt"
+          if (!(Test-Path -LiteralPath $zip)) { throw "Missing Windows ZIP: $zip" }
+          if (!(Test-Path -LiteralPath $sums)) { throw "Missing Windows checksum file: $sums" }
+          $expected = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksumLine = Get-Content -LiteralPath $sums | Select-Object -First 1
+          if ($checksumLine -notmatch [regex]::Escape($expected)) {
+            throw "Windows ZIP checksum does not match $sums"
+          }
+
+      - name: Upload Windows package artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: line-cheater-windows-${{ steps.version.outputs.version }}
+          if-no-files-found: error
+          path: |
+            native/electron/dist/LINE-Cheater-*-Windows-x64.zip
+            native/electron/dist/SHA256SUMS-Windows-x64.txt
+
+      - name: Attach Windows package to the GitHub release
+        if: github.event_name == 'workflow_run'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "v$env:VERSION"
+          $zip = "native/electron/dist/LINE-Cheater-$env:VERSION-Windows-x64.zip"
+          $sums = "native/electron/dist/SHA256SUMS-Windows-x64.txt"
+          gh release view $tag --repo $env:REPOSITORY
+          gh release upload $tag $zip $sums --repo $env:REPOSITORY --clobber

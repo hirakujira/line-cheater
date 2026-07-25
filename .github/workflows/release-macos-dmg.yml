@@ -18,13 +18,13 @@ jobs:
 
     steps:
       - name: Check out latest main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
           ref: main
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -107,7 +107,7 @@ jobs:
           else
             gh release create "$tag" "$dmg" "$zip" "$sums" \
               --target "$VERSION_COMMIT" \
-              --title "LINE Cheater ${VERSION}" \
+              --title "LINE Cheater v${VERSION}" \
               --notes "$notes" \
               --generate-notes
           fi

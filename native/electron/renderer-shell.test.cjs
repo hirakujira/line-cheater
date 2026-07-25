@@ -19,6 +19,10 @@ const dmgPackager = fs.readFileSync(
   path.join(root, "scripts", "package-dmg.sh"),
   "utf8"
 );
+const windowsPackager = fs.readFileSync(
+  path.join(root, "scripts", "package-windows.cjs"),
+  "utf8"
+);
 const macEntitlements = fs.readFileSync(
   path.join(root, "entitlements.mac.plist"),
   "utf8"
@@ -48,6 +52,15 @@ test("reuses the macOS app icon for in-app branding", () => {
     /path\.join\(packagedSourceRoot, "native", "electron", "assets", "icon\.png"\)/
   );
   assert.match(styles, /\.brand-mark\s*\{[^}]*object-fit: cover/);
+});
+
+test("selects the platform-native desktop icon and packages Windows assets", () => {
+  assert.match(main, /process\.platform === "win32"/);
+  assert.match(main, /path\.join\(__dirname, "assets", "icon\.ico"\)/);
+  assert.match(main, /path\.join\(__dirname, "assets", "icon\.png"\)/);
+  assert.match(windowsPackager, /assets", "icon\.ico/);
+  assert.match(windowsPackager, /rcedit-x64\.exe/);
+  assert.match(windowsPackager, /node_modules",\s+"electron",\s+"install\.js/);
 });
 
 test("separates source selection from the sidebar workspace", () => {
@@ -223,12 +236,13 @@ test("does not duplicate DOM ids in the app shell", () => {
   assert.equal(new Set(ids).size, ids.length);
 });
 
-test("packages the release sidecar with notarization-ready macOS signatures", () => {
+test("supports ad-hoc and Developer ID macOS signatures", () => {
   assert.match(packageJson.scripts["package:mac"], /build:native:mac/);
   assert.match(main, /path\.join\(process\.resourcesPath, "bin", executable\)/);
   assert.match(macPackager, /"target",\s*"release",\s*"line-cheater"/);
+  assert.match(macPackager, /MACOS_SIGN_IDENTITY \|\| "-"/);
   assert.match(macPackager, /MACOS_SIGN_IDENTITY to a Developer ID Application/);
-  assert.doesNotMatch(macPackager, /MACOS_SIGN_IDENTITY \|\| "-"/);
+  assert.match(macPackager, /usesDeveloperId/);
   assert.match(macPackager, /function signElectronRuntime\(\)/);
   assert.match(macPackager, /"--options", "runtime"/);
   assert.match(macPackager, /"--timestamp"/);
@@ -242,6 +256,7 @@ test("packages the release sidecar with notarization-ready macOS signatures", ()
   assert.match(macPackager, /"assets", "icon\.png"/);
   assert.match(macPackager, /pixelWidth:\\s\*1024/);
   assert.match(macPackager, /hasAlpha:\\s\*\(\?:yes\|true\)/);
+  assert.match(macPackager, /Signature: ad hoc \(not notarized\)/);
 });
 
 test("uses only the Electron JIT entitlements needed for hardened runtime", () => {
@@ -260,7 +275,20 @@ test("provides a self-checking DMG packaging script", () => {
   assert.match(dmgPackager, /mounted_sidecar/);
   assert.match(dmgPackager, /Resources\/bin\/line-cheater/);
   assert.match(dmgPackager, /--version/);
-  assert.equal(fs.statSync(path.join(root, "scripts", "package-dmg.sh")).mode & 0o111, 0o111);
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(path.join(root, "scripts", "package-dmg.sh")).mode & 0o111, 0o111);
+  }
+});
+
+test("provides a GitHub Actions Windows packaging workflow", () => {
+  const workflow = fs.readFileSync(
+    path.join(root, "../../.github/workflows/build-windows.yml"),
+    "utf8"
+  );
+  assert.match(workflow, /windows-2022/);
+  assert.match(workflow, /npm run package:win/);
+  assert.match(workflow, /actions\/upload-artifact@v6/);
+  assert.match(workflow, /Windows-x64\.zip/);
 });
 
 test("prefers the current debug sidecar during development", () => {
