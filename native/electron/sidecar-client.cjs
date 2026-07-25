@@ -6,6 +6,7 @@ const { spawn } = require("node:child_process");
 const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_RESPONSE_LINE_BYTES = 16 * 1024 * 1024;
 const STDERR_TAIL_BYTES = 32 * 1024;
+const READY_IDLE_TIMEOUT_MS = 60_000;
 
 class SidecarClient extends EventEmitter {
   static async start(command, args, options) {
@@ -34,9 +35,9 @@ class SidecarClient extends EventEmitter {
       this.resolveReady = resolve;
       this.rejectReady = reject;
     });
-    this.readyTimer = setTimeout(() => {
-      this.fail(new Error("Rust sidecar did not become ready within 30 seconds."));
-    }, options.readyTimeoutMs || 30_000);
+    this.readyIdleTimeoutMs = options.readyTimeoutMs || READY_IDLE_TIMEOUT_MS;
+    this.readyTimer = null;
+    this.armReadyTimer();
     this.child.stdout.on("data", (chunk) => this.consumeStdout(chunk));
     this.child.stderr.on("data", (chunk) => this.consumeStderr(chunk));
     this.child.on("error", (error) => this.fail(error));
@@ -49,6 +50,21 @@ class SidecarClient extends EventEmitter {
         ));
       }
     });
+  }
+
+  // Preparing a large .imazingapp streams progress events for minutes, so readiness is bounded by
+  // silence instead of by total elapsed time.
+  armReadyTimer() {
+    if (this.readySettled || this.closed) return;
+    clearTimeout(this.readyTimer);
+    const seconds = Math.round(this.readyIdleTimeoutMs / 1000);
+    this.readyTimer = setTimeout(() => {
+      const error = new Error(
+        `Rust sidecar sent no output for ${seconds} seconds while opening the backup.`
+      );
+      error.code = "sidecar_not_ready";
+      this.fail(error);
+    }, this.readyIdleTimeoutMs);
   }
 
   request(method, params, options) {
@@ -73,6 +89,7 @@ class SidecarClient extends EventEmitter {
 
   consumeStdout(chunk) {
     if (this.closed) return;
+    this.armReadyTimer();
     this.stdoutBuffer = Buffer.concat([this.stdoutBuffer, chunk]);
     while (true) {
       const newline = this.stdoutBuffer.indexOf(0x0a);

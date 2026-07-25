@@ -275,14 +275,11 @@ fn main() -> Result<()> {
             print_json(&Catalog::open(&catalog)?.stats()?)?;
         }
         Command::Serve { source } => {
-            let mut session = NativeSession::open(&source, &cli.work_dir)?;
-            let stdin = std::io::stdin();
             let stdout = std::io::stdout();
-            serve(
-                &mut session,
-                &mut BufReader::new(stdin.lock()),
-                &mut BufWriter::new(stdout.lock()),
-            )?;
+            let mut output = BufWriter::new(stdout.lock());
+            let mut session = NativeSession::open_reporting(&source, &cli.work_dir, &mut output)?;
+            let stdin = std::io::stdin();
+            serve(&mut session, &mut BufReader::new(stdin.lock()), &mut output)?;
         }
         Command::Slim {
             source,

@@ -122,7 +122,7 @@ async function replaceSidecar(source) {
   const workKey = crypto.createHash("sha256").update(activeSource).digest("hex");
   const workDir = path.join(app.getPath("userData"), "sessions", workKey);
   fs.mkdirSync(workDir, { recursive: true });
-  const client = await SidecarClient.start(rustBinaryPath(), [
+  const client = new SidecarClient(rustBinaryPath(), [
     "--work-dir", workDir,
     "serve", "--source", activeSource
   ]);
@@ -139,6 +139,12 @@ async function replaceSidecar(source) {
       });
     }
   });
+  try {
+    await client.ready;
+  } catch (error) {
+    await client.dispose();
+    throw sourceOpenError(error);
+  }
   sidecar = client;
   try {
     await client.request("recoverInterruptedOperations", {});
@@ -148,6 +154,16 @@ async function replaceSidecar(source) {
     throw error;
   }
   return client.ready;
+}
+
+function sourceOpenError(error) {
+  if (error && error.code === "sidecar_not_ready") {
+    return new Error(
+      "Rust 核心長時間沒有回應，備份可能位於很慢的磁碟或已無法讀取。" +
+      "請確認來源檔案仍可存取，再重新選擇備份。"
+    );
+  }
+  return error;
 }
 
 function cleanCancelledOperation(operation) {

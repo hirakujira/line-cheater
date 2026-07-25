@@ -69,6 +69,43 @@ process.stdin.on("data", chunk => {
   await client.dispose();
 });
 
+test("keeps waiting for readiness while preparation progress keeps arriving", async () => {
+  const fixture = String.raw`
+let sent = 0;
+const timer = setInterval(() => {
+  sent += 1;
+  process.stdout.write(JSON.stringify({
+    event: "sourcePrepareProgress",
+    phase: "staging_databases",
+    stagedBytes: sent,
+    totalBytes: 6
+  }) + "\n");
+  if (sent === 6) {
+    clearInterval(timer);
+    process.stdout.write(JSON.stringify({event:"ready",protocolVersion:1}) + "\n");
+  }
+}, 25);
+setInterval(() => {}, 1000);
+`;
+  const client = new SidecarClient(process.execPath, ["-e", fixture], { readyTimeoutMs: 90 });
+  const progress = [];
+  client.on("sidecarEvent", (event) => {
+    if (event.event === "sourcePrepareProgress") progress.push(event.stagedBytes);
+  });
+  const ready = await client.ready;
+  assert.equal(ready.event, "ready");
+  assert.ok(progress.length >= 4, `expected preparation progress, saw ${progress.length}`);
+  await client.dispose();
+});
+
+test("fails readiness when the sidecar stops producing output", async () => {
+  const client = new SidecarClient(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+    readyTimeoutMs: 60
+  });
+  await assert.rejects(client.ready, (error) => error.code === "sidecar_not_ready");
+  assert.equal(client.closed, true);
+});
+
 test("cancels an in-flight sidecar request and terminates the child", async () => {
   const fixture = String.raw`
 process.stdout.write(JSON.stringify({event:"ready",protocolVersion:1}) + "\n");

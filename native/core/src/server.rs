@@ -14,7 +14,7 @@ use crate::model::{
     AdvancedCleanupReport, AttachmentCursor, AttachmentKind, Chat, ChatCursor, ChatPage,
     CleanupGroupPage, DEFAULT_PAGE_SIZE, DuplicateGroupCursor, MessageCursor, MessagePage,
 };
-use crate::source::{PreparedSource, prepare_source};
+use crate::source::{PreparedSource, prepare_source_reporting};
 
 pub const SIDECAR_PROTOCOL_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -31,7 +31,29 @@ pub struct NativeSession {
 
 impl NativeSession {
     pub fn open(source: &Path, work_dir: &Path) -> Result<Self> {
-        let prepared = prepare_source(source, work_dir)?;
+        Self::open_reporting(source, work_dir, &mut std::io::sink())
+    }
+
+    /// Preparation can copy multi-gigabyte databases out of an archive, so the caller receives
+    /// `sourcePrepareProgress` lines and the ready handshake never waits on unbounded work such as
+    /// interrupted-operation recovery.
+    pub fn open_reporting<W: Write>(
+        source: &Path,
+        work_dir: &Path,
+        output: &mut W,
+    ) -> Result<Self> {
+        let prepared = prepare_source_reporting(source, work_dir, |progress| {
+            let _ = write_json_line(
+                output,
+                &json!({
+                    "event": "sourcePrepareProgress",
+                    "phase": progress.phase,
+                    "entry": progress.entry,
+                    "stagedBytes": progress.staged_bytes,
+                    "totalBytes": progress.total_bytes,
+                }),
+            );
+        })?;
         let database = LineDatabase::open(&prepared.database_path)?;
         let square_database = prepared
             .square_database_path
@@ -44,7 +66,6 @@ impl NativeSession {
             .map(UnifiedGroupDatabase::open)
             .transpose()?;
         let catalog = Catalog::open(&work_dir.join("catalog.sqlite"))?;
-        catalog.recover_interrupted_operations(&prepared.original_path, prepared.report.kind)?;
         let fts5_index = Fts5MessageIndex::open(&work_dir.join("search.sqlite")).ok();
         Ok(Self {
             prepared,

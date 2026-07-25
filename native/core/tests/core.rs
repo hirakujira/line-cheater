@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use anyhow::anyhow;
 use line_backup_native::{
     AttachmentKind, Catalog, ChatCursor, LineDatabase, LineSquareDatabase, MessageCursor,
-    NativeSession, SourceKind, UnifiedGroupDatabase, build_candidate, inspect_source,
-    prepare_source, serve,
+    NativeSession, PreparePhase, SourceKind, UnifiedGroupDatabase, build_candidate, inspect_source,
+    prepare_source, prepare_source_reporting, serve,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -1232,6 +1232,71 @@ fn stages_only_sqlite_from_imazing_archive() {
     assert_eq!(database.list_messages(7, None, 10).unwrap().items.len(), 4);
     assert!(prepared.square_database_path.unwrap().is_file());
     assert!(prepared.unified_group_database_path.unwrap().is_file());
+}
+
+#[test]
+fn reports_archive_staging_progress_and_reuses_staged_databases() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let database = inspect_source(&source).unwrap().database_path;
+    let archive_path = temporary.path().join("LINE.imazingapp");
+    write_single_database_archive(&archive_path, &source, &database, b"media payload");
+    let database_bytes = fs::metadata(source.join(&database)).unwrap().len();
+    let work = temporary.path().join("work");
+
+    let mut events = Vec::new();
+    let prepared = prepare_source_reporting(&archive_path, &work, |progress| {
+        events.push((progress.phase, progress.staged_bytes, progress.total_bytes));
+    })
+    .unwrap();
+    assert_eq!(events[0].0, PreparePhase::ReadingArchiveIndex);
+    let staging: Vec<_> = events
+        .iter()
+        .filter(|event| event.0 == PreparePhase::StagingDatabases)
+        .collect();
+    assert!(staging.iter().all(|event| event.2 == database_bytes));
+    assert_eq!(staging.last().unwrap().1, database_bytes);
+    let staging_directory = prepared.staging_directory.clone().unwrap();
+
+    let mut reused_events = Vec::new();
+    let reused = prepare_source_reporting(&archive_path, &work, |progress| {
+        reused_events.push((progress.phase, progress.staged_bytes, progress.total_bytes));
+    })
+    .unwrap();
+    assert_eq!(reused.staging_directory.unwrap(), staging_directory);
+    assert!(
+        reused_events
+            .iter()
+            .filter(|event| event.0 == PreparePhase::StagingDatabases)
+            .all(|event| event.1 == 0 && event.2 == 0)
+    );
+
+    write_single_database_archive(&archive_path, &source, &database, b"replaced media payload");
+    let changed = prepare_source_reporting(&archive_path, &work, |_| {}).unwrap();
+    assert_ne!(changed.staging_directory.unwrap(), staging_directory);
+}
+
+fn write_single_database_archive(
+    archive_path: &Path,
+    source: &Path,
+    database: &str,
+    media_payload: &[u8],
+) {
+    let archive_file = fs::File::create(archive_path).unwrap();
+    let mut archive = zip::ZipWriter::new(archive_file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    archive.start_file(database, options).unwrap();
+    archive
+        .write_all(&fs::read(source.join(database)).unwrap())
+        .unwrap();
+    archive
+        .start_file(
+            "Container/AppGroups/group.com.linecorp.line/Message Attachments/c1/99999999.jpg",
+            options,
+        )
+        .unwrap();
+    archive.write_all(media_payload).unwrap();
+    archive.finish().unwrap();
 }
 
 #[test]

@@ -5,6 +5,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 const sourceKinds = new Set(["directory", "archive", "sqlite"]);
 const eventNames = new Set([
   "operationStarted",
+  "sourcePrepareProgress",
   "searchIndexProgress",
   "catalogProgress",
   "catalogContextProgress",

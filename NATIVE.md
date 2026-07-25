@@ -388,6 +388,17 @@ Ready event:
 {"event":"ready","protocolVersion":1,"source":{},"readOnly":true}
 ```
 
+Preparation events precede `ready` whenever a `.imazingapp` must be staged. The
+staging fingerprint is metadata-only, entry lookups use the in-memory central
+directory, and interrupted-operation recovery is left to the explicit
+`recoverInterruptedOperations` request, so readiness never waits on work that
+scales with the archive size:
+
+```json
+{"event":"sourcePrepareProgress","phase":"reading_archive_index","entry":null,"stagedBytes":0,"totalBytes":0}
+{"event":"sourcePrepareProgress","phase":"staging_databases","entry":"Line.sqlite","stagedBytes":16777216,"totalBytes":2147483648}
+```
+
 Request and success response:
 
 ```json
