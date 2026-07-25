@@ -67,6 +67,26 @@ test("selects the platform-native desktop icon and packages Windows assets", () 
   assert.match(windowsPackager, /node_modules",\s+"electron",\s+"install\.js/);
 });
 
+test("verifies the complete Windows package payload", () => {
+  assert.match(windowsPackager, /const requiredPackageFiles = \[/);
+  assert.match(windowsPackager, /required file: \$\{relativePath\}/);
+  assert.match(windowsPackager, /verifiedMetadata\.productName !== productName/);
+  assert.match(windowsPackager, /verifiedMetadata\.version !== version/);
+  assert.match(windowsPackager, /verifiedMetadata\.main !== "native\/electron\/main\.cjs"/);
+  for (const packagedFile of [
+    "renderer.html",
+    "renderer.js",
+    "sidecar-client.cjs",
+    "styles.css",
+    "icon.ico",
+    "icon.png",
+    "data-provider.js",
+    "line-cheater.exe"
+  ]) {
+    assert.match(windowsPackager, new RegExp(`"${packagedFile.replace('.', "\\.")}"`));
+  }
+});
+
 test("separates source selection from the sidebar workspace", () => {
   assert.match(html, /id="welcome-screen"/);
   assert.match(html, /id="enter-workspace"[^>]*disabled/);
