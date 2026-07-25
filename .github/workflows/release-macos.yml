@@ -373,6 +373,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
           VERSION: ${{ needs.prepare.outputs.version }}
           VERSION_COMMIT: ${{ needs.prepare.outputs.version_commit }}
         run: |
@@ -387,14 +388,16 @@ jobs:
           notes=$'LINE Cheater macOS 12+ Apple Silicon 與 Intel (arm64/x64) 正式封裝。\n\n來源備份以唯讀方式開啟，候選輸出另存，不會覆寫原始檔。\n\n此版本的 arm64 與 x64 封裝均使用 Developer ID Application 簽署並完成 Apple notarization，DMG 已 stapled ticket。\n\n完整功能、安全規則與限制請參考 README：'
           notes+="https://github.com/${GITHUB_REPOSITORY}/blob/main/README.md"
 
-          if gh release view "$tag" >/dev/null 2>&1; then
+          if gh release view "$tag" --repo "$REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" \
               "$dmg_arm64" "$zip_arm64" "$dmg_x64" "$zip_x64" "$sums" \
+              --repo "$REPOSITORY" \
               --clobber
-            gh release edit "$tag" --draft=false
+            gh release edit "$tag" --repo "$REPOSITORY" --draft=false
           else
             gh release create "$tag" \
               "$dmg_arm64" "$zip_arm64" "$dmg_x64" "$zip_x64" "$sums" \
+              --repo "$REPOSITORY" \
               --target "$VERSION_COMMIT" \
               --title "LINE Cheater v${VERSION}" \
               --notes "$notes" \
