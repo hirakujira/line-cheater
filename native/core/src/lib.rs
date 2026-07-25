@@ -17,4 +17,7 @@ pub use model::{
     MessagePage,
 };
 pub use server::{NativeSession, serve};
-pub use source::{PreparedSource, SourceKind, SourceReport, inspect_source, prepare_source};
+pub use source::{
+    PreparePhase, PrepareProgress, PreparedSource, SourceKind, SourceReport, inspect_source,
+    prepare_source, prepare_source_reporting,
+};

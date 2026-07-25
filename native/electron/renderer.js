@@ -167,12 +167,14 @@ const categoryLabels = {
 };
 
 function setStatus(message, error) {
+  const text = String(message == null ? "" : message)
+    .replace(/Error invoking remote method '[^']*':\s*(?:Error:\s*)?/g, "");
   for (const status of [elements.status, elements.workspaceStatus]) {
-    status.textContent = message;
+    status.textContent = text;
     status.classList.toggle("error", Boolean(error));
   }
   if (!elements.loadModal.classList.contains("hidden")) {
-    elements.loadModalMessage.textContent = message;
+    elements.loadModalMessage.textContent = text;
   }
 }
 
@@ -2558,6 +2560,22 @@ elements.duplicateNext.addEventListener("click", () => {
   if (duplicatePage && duplicatePage.nextCursor) void loadDuplicateGroups(duplicatePageNumber + 1);
 });
 
+bridge.on("sourcePrepareProgress", (event) => {
+  if (elements.loadModal.classList.contains("hidden")) return;
+  if (event.phase === "reading_archive_index") {
+    updateLoadModalProgress(4, "正在讀取備份索引…");
+    return;
+  }
+  const total = Number(event.totalBytes) || 0;
+  const staged = Math.min(Number(event.stagedBytes) || 0, total);
+  const ratio = total ? staged / total : 0;
+  updateLoadModalProgress(
+    5 + ratio * 6,
+    total
+      ? `正在取出備份中的 SQLite…（${formatBytes(staged)} / ${formatBytes(total)}）`
+      : "正在取出備份中的 SQLite…"
+  );
+});
 bridge.on("catalogProgress", (event) => {
   elements.progress.removeAttribute("value");
   elements.catalogSummary.textContent =
