@@ -1,4 +1,4 @@
-name: Build and attach Windows release
+name: Build and release Windows ZIP
 
 on:
   workflow_run:
