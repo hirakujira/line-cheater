@@ -36,6 +36,9 @@ const macEntitlements = fs.readFileSync(
   "utf8"
 );
 const packageJson = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+const landingHtml = fs.readFileSync(path.join(root, "../../index.html"), "utf8");
+const landingScript = fs.readFileSync(path.join(root, "../../app.js"), "utf8");
+const landingStyles = fs.readFileSync(path.join(root, "../../styles.css"), "utf8");
 
 test("uses LINE Cheater consistently as the desktop product name", () => {
   assert.match(html, /<title>LINE Cheater<\/title>/);
@@ -47,6 +50,21 @@ test("uses LINE Cheater consistently as the desktop product name", () => {
   assert.doesNotMatch(main, /line-reader:\/\//);
   assert.equal(packageJson.name, "line-cheater-desktop");
   assert.equal(packageJson.productName, "LINE Cheater");
+});
+
+test("offers direct macOS architecture downloads on the homepage", () => {
+  assert.match(landingHtml, /id="macArm64Download"/);
+  assert.match(landingHtml, /Apple Silicon/);
+  assert.match(landingHtml, /id="macX64Download"/);
+  assert.match(landingHtml, /Intel Mac/);
+  assert.match(landingHtml, /id="windowsDownload"/);
+  assert.match(landingScript, /macOS-arm64\\\.dmg/);
+  assert.match(landingScript, /macOS-x64\\\.dmg/);
+  assert.match(landingScript, /configurePlatformDownload\(el\.macArm64Download/);
+  assert.match(landingScript, /configurePlatformDownload\(el\.macX64Download/);
+  assert.match(landingScript, /macArchitecture === "x64"/);
+  assert.match(landingStyles, /\.download-options-macos/);
+  assert.match(landingStyles, /\.platform-download-windows/);
 });
 
 test("reuses the macOS app icon for in-app branding", () => {
@@ -329,6 +347,8 @@ test("provides a self-checking DMG packaging script", () => {
   assert.equal(packageJson.scripts["package:dmg"], "./scripts/package-dmg.sh");
   assert.match(dmgPackager, /npm --prefix \"\$electron_root\" ci/);
   assert.match(dmgPackager, /SKIP_NPM_CI/);
+  assert.match(dmgPackager, /SKIP_NPM_TEST/);
+  assert.match(dmgPackager, /build:native:mac/);
   assert.match(dmgPackager, /MACOS_PACKAGE_ARCH/);
   assert.match(dmgPackager, /x86_64\) artifact_arch="x64"/);
   assert.match(dmgPackager, /electron_installer/);
@@ -379,7 +399,9 @@ test("provides a GitHub Actions Windows packaging workflow", () => {
     "utf8"
   );
   assert.match(workflow, /windows-2022/);
-  assert.match(workflow, /npm run package:win/);
+  assert.match(workflow, /npm run build:native:win/);
+  assert.match(workflow, /node scripts\/package-windows\.cjs/);
+  assert.match(workflow, /github\.event_name != 'workflow_run'/);
   assert.match(workflow, /actions\/upload-artifact@v6/);
   assert.match(workflow, /Windows-x64\.zip/);
 });
