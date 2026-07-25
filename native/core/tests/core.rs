@@ -1656,6 +1656,55 @@ fn raw_copies_archive_candidate_and_removes_marked_entry() {
 }
 
 #[test]
+fn keeps_archive_directory_entries_in_candidate() {
+    let temporary = TempDir::new().unwrap();
+    let source_directory = make_fixture(temporary.path());
+    let database = inspect_source(&source_directory).unwrap().database_path;
+    let removable =
+        "Container/AppGroups/group.com.linecorp.line/Message Thumbnails/c1/99999999.thumb";
+    let archive_path = temporary.path().join("LINE-directories.imazingapp");
+    let mut writer = zip::ZipWriter::new(fs::File::create(&archive_path).unwrap());
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.add_directory("Payload/", options).unwrap();
+    writer.add_directory("Payload/LINE.app/", options).unwrap();
+    writer.start_file(".lock", options).unwrap();
+    writer.write_all(b"lock").unwrap();
+    writer
+        .start_file("Payload/LINE.app/Info.plist", options)
+        .unwrap();
+    writer.write_all(b"plist").unwrap();
+    writer.start_file(&database, options).unwrap();
+    writer
+        .write_all(&fs::read(source_directory.join(&database)).unwrap())
+        .unwrap();
+    writer.start_file(removable, options).unwrap();
+    writer.write_all(b"remove me").unwrap();
+    writer.finish().unwrap();
+
+    let mut catalog =
+        Catalog::open(&temporary.path().join("directory-work/catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&archive_path, SourceKind::ImazingArchive, |_| {})
+        .unwrap();
+    catalog.set_marked(removable, true).unwrap();
+    let output = temporary
+        .path()
+        .join("LINE-directories-candidate.imazingapp");
+    let report = build_candidate(&archive_path, &output, &catalog, true, |_| Ok(())).unwrap();
+    assert_eq!(report.removed_entries, 1);
+    assert_eq!(report.input_entries - report.output_entries, 1);
+
+    let mut archive = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+    assert_eq!(archive.len() as u64, report.output_entries);
+    let names: Vec<String> = (0..archive.len())
+        .map(|index| archive.by_index(index).unwrap().name().to_string())
+        .collect();
+    assert!(names.contains(&"Payload/".to_string()));
+    assert!(names.contains(&"Payload/LINE.app/".to_string()));
+    assert!(!names.contains(&removable.to_string()));
+}
+
+#[test]
 fn builds_zip64_candidate_with_more_than_u16_entries() {
     let temporary = TempDir::new().unwrap();
     let source_directory = make_fixture(temporary.path());

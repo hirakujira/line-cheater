@@ -432,6 +432,18 @@ where
         ensure_stable_archive_name(&entry)?;
         let name = entry.name().to_string();
         processed_bytes = processed_bytes.saturating_add(entry.compressed_size());
+        if entry.is_dir() {
+            drop(entry);
+            writer.raw_copy_file(archive.by_index(index)?)?;
+            output_entries += 1;
+            on_progress(CandidateProgress {
+                processed_bytes,
+                total_bytes,
+                processed_entries: (index + 1) as u64,
+                total_entries: input_entries,
+            })?;
+            continue;
+        }
         if marked.contains(&name) {
             removed_found.insert(name);
             on_progress(CandidateProgress {
@@ -470,7 +482,7 @@ where
         }
         let expected_digest = catalog
             .content_digest_for_path(&name)?
-            .context("catalog is missing a source content digest")?;
+            .with_context(|| format!("catalog is missing a source content digest: {name}"))?;
         let digest = hash_reader(&mut entry)?;
         if digest != expected_digest {
             bail!("source archive entry changed while candidate was being written: {name}");
@@ -608,7 +620,7 @@ where
         let before = file_fingerprint(entry.path())?;
         let expected_digest = catalog
             .content_digest_for_path(&relative)?
-            .context("catalog is missing a source content digest")?;
+            .with_context(|| format!("catalog is missing a source content digest: {relative}"))?;
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
             .large_file(before.bytes >= ZIP64_BYTES_THR);

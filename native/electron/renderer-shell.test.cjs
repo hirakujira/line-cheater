@@ -358,7 +358,9 @@ test("notarizes and staples the macOS DMG with GitHub Secrets", () => {
   assert.match(dmgNotarizer, /notarytool submit/);
   assert.match(dmgNotarizer, /stapler staple/);
   assert.match(dmgNotarizer, /stapler validate/);
-  assert.equal(fs.statSync(path.join(root, "scripts", "notarize-dmg.sh")).mode & 0o111, 0o111);
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(path.join(root, "scripts", "notarize-dmg.sh")).mode & 0o111, 0o111);
+  }
 });
 
 test("provides a GitHub Actions Windows packaging workflow", () => {
