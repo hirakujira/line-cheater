@@ -428,19 +428,48 @@
       var published = Array.isArray(releases) ? releases.filter(function (release) {
         return release && !release.draft && !release.prerelease;
       }) : [];
-      var macAsset = findDesktopReleaseAsset(published, /macOS-arm64\.dmg$/i);
+      var macArm64Asset = findDesktopReleaseAsset(published, /macOS-arm64\.dmg$/i);
+      var macX64Asset = findDesktopReleaseAsset(published, /macOS-x64\.dmg$/i);
       var windowsAsset = findDesktopReleaseAsset(published, /Windows-x64\.zip$/i);
-      configurePlatformDownload(el.macDownload, el.macDownloadMeta, macAsset, "macOS 12+ · Apple Silicon");
-      configurePlatformDownload(el.windowsDownload, el.windowsDownloadMeta, windowsAsset, "Windows 10/11 · x64");
-      if (el.releaseStatus) {
-        el.releaseStatus.textContent = macAsset && windowsAsset
-          ? "下載連結由 GitHub 最新正式 Release 提供。"
-          : "也可前往 GitHub Releases 查看所有版本。";
-      }
-      highlightCurrentPlatform();
+      return detectMacArchitecture().then(function (macArchitecture) {
+        var macAsset = macArchitecture === "x64" ? macX64Asset :
+          (macArchitecture === "arm64" ? macArm64Asset : null);
+        var macLabel = macArchitecture === "x64"
+          ? "macOS 12+ · Intel"
+          : (macArchitecture === "arm64" ? "macOS 12+ · Apple Silicon" :
+            "macOS 12+ · 選擇 arm64 / Intel");
+        configurePlatformDownload(el.macDownload, el.macDownloadMeta, macAsset, macLabel);
+        configurePlatformDownload(el.windowsDownload, el.windowsDownloadMeta, windowsAsset, "Windows 10/11 · x64");
+        if (el.releaseStatus) {
+          el.releaseStatus.textContent = macAsset && windowsAsset
+            ? "下載連結由 GitHub 最新正式 Release 提供。"
+            : (macArm64Asset && macX64Asset
+              ? "macOS 請在 GitHub Releases 選擇 Apple Silicon 或 Intel 版本。"
+              : "也可前往 GitHub Releases 查看所有版本。");
+        }
+        highlightCurrentPlatform();
+      });
     }).catch(function () {
       setDesktopReleaseFallback(true);
     });
+  }
+
+  function detectMacArchitecture() {
+    var userAgentData = navigator.userAgentData;
+    if (userAgentData && typeof userAgentData.getHighEntropyValues === "function") {
+      return userAgentData.getHighEntropyValues(["architecture"]).then(function (data) {
+        if (data && (data.architecture === "arm" || data.architecture === "arm64")) {
+          return "arm64";
+        }
+        if (data && (data.architecture === "x86" || data.architecture === "x64")) {
+          return "x64";
+        }
+        return null;
+      }).catch(function () {
+        return null;
+      });
+    }
+    return Promise.resolve(null);
   }
 
   function findDesktopReleaseAsset(releases, filenamePattern) {
@@ -472,7 +501,7 @@
   }
 
   function setDesktopReleaseFallback(hasError) {
-    configurePlatformDownload(el.macDownload, el.macDownloadMeta, null, "macOS 12+ · Apple Silicon");
+    configurePlatformDownload(el.macDownload, el.macDownloadMeta, null, "macOS 12+ · 選擇 arm64 / Intel");
     configurePlatformDownload(el.windowsDownload, el.windowsDownloadMeta, null, "Windows 10/11 · x64");
     if (el.releaseStatus) {
       el.releaseStatus.textContent = hasError

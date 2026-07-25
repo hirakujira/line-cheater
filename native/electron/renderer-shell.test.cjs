@@ -299,6 +299,8 @@ test("supports ad-hoc and Developer ID macOS signatures", () => {
   assert.match(main, /path\.join\(process\.resourcesPath, "bin", executable\)/);
   assert.match(macPackager, /"target",\s*"release",\s*"line-cheater"/);
   assert.match(macPackager, /MACOS_SIGN_IDENTITY \|\| "-"/);
+  assert.match(macPackager, /process\.arch === "arm64"/);
+  assert.match(macPackager, /process\.arch === "x64"/);
   assert.match(macPackager, /MACOS_SIGN_IDENTITY to a Developer ID Application/);
   assert.match(macPackager, /usesDeveloperId/);
   assert.match(macPackager, /function signElectronRuntime\(\)/);
@@ -327,6 +329,8 @@ test("provides a self-checking DMG packaging script", () => {
   assert.equal(packageJson.scripts["package:dmg"], "./scripts/package-dmg.sh");
   assert.match(dmgPackager, /npm --prefix \"\$electron_root\" ci/);
   assert.match(dmgPackager, /SKIP_NPM_CI/);
+  assert.match(dmgPackager, /MACOS_PACKAGE_ARCH/);
+  assert.match(dmgPackager, /x86_64\) artifact_arch="x64"/);
   assert.match(dmgPackager, /electron_installer/);
   assert.match(dmgPackager, /hdiutil verify/);
   assert.match(dmgPackager, /hdiutil attach/);
@@ -338,17 +342,23 @@ test("provides a self-checking DMG packaging script", () => {
   }
 });
 
-test("imports optional macOS signing material without weakening the ad-hoc fallback", () => {
+test("requires signing material for the dual-architecture macOS release", () => {
   assert.match(macWorkflow, /MACOS_CERTIFICATE_BASE64/);
   assert.match(macWorkflow, /base64 -D/);
   assert.match(macWorkflow, /security import .* -P \"\"/s);
   assert.match(macWorkflow, /MACOS_SIGN_IDENTITY:/);
-  assert.match(macWorkflow, /ad-hoc code signature/);
+  assert.match(macWorkflow, /test -n \"\$\{MACOS_CERTIFICATE_BASE64\}\"/);
+  assert.match(macWorkflow, /test -n \"\$\{MACOS_SIGN_IDENTITY\}\"/);
   assert.match(macWorkflow, /Developer ID Application/);
   assert.match(macWorkflow, /delete-keychain/);
 });
 
 test("notarizes and staples the macOS DMG with GitHub Secrets", () => {
+  assert.match(macWorkflow, /macos-15-intel/);
+  assert.match(macWorkflow, /arch: x64/);
+  assert.match(macWorkflow, /LINE-Cheater-\$\{VERSION\}-macOS-\$\{MACOS_ARCH\}\.dmg/);
+  assert.match(macWorkflow, /SHA256SUMS-\$\{MACOS_ARCH\}\.txt/);
+  assert.match(macWorkflow, /actions\/download-artifact@v6/);
   assert.match(macWorkflow, /MACOS_NOTARY_APPLE_ID/);
   assert.match(macWorkflow, /MACOS_NOTARY_TEAM_ID/);
   assert.match(macWorkflow, /MACOS_NOTARY_APP_SPECIFIC_PASSWORD/);

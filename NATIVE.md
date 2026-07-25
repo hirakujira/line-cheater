@@ -1,10 +1,50 @@
 # Native Core Architecture and Handoff
 
-Last updated: 2026-07-24
+Last updated: 2026-07-25
 
 This document is the durable handoff record for the bounded-memory desktop version
 of LINE Cheater. Keep it updated whenever the native implementation,
 data contract, safety rules, or next steps change.
+
+## Recent change summary
+
+The following summarizes the major native, desktop, and release changes from
+2026-07-24 through 2026-07-25. Release-only version bumps (`0.1.10`, `0.1.11`,
+and `0.1.12`) only synchronized Cargo/Electron metadata and lockfiles; they are
+grouped below rather than treated as separate feature changes.
+
+- `2d8a930 Build native app` introduced the Rust workspace, bounded native
+  catalog/database/candidate layers, the JSONL sidecar, the Electron shell, the
+  renderer provider, and the initial macOS packager.
+- `9efeacd Protect originals without thumbnails` tightened cleanup evidence so
+  “keep thumbnail” only acts on non-empty image thumbnails with a matching
+  original; PDFs, videos, and originals without thumbnails remain protected.
+- `3929eaa Fix native pagination and package DMG` corrected forward/backward
+  lookahead pagination and cursors, added the self-checking DMG workflow, and
+  completed the bounded desktop pagination/layout path.
+- `bf2fa93 Cleanup chat and db` added source-aware database cleanup planning and
+  rewrites for selected chats/orphan `LineSquare` messages inside the candidate,
+  with progress/reporting and read-only source preservation.
+- `e7d1586 feat(native): add resumable jobs and FTS5 search` added resumable
+  catalog/FTS/duplicate/candidate jobs, job IDs and checkpoints, bounded FTS5
+  search with safe SQLite fallback, expanded desktop controls, and a peak-RSS
+  measurement script.
+- `52bec56 Fix large size issue` hardened large-backup source staging, sidecar
+  startup and cancellation behavior, bounded IPC responses, and the generated
+  large-fixture regression coverage.
+- `0398dcf ci: add manual macOS signing test` added a manual Developer ID
+  signing verification workflow. `8cd4c45 ci: notarize macOS DMG releases`
+  added passwordless P12 import, `notarytool` submission, ticket stapling,
+  validation, and release checksum refresh.
+- `ddb3412 ci: merge desktop build and release workflows` (merged by
+  `99738d6`) consolidated the per-platform workflows, preserved PR checks, and
+  kept Windows release attachment behind successful macOS publication.
+- `519e06a chore(release): bump version to 0.1.12` synchronized the current
+  Cargo/Electron version metadata and lockfiles for the published `v0.1.12`
+  release.
+- Current Intel support work extends the macOS packager guard and release flow
+  to separate arm64 and x64 runners, signed/notarized artifacts, per-arch
+  checksums, and one combined GitHub Release publication.
 
 ## Goal
 
@@ -160,8 +200,8 @@ Verified implementation:
   removes the category/warning strips and pagination, then uses a contained
   virtual album scroller that preserves image proportions and puts the default
   original/thumbnail controls below the image.
-- [x] Add a repeatable macOS arm64 packager that bundles the optimized Rust
-  sidecar, custom icon, ad-hoc signature, ZIP, DMG, and SHA-256 checksums.
+- [x] Add a repeatable macOS arm64/x64 packager that bundles the optimized Rust
+  sidecar, custom icon, signature, ZIP, DMG, and SHA-256 checksums.
 - [x] Add Windows x64 GitHub Actions packaging and release workflows that bundle
   the Windows Rust sidecar, native icon, ZIP, and SHA-256 checksums.
 - [x] Add user-visible cancellation for catalog, duplicate hashing, and
@@ -177,9 +217,12 @@ Verified implementation:
   has no black corner matte or pre-applied system mask; packaging validates its
   dimensions and derives all ten legacy `.iconset` sizes before building the
   `.icns`.
-- [ ] Complete Apple notarization, Intel/universal macOS, Linux packages, and
-  Windows signing. The macOS workflow now imports an optional passwordless P12
-  and uses `MACOS_SIGN_IDENTITY` when both secrets are present.
+- [x] Add Developer ID signing and Apple notarization for macOS release DMGs.
+- [x] Add separate Intel x64 and Apple Silicon arm64 package jobs, with
+  per-architecture verification and a single combined release publication.
+- [ ] Complete a verified universal macOS bundle, Linux packages, and Windows
+  signing. Separate macOS architectures are intentionally published first so
+  each Rust sidecar and Electron runtime is built natively.
 - [x] Port exact duplicate review into the desktop UI; cleanup-plan exports and
   the remaining analysis UX are still pending.
 - [x] Validate a native candidate through an actual iMazing restore; repeat this
@@ -193,8 +236,9 @@ Verified implementation:
 2026-07-25:
 
 - Rust: 1.96.0.
-- Native tests: 28 passed; renderer provider tests: 7 passed; Electron tests:
-  38 passed; existing Python CLI tests: 19 passed.
+- Native tests: 30 passed; renderer provider tests: 9 passed; Electron shell
+  tests: 33 passed (42 passed in the combined `npm test` command); existing
+  Python CLI tests: 19 passed.
 - Electron: 43.2.0 pinned; `npm audit` reported 0 vulnerabilities.
 - Ignored real fixture: 1.1 GB, 13,512 files, 11,239 classified attachments.
 - Catalog scan: approximately 0.36 seconds on the current machine.
@@ -281,15 +325,19 @@ Verified implementation:
   removal checkbox or candidate build was triggered.
 - Generated candidate fixtures verify directory streaming, archive raw-copy,
   explicit attachment removal, complete CRC reads, and protected core hashes.
-- The macOS arm64 release package embeds an arm64 optimized Rust sidecar and
-  Electron runtime. The 281 MiB app, 118 MiB ZIP, and 132 MiB DMG passed deep
-  ad-hoc signature verification, ZIP entry validation, DMG CRC verification,
-  bundled-sidecar execution, and SHA-256 generation. The packaged app was
-  launched through macOS and reached the LINE Cheater welcome/source screen
-  without loading a personal backup.
-- This artifact is not Developer ID signed or notarized. Treat it as a tester
-  build; do not describe it as Gatekeeper-ready public distribution.
-- The process-tree RSS script measured the complete 28-test native suite,
+- The initial macOS arm64 preview package embedded an arm64 optimized Rust
+  sidecar and Electron runtime. The 281 MiB app, 118 MiB ZIP, and 132 MiB DMG
+  passed deep ad-hoc signature verification, ZIP entry validation, DMG CRC
+  verification, bundled-sidecar execution, and SHA-256 generation. The
+  packaged app was launched through macOS and reached the LINE Cheater
+  welcome/source screen without loading a personal backup.
+- The published `v0.1.12` release completed the Developer ID signing and Apple
+  notarization flow for the arm64 DMG. The Intel x64 package path is now
+  automated in the release workflow and will be validated as a separate native
+  runner build rather than by cross-compiling the arm64 artifact.
+- That initial preview artifact was not Developer ID signed or notarized; the
+  published `v0.1.12` arm64 release is the signed and notarized public build.
+- The process-tree RSS script measured the complete 30-test native suite,
   including the >65,535-entry ZIP64 fixture, at a peak of 132,752 KiB. This is
   a synthetic test-suite figure, not a 200 GB backup acceptance result; the
   production fixture matrix still needs separate directory/archive runs.
@@ -750,8 +798,8 @@ The next owner should proceed in this order:
    richer tokenization and an explicit indexed-message count in the UI.
 4. Manually regress directory, SQLite, and `.imazingapp` native pickers on
    macOS/Windows/Linux. The macOS arm64 and Windows x64 bundle/sidecar paths
-   are automated; complete Apple notarization, Intel/universal builds, Linux
-   packaging, and Windows signing.
+   are automated; complete universal macOS builds, Linux packaging, and
+   Windows signing remain.
 5. Replace in-memory ZIP central-directory bookkeeping for million-entry
    archives and add the sparse >4 GiB single-entry runner.
 6. Add cancellation/restart coverage for the FTS build and measured peak RSS
