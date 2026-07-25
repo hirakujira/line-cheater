@@ -287,7 +287,7 @@ test("provides a GitHub Actions Windows packaging workflow", () => {
   );
   assert.match(workflow, /windows-2022/);
   assert.match(workflow, /npm run package:win/);
-  assert.match(workflow, /actions\/upload-artifact@v4/);
+  assert.match(workflow, /actions\/upload-artifact@v5/);
   assert.match(workflow, /Windows-x64\.zip/);
 });
 

@@ -25,12 +25,12 @@ jobs:
 
     steps:
       - name: Check out latest main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: main
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -80,7 +80,7 @@ jobs:
           }
 
       - name: Upload Windows package artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: line-cheater-windows-${{ steps.version.outputs.version }}
           if-no-files-found: error
