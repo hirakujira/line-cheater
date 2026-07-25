@@ -1,4 +1,4 @@
-name: Test macOS desktop
+name: Build macOS arm64
 
 on:
   pull_request:
