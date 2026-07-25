@@ -57,10 +57,9 @@ class SidecarClient extends EventEmitter {
   armReadyTimer() {
     if (this.readySettled || this.closed) return;
     clearTimeout(this.readyTimer);
-    const seconds = Math.round(this.readyIdleTimeoutMs / 1000);
     this.readyTimer = setTimeout(() => {
       const error = new Error(
-        `Rust sidecar sent no output for ${seconds} seconds while opening the backup.`
+        `Rust sidecar sent no output for ${this.readyIdleTimeoutMs} ms while opening the backup.`
       );
       error.code = "sidecar_not_ready";
       this.fail(error);
