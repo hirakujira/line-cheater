@@ -47,7 +47,14 @@ if [[ ! -d "$electron_app" ]]; then
   node "$electron_installer"
 fi
 
-npm --prefix "$electron_root" run package:mac
+if [[ "${SKIP_NPM_TEST:-0}" == "1" ]]; then
+  # Common Rust/Electron checks run once in the workflow; retain the native
+  # release build and package verification on every architecture runner.
+  npm --prefix "$electron_root" run build:native:mac
+  node "$electron_root/scripts/package-macos.cjs"
+else
+  npm --prefix "$electron_root" run package:mac
+fi
 
 version="$(node -p 'require(process.argv[1]).version' "$electron_root/package.json")"
 dist_root="$electron_root/dist"

@@ -83,8 +83,10 @@
     el.productLanding = document.getElementById("productLanding");
     el.openWebApp = document.getElementById("openWebApp");
     el.returnToLanding = document.getElementById("returnToLanding");
-    el.macDownload = document.getElementById("macDownload");
-    el.macDownloadMeta = document.getElementById("macDownloadMeta");
+    el.macArm64Download = document.getElementById("macArm64Download");
+    el.macArm64DownloadMeta = document.getElementById("macArm64DownloadMeta");
+    el.macX64Download = document.getElementById("macX64Download");
+    el.macX64DownloadMeta = document.getElementById("macX64DownloadMeta");
     el.windowsDownload = document.getElementById("windowsDownload");
     el.windowsDownloadMeta = document.getElementById("windowsDownloadMeta");
     el.releaseStatus = document.getElementById("releaseStatus");
@@ -340,7 +342,7 @@
     });
     el.runDiffButton.addEventListener("click", runBrowserDiff);
     el.packageModalClose.addEventListener("click", closePackageModal);
-    [el.macDownload, el.windowsDownload].forEach(function (link) {
+    [el.macArm64Download, el.macX64Download, el.windowsDownload].forEach(function (link) {
       if (!link) return;
       link.addEventListener("click", handleDesktopDownloadClick);
     });
@@ -432,22 +434,17 @@
       var macX64Asset = findDesktopReleaseAsset(published, /macOS-x64\.dmg$/i);
       var windowsAsset = findDesktopReleaseAsset(published, /Windows-x64\.zip$/i);
       return detectMacArchitecture().then(function (macArchitecture) {
-        var macAsset = macArchitecture === "x64" ? macX64Asset :
-          (macArchitecture === "arm64" ? macArm64Asset : null);
-        var macLabel = macArchitecture === "x64"
-          ? "macOS 12+ · Intel"
-          : (macArchitecture === "arm64" ? "macOS 12+ · Apple Silicon" :
-            "macOS 12+ · 選擇 arm64 / Intel");
-        configurePlatformDownload(el.macDownload, el.macDownloadMeta, macAsset, macLabel);
+        configurePlatformDownload(el.macArm64Download, el.macArm64DownloadMeta, macArm64Asset, "macOS 12+ · Apple Silicon · arm64");
+        configurePlatformDownload(el.macX64Download, el.macX64DownloadMeta, macX64Asset, "macOS 12+ · Intel · x64");
         configurePlatformDownload(el.windowsDownload, el.windowsDownloadMeta, windowsAsset, "Windows 10/11 · x64");
         if (el.releaseStatus) {
-          el.releaseStatus.textContent = macAsset && windowsAsset
-            ? "下載連結由 GitHub 最新正式 Release 提供。"
+          el.releaseStatus.textContent = macArm64Asset && macX64Asset && windowsAsset
+            ? "下載連結由 GitHub 最新正式 Release 提供；macOS 請依晶片選擇 DMG。"
             : (macArm64Asset && macX64Asset
-              ? "macOS 請在 GitHub Releases 選擇 Apple Silicon 或 Intel 版本。"
+              ? "macOS 已提供 Apple Silicon 與 Intel 兩個直接下載按鈕。"
               : "也可前往 GitHub Releases 查看所有版本。");
         }
-        highlightCurrentPlatform();
+        highlightCurrentPlatform(macArchitecture);
       });
     }).catch(function () {
       setDesktopReleaseFallback(true);
@@ -501,20 +498,25 @@
   }
 
   function setDesktopReleaseFallback(hasError) {
-    configurePlatformDownload(el.macDownload, el.macDownloadMeta, null, "macOS 12+ · 選擇 arm64 / Intel");
+    configurePlatformDownload(el.macArm64Download, el.macArm64DownloadMeta, null, "macOS 12+ · Apple Silicon · arm64");
+    configurePlatformDownload(el.macX64Download, el.macX64DownloadMeta, null, "macOS 12+ · Intel · x64");
     configurePlatformDownload(el.windowsDownload, el.windowsDownloadMeta, null, "Windows 10/11 · x64");
     if (el.releaseStatus) {
       el.releaseStatus.textContent = hasError
         ? "從 GitHub Releases 選擇最新的下載檔。"
         : "正在讀取最新桌面版資訊。";
     }
-    highlightCurrentPlatform();
+    highlightCurrentPlatform(null);
   }
 
-  function highlightCurrentPlatform() {
+  function highlightCurrentPlatform(macArchitecture) {
     var userAgent = String(navigator.userAgent || "");
-    var preferred = /Windows/i.test(userAgent) ? el.windowsDownload : (/Macintosh|Mac OS X/i.test(userAgent) ? el.macDownload : null);
-    [el.macDownload, el.windowsDownload].forEach(function (link) {
+    var preferred = /Windows/i.test(userAgent) ? el.windowsDownload : null;
+    if (/Macintosh|Mac OS X/i.test(userAgent)) {
+      preferred = macArchitecture === "x64" ? el.macX64Download :
+        (macArchitecture === "arm64" ? el.macArm64Download : null);
+    }
+    [el.macArm64Download, el.macX64Download, el.windowsDownload].forEach(function (link) {
       if (!link) return;
       link.classList.toggle("is-platform-match", link === preferred);
       if (link === preferred) link.setAttribute("aria-current", "true");

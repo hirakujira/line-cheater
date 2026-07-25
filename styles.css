@@ -938,6 +938,29 @@ body.image-modal-open { overflow: hidden; }
   background: #14b8a6;
   content: "";
 }
+.download-section-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 17px 0 8px;
+  color: #526b65;
+  font-size: 0.68rem;
+  font-weight: 800;
+}
+.download-section-heading strong, .download-section-heading small {
+  display: block;
+}
+.download-section-heading strong {
+  color: #1f5048;
+  font-size: 0.84rem;
+}
+.download-section-heading small {
+  margin-top: 2px;
+  font-size: 0.65rem;
+  font-weight: 650;
+}
+.download-section-heading > span { white-space: nowrap; }
 .download-options {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -968,6 +991,7 @@ body.image-modal-open { overflow: hidden; }
   background: #f0fdfa;
 }
 .platform-download.is-unavailable { background: #f8fafc; }
+.platform-download-windows { margin-top: 9px; }
 .platform-download strong, .platform-download small {
   display: block;
   overflow: hidden;
@@ -1002,6 +1026,9 @@ body.image-modal-open { overflow: hidden; }
   width: 7px;
   height: 7px;
   background: currentColor;
+}
+.platform-download-icon-intel {
+  font-size: 0.78rem;
 }
 .edition-tutorial-link {
   box-sizing: border-box;
@@ -1156,7 +1183,7 @@ body.image-modal-open { overflow: hidden; }
   .product-landing h1 { font-size: clamp(2.6rem, 13vw, 3.5rem); }
   .landing-copy { font-size: 0.93rem; }
   .edition-card { padding: 18px; border-radius: 17px; }
-  .download-options { grid-template-columns: 1fr; }
+  .download-options-macos { grid-template-columns: 1fr; }
   .edition-card-web { display: block; }
   .web-edition-details { margin-bottom: 17px; }
   .open-web-app { width: 100%; }

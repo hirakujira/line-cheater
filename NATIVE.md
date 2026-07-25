@@ -1,6 +1,6 @@
 # Native Core Architecture and Handoff
 
-Last updated: 2026-07-25
+Last updated: 2026-07-26
 
 This document is the durable handoff record for the bounded-memory desktop version
 of LINE Cheater. Keep it updated whenever the native implementation,
@@ -9,8 +9,8 @@ data contract, safety rules, or next steps change.
 ## Recent change summary
 
 The following summarizes the major native, desktop, and release changes from
-2026-07-24 through 2026-07-25. Release-only version bumps (`0.1.10`, `0.1.11`,
-and `0.1.12`) only synchronized Cargo/Electron metadata and lockfiles; they are
+2026-07-24 through 2026-07-26. Release-only version bumps (`0.1.10` through
+`0.1.14`) only synchronized Cargo/Electron metadata and lockfiles; they are
 grouped below rather than treated as separate feature changes.
 
 - `2d8a930 Build native app` introduced the Rust workspace, bounded native
@@ -39,12 +39,29 @@ grouped below rather than treated as separate feature changes.
 - `ddb3412 ci: merge desktop build and release workflows` (merged by
   `99738d6`) consolidated the per-platform workflows, preserved PR checks, and
   kept Windows release attachment behind successful macOS publication.
-- `519e06a chore(release): bump version to 0.1.12` synchronized the current
-  Cargo/Electron version metadata and lockfiles for the published `v0.1.12`
-  release.
-- Current Intel support work extends the macOS packager guard and release flow
-  to separate arm64 and x64 runners, signed/notarized artifacts, per-arch
-  checksums, and one combined GitHub Release publication.
+- `bc49ddb feat(macOS): add Intel release artifacts` extended the macOS packager
+  guard and release flow to native arm64 and x64 runners, signed/notarized
+  artifacts, per-arch checksums, and one combined GitHub Release publication.
+- `e0f08ff fix(ci): stabilize Pages and Intel checks` upgraded the Pages actions
+  to their Node 24-compatible major versions and made sidecar readiness tests
+  less timing-sensitive.
+- `52fc5a1 fix(release): pass repository to macOS publish` made the no-checkout
+  publish job pass the repository explicitly to every `gh release` command.
+- `fbec01b` and `8c50949` synchronized the Cargo/Electron version metadata and
+  lockfiles for the published `v0.1.13` and `v0.1.14` releases.
+- The macOS workflow now runs architecture-independent Rust/Electron checks
+  once on arm64, skips the duplicate Intel setup on push events, and keeps
+  native arm64/x64 release builds, package verification, signing, notarization,
+  and stapling on both architecture runners. Packaging can reuse those checks
+  without running the full test suite a second time.
+- The Windows workflow keeps Electron tests for pull requests and manual runs,
+  while the post-macOS `workflow_run` reuses the already-passed cross-platform
+  checks and performs only the native Windows build, ZIP assembly, extraction
+  verification, checksum validation, and bundled sidecar version check.
+- The homepage now exposes separate direct macOS DMG buttons for Apple Silicon
+  (`arm64`) and Intel (`x64`), resolves both assets from the latest formal
+  GitHub Release, highlights a detected architecture when available, and keeps
+  the Windows x64 download alongside them.
 
 ## Goal
 

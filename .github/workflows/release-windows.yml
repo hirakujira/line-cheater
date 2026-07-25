@@ -55,10 +55,18 @@ jobs:
         working-directory: native/electron
         run: node node_modules/electron/install.js
 
+      - name: Run Electron tests
+        if: ${{ github.event_name != 'workflow_run' }}
+        shell: bash
+        working-directory: native/electron
+        run: npm test
+
       - name: Build and verify Windows package
         shell: bash
         working-directory: native/electron
-        run: npm run package:win
+        run: |
+          npm run build:native:win
+          node scripts/package-windows.cjs
 
       - name: Verify release artifacts
         shell: pwsh
@@ -128,10 +136,18 @@ jobs:
         working-directory: native/electron
         run: node node_modules/electron/install.js
 
+      - name: Run Electron tests
+        if: ${{ github.event_name != 'workflow_run' }}
+        shell: bash
+        working-directory: native/electron
+        run: npm test
+
       - name: Build and verify Windows package
         shell: bash
         working-directory: native/electron
-        run: npm run package:win
+        run: |
+          npm run build:native:win
+          node scripts/package-windows.cjs
 
       - name: Verify release artifacts
         shell: pwsh

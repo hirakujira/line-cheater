@@ -33,15 +33,19 @@ jobs:
         include:
           - arch: arm64
             runner: macos-14
+            run_common_checks: true
           - arch: x64
             runner: macos-15-intel
+            run_common_checks: false
     runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Check out source
+        if: ${{ github.event_name != 'push' || matrix.run_common_checks }}
         uses: actions/checkout@v5
 
       - name: Set up Node.js
+        if: ${{ github.event_name != 'push' || matrix.run_common_checks }}
         uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -49,32 +53,40 @@ jobs:
           cache-dependency-path: native/electron/package-lock.json
 
       - name: Set up Rust
+        if: ${{ github.event_name != 'push' || matrix.run_common_checks }}
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
       - name: Install Electron dependencies
+        if: ${{ github.event_name != 'push' || matrix.run_common_checks }}
         working-directory: native/electron
         run: npm ci
 
       - name: Install Electron runtime
+        if: ${{ github.event_name != 'push' || matrix.run_common_checks }}
         working-directory: native/electron
         run: node node_modules/electron/install.js
 
       - name: Check Rust formatting
+        if: ${{ matrix.run_common_checks }}
         run: cargo fmt --all --check
 
       - name: Run Rust tests
+        if: ${{ matrix.run_common_checks }}
         run: cargo test --workspace
 
       - name: Run Rust clippy
+        if: ${{ matrix.run_common_checks }}
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Run Electron tests
+        if: ${{ matrix.run_common_checks }}
         working-directory: native/electron
         run: npm test
 
       - name: Audit production dependencies
+        if: ${{ matrix.run_common_checks }}
         working-directory: native/electron
         run: npm audit --omit=dev
 
@@ -84,7 +96,8 @@ jobs:
         env:
           MACOS_PACKAGE_ARCH: ${{ matrix.arch }}
           SKIP_NPM_CI: "1"
-        run: npm run package:mac
+          SKIP_NPM_TEST: "1"
+        run: ./scripts/package-dmg.sh
 
       - name: Verify macOS package outputs
         if: ${{ github.event_name != 'push' }}
@@ -259,6 +272,7 @@ jobs:
           MACOS_PACKAGE_ARCH: ${{ matrix.arch }}
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
           SKIP_NPM_CI: "1"
+          SKIP_NPM_TEST: "1"
         run: native/electron/scripts/package-dmg.sh
 
       - name: Notarize and staple DMG
