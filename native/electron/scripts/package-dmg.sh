@@ -20,6 +20,19 @@ case "$(uname -m)" in
     ;;
 esac
 
+expected_arch="${MACOS_PACKAGE_ARCH:-$artifact_arch}"
+case "$expected_arch" in
+  arm64|x64) ;;
+  *)
+    print -u2 "Unsupported expected macOS architecture: $expected_arch"
+    exit 1
+    ;;
+esac
+if [[ "$expected_arch" != "$artifact_arch" ]]; then
+  print -u2 "Runner architecture is $artifact_arch, expected $expected_arch"
+  exit 1
+fi
+
 if [[ "${SKIP_NPM_CI:-0}" != "1" ]]; then
   npm --prefix "$electron_root" ci
 fi

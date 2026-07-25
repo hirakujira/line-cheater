@@ -8,6 +8,14 @@ on:
         required: true
         default: false
         type: boolean
+      architecture:
+        description: macOS architecture to sign and verify
+        required: true
+        default: arm64
+        type: choice
+        options:
+          - arm64
+          - x64
 
 permissions:
   contents: read
@@ -18,7 +26,7 @@ concurrency:
 
 jobs:
   sign-and-verify:
-    runs-on: macos-14
+    runs-on: ${{ inputs.architecture == 'x64' && 'macos-15-intel' || 'macos-14' }}
 
     steps:
       - name: Check out selected ref
@@ -96,6 +104,7 @@ jobs:
 
       - name: Build and verify signed DMG
         env:
+          MACOS_PACKAGE_ARCH: ${{ inputs.architecture }}
           SKIP_NPM_CI: "1"
           MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
         run: native/electron/scripts/package-dmg.sh
@@ -109,7 +118,7 @@ jobs:
         run: |
           set -euo pipefail
           version="$(node -p "require('./native/electron/package.json').version")"
-          dmg="native/electron/dist/LINE-Cheater-${version}-macOS-arm64.dmg"
+          dmg="native/electron/dist/LINE-Cheater-${version}-macOS-${{ inputs.architecture }}.dmg"
           native/electron/scripts/notarize-dmg.sh "$dmg"
 
       - name: Refresh checksums after DMG stapling
@@ -120,8 +129,8 @@ jobs:
           version="$(node -p "require('./native/electron/package.json').version")"
           cd native/electron/dist
           shasum -a 256 \
-            "LINE-Cheater-${version}-macOS-arm64.zip" \
-            "LINE-Cheater-${version}-macOS-arm64.dmg" \
+            "LINE-Cheater-${version}-macOS-${{ inputs.architecture }}.zip" \
+            "LINE-Cheater-${version}-macOS-${{ inputs.architecture }}.dmg" \
             > SHA256SUMS.txt
 
       - name: Verify signed app and DMG
@@ -131,9 +140,9 @@ jobs:
         run: |
           set -euo pipefail
           version="$(node -p "require('./native/electron/package.json').version")"
-          app="native/electron/dist/mac-arm64/LINE Cheater.app"
-          dmg="native/electron/dist/LINE-Cheater-${version}-macOS-arm64.dmg"
-          zip="native/electron/dist/LINE-Cheater-${version}-macOS-arm64.zip"
+          app="native/electron/dist/mac-${{ inputs.architecture }}/LINE Cheater.app"
+          dmg="native/electron/dist/LINE-Cheater-${version}-macOS-${{ inputs.architecture }}.dmg"
+          zip="native/electron/dist/LINE-Cheater-${version}-macOS-${{ inputs.architecture }}.zip"
           sums="native/electron/dist/SHA256SUMS.txt"
 
           test -d "$app"
@@ -171,8 +180,8 @@ jobs:
           name: line-cheater-macos-signed-test-${{ github.run_id }}
           if-no-files-found: error
           path: |
-            native/electron/dist/LINE-Cheater-*-macOS-arm64.dmg
-            native/electron/dist/LINE-Cheater-*-macOS-arm64.zip
+            native/electron/dist/LINE-Cheater-*-macOS-${{ inputs.architecture }}.dmg
+            native/electron/dist/LINE-Cheater-*-macOS-${{ inputs.architecture }}.zip
             native/electron/dist/SHA256SUMS.txt
 
       - name: Remove temporary signing material

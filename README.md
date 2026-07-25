@@ -11,7 +11,7 @@ LINE iOS App Container 備份的本機瀏覽、分析與保守瘦身工具。支
 | 網頁版 | 快速查看、匯出與附件審核 | 在瀏覽器本機讀取完整備份、單一 SQLite 或大型備份索引。 |
 | Python CLI | 大型 SQLite、批次分析與可驗證的索引輸出 | 使用 Python 標準函式庫，支援 snapshot、health、index、search、diff 與 slim-test。 |
 | Rust CLI | 有界記憶體的本機資料處理 | 提供聊天、訊息、搜尋、catalog、標記與候選檔建立能力。 |
-| Electron 桌面版 | 大型備份的圖形介面與進階清理 | 以 Rust sidecar 處理 `.imazingapp` 或解開的備份資料夾；目前有 macOS arm64 DMG 與 Windows x64 ZIP 發布流程。 |
+| Electron 桌面版 | 大型備份的圖形介面與進階清理 | 以 Rust sidecar 處理 `.imazingapp` 或解開的備份資料夾；目前有 macOS arm64/x64 DMG 與 Windows x64 ZIP 發布流程。 |
 
 詳細命令與架構文件：
 
@@ -90,13 +90,13 @@ npm --prefix native/electron test
 npm --prefix native/electron run dev
 ```
 
-macOS 12 以上的 Apple Silicon 測試封裝可在 macOS 上重複建立：
+macOS 12 以上的 Apple Silicon 或 Intel 封裝可在對應的 macOS 主機上重複建立：
 
 ```bash
 native/electron/scripts/package-dmg.sh
 ```
 
-已有依賴時可設定 `SKIP_NPM_CI=1`。沒有簽章 secrets 時輸出為 ad-hoc 簽章；GitHub Actions 可使用 passwordless `MACOS_CERTIFICATE_BASE64` P12 與 `MACOS_SIGN_IDENTITY` 進行 Developer ID 簽署，並使用 `MACOS_NOTARY_APPLE_ID`、`MACOS_NOTARY_TEAM_ID` 與 `MACOS_NOTARY_APP_SPECIFIC_PASSWORD` 對 DMG 完成 notarization 與 ticket stapling。Windows x64 ZIP 由 [Windows GitHub Actions workflow](.github/workflows/release-windows.yml) 建立與驗證；目前未配置 Windows code signing。請參考 [Electron package 說明](native/electron/README.md#macos-package)。
+已有依賴時可設定 `SKIP_NPM_CI=1`。本機 `package:mac` 仍可在沒有簽章環境時產生 ad-hoc 簽章；正式 GitHub Actions release 已配置 passwordless `MACOS_CERTIFICATE_BASE64` P12、`MACOS_SIGN_IDENTITY` 與 Apple notarization credentials，會對 arm64/x64 DMG 完成 Developer ID 簽署、notarization 與 ticket stapling。Windows x64 ZIP 由 [Windows GitHub Actions workflow](.github/workflows/release-windows.yml) 建立與驗證；目前未配置 Windows code signing。請參考 [Electron package 說明](native/electron/README.md#macos-package)。
 
 桌面版提供聊天與訊息瀏覽、受限原圖預覽、附件清理、完全相同附件審核，以及受保護的進階模式。重複附件以檔案大小與 SHA-256 分組，標記前會要求至少保留一份。進階模式可規劃移除選定聊天室及其附件，或掃描空聊天室、僅含系統訊息的聊天室與沒有對應聊天列的 `LineSquare` 訊息。SQLite 只會在新建候選檔中重寫與 `VACUUM`，原始資料庫不會被修改。
 

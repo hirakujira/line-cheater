@@ -1,7 +1,8 @@
 # LINE Cheater desktop preview
 
-This is the runnable desktop shell for the bounded-memory Rust core. A macOS
-arm64 tester package is available; it is not yet a notarized public release.
+This is the runnable desktop shell for the bounded-memory Rust core. The macOS
+release workflow produces separate arm64 and x64 packages for Apple Silicon and
+Intel Macs.
 
 Read [`../../NATIVE.md`](../../NATIVE.md) first. That file is the authoritative
 architecture, safety, verification, and handoff record.
@@ -86,8 +87,8 @@ sidecar, copies the Electron runtime, installs the sidecar under
 `Contents/Resources/bin`, validates the 1024 × 1024
 `assets/icon.png` with transparent macOS-style rounded corners, derives all
 ten required `.iconset` bitmap slots and the
-LINE Cheater `.icns`, applies an ad-hoc code
-signature, verifies the bundle, and produces:
+LINE Cheater `.icns`, applies an ad-hoc code signature for local packaging,
+verifies the bundle, and produces:
 
 ```text
 native/electron/dist/mac-<arch>/LINE Cheater.app
@@ -96,28 +97,29 @@ native/electron/dist/LINE-Cheater-<version>-macOS-<arch>.dmg
 native/electron/dist/SHA256SUMS.txt
 ```
 
-The 2026-07-24 artifact is `arm64`, for Apple Silicon Macs running macOS 12 or
-later. Without signing secrets it is ad-hoc signed and suitable for direct
-testing, but a recipient may see an unidentified-developer Gatekeeper warning.
-The macOS release workflow can import a passwordless
-`MACOS_CERTIFICATE_BASE64` P12 and use `MACOS_SIGN_IDENTITY` for a Developer ID
-signature. When `MACOS_NOTARY_APPLE_ID`, `MACOS_NOTARY_TEAM_ID`, and
-`MACOS_NOTARY_APP_SPECIFIC_PASSWORD` are configured, the workflow submits the
-DMG with `xcrun notarytool`, waits for acceptance, staples the ticket, and
-validates the stapled DMG. The local `package:mac` command only signs and
-packages; it does not contact Apple notarization. Build a separate `x64`
-runtime/sidecar or a verified universal bundle before claiming Intel Mac
-support.
+The release workflow produces separate `arm64` and `x64` artifacts for Apple
+Silicon and Intel Macs running macOS 12 or later. The local `package:mac`
+command packages the current host architecture; `package-dmg.sh` rejects a
+requested architecture that does not match the runner. Local packaging uses
+an ad-hoc signature unless a Developer ID identity is supplied. The release
+jobs import the configured passwordless `MACOS_CERTIFICATE_BASE64` P12 and use
+`MACOS_SIGN_IDENTITY` for Developer ID signatures. The configured
+`MACOS_NOTARY_APPLE_ID`, `MACOS_NOTARY_TEAM_ID`, and
+`MACOS_NOTARY_APP_SPECIFIC_PASSWORD` credentials are used to submit each
+architecture's DMG with `xcrun notarytool`; each submission is waited on,
+stapled, and validated.
 
 ### Automated release
 
 Every push to `main` (including a merged pull request) runs
-`.github/workflows/release-macos.yml` on an Apple Silicon `macos-14`
-runner. The workflow increments the patch version in
-`native/core/Cargo.toml`, synchronizes `Cargo.lock` and the Electron package
-metadata, commits the version bump, builds and verifies the DMG, then publishes
-the DMG, ZIP, and `SHA256SUMS.txt` to a tag-matched GitHub Release. The
-generated version-bump commit is detected so it does not increment twice.
+`.github/workflows/release-macos.yml` on an arm64 `macos-14` runner and an
+Intel `macos-15-intel` runner. A single prepare job increments the patch version
+in `native/core/Cargo.toml`, synchronizes `Cargo.lock` and the Electron package
+metadata, and commits the version bump. The two package jobs then build and
+verify their native sidecar, Electron runtime, signed DMG, notarization, and
+checksums; one publish job combines both architectures into the tag-matched
+GitHub Release. The generated version-bump commit is detected so it does not
+increment twice.
 
 Windows x64 packaging runs from `.github/workflows/release-windows.yml` on pull
 requests and after the macOS release workflow succeeds. It publishes an
@@ -259,9 +261,9 @@ unsupported original to its thumbnail.
   counts. It is already isolated in `search.sqlite` and falls back to `LIKE`.
 - Manually regress directory, SQLite, and `.imazingapp` selection plus preview
   rendering through native file pickers on macOS, Windows, and Linux.
-- Add Developer ID signing/notarization, Intel/universal macOS, Windows signing,
-  Linux packages, and update policy. The repeatable macOS arm64 ad-hoc package
-  already bundles the optimized Rust sidecar and icon.
+- Add a verified universal macOS bundle, Windows signing, Linux packages, and
+  update policy. Separate signed/notarized macOS arm64 and x64 packages are
+  now built by the release workflow.
 - Use `scripts/measure-peak-rss.sh` to record Rust process-tree peak RSS for a
   synthetic large fixture; separate Electron main/renderer measurement remains.
 - Repeat iMazing restore checks across more backup variants; one real restore
