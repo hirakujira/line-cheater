@@ -274,7 +274,9 @@ test("provides a self-checking DMG packaging script", () => {
   assert.match(dmgPackager, /mounted_sidecar/);
   assert.match(dmgPackager, /Resources\/bin\/line-cheater/);
   assert.match(dmgPackager, /--version/);
-  assert.equal(fs.statSync(path.join(root, "scripts", "package-dmg.sh")).mode & 0o111, 0o111);
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(path.join(root, "scripts", "package-dmg.sh")).mode & 0o111, 0o111);
+  }
 });
 
 test("provides a GitHub Actions Windows packaging workflow", () => {
