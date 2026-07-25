@@ -4,6 +4,13 @@ on:
   push:
     branches:
       - main
+    # Homepage and documentation-only merges must not rebuild desktop releases.
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "native/core/**"
+      - "native/frontend/**"
+      - "native/electron/**"
 
 permissions:
   contents: write
