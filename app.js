@@ -19,6 +19,8 @@
   var chatResizeTimer = null;
   var packageInProgress = false;
   var imageModalTrigger = null;
+  var donateModalTrigger = null;
+  var pendingDownloadUrl = "";
 
   var state = {
     files: [],
@@ -171,6 +173,10 @@
     el.packageModalProgress = document.getElementById("packageModalProgress");
     el.packageModalProgressLabel = document.getElementById("packageModalProgressLabel");
     el.packageModalClose = document.getElementById("packageModalClose");
+    el.donateModal = document.getElementById("donateModal");
+    el.donateModalCard = el.donateModal && el.donateModal.querySelector(".package-modal-card");
+    el.donateModalSupport = document.getElementById("donateModalSupport");
+    el.donateModalContinue = document.getElementById("donateModalContinue");
     el.imageModal = document.getElementById("imageModal");
     el.imageModalCard = el.imageModal && el.imageModal.querySelector(".image-modal-card");
     el.imageModalImage = document.getElementById("imageModalImage");
@@ -334,12 +340,30 @@
     });
     el.runDiffButton.addEventListener("click", runBrowserDiff);
     el.packageModalClose.addEventListener("click", closePackageModal);
+    [el.macDownload, el.windowsDownload].forEach(function (link) {
+      if (!link) return;
+      link.addEventListener("click", handleDesktopDownloadClick);
+    });
+    if (el.donateModal) {
+      el.donateModalContinue.addEventListener("click", function () {
+        startPendingDownload();
+      });
+      el.donateModalSupport.addEventListener("click", function () {
+        var message = document.getElementById("donateModalMessage");
+        if (message) message.textContent = "已在新分頁開啟抖內頁面，感謝支持！點「繼續下載」即可取得安裝檔。";
+      });
+      el.donateModal.addEventListener("click", function (event) {
+        if (event.target === el.donateModal || event.target.classList.contains("package-modal-backdrop")) closeDonateModal();
+      });
+    }
     el.imageModalClose.addEventListener("click", closeImageModal);
     el.imageModal.addEventListener("click", function (event) {
       if (event.target === el.imageModal || event.target.classList.contains("image-modal-backdrop")) closeImageModal();
     });
     document.addEventListener("keydown", function (event) {
-      if (event.key === "Escape") closeImageModal();
+      if (event.key !== "Escape") return;
+      closeImageModal();
+      closeDonateModal();
     });
     window.addEventListener("resize", scheduleChatLayoutRefresh);
     window.addEventListener("hashchange", function () {
@@ -411,7 +435,7 @@
       if (el.releaseStatus) {
         el.releaseStatus.textContent = macAsset && windowsAsset
           ? "下載連結由 GitHub 最新正式 Release 提供。"
-          : "部分平台尚未找到對應資產，可前往 GitHub Releases 查看所有版本。";
+          : "也可前往 GitHub Releases 查看所有版本。";
       }
       highlightCurrentPlatform();
     }).catch(function () {
@@ -442,17 +466,17 @@
       meta.textContent = asset.version + " · " + platformLabel;
       link.removeAttribute("title");
     } else {
-      meta.textContent = "尚未提供，前往 Releases 查看";
-      link.title = "尚未找到此平台的正式 Release，將開啟 GitHub Releases。";
+      meta.textContent = platformLabel;
+      link.title = "開啟 GitHub Releases 選擇版本。";
     }
   }
 
   function setDesktopReleaseFallback(hasError) {
-    configurePlatformDownload(el.macDownload, el.macDownloadMeta, null, "");
-    configurePlatformDownload(el.windowsDownload, el.windowsDownloadMeta, null, "");
+    configurePlatformDownload(el.macDownload, el.macDownloadMeta, null, "macOS 12+ · Apple Silicon");
+    configurePlatformDownload(el.windowsDownload, el.windowsDownloadMeta, null, "Windows 10/11 · x64");
     if (el.releaseStatus) {
       el.releaseStatus.textContent = hasError
-        ? "目前無法取得最新版本，請從 GitHub Releases 選擇下載檔。"
+        ? "從 GitHub Releases 選擇最新的下載檔。"
         : "正在讀取最新桌面版資訊。";
     }
     highlightCurrentPlatform();
@@ -2027,6 +2051,44 @@
     if (el.diffPanel) el.diffPanel.inert = false;
     if (imageModalTrigger) imageModalTrigger.focus();
     imageModalTrigger = null;
+  }
+
+  function handleDesktopDownloadClick(event) {
+    if (!el.donateModal) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
+    var link = event.currentTarget;
+    var url = link && link.href;
+    if (!url) return;
+    event.preventDefault();
+    openDonateModal(url, link);
+  }
+
+  function openDonateModal(url, trigger) {
+    pendingDownloadUrl = url;
+    donateModalTrigger = trigger || null;
+    var message = document.getElementById("donateModalMessage");
+    if (message) message.textContent = "LINE Cheater 完全免費、開源，也不會上傳你的資料。如果它幫你省下了時間，歡迎抖內一杯咖啡，讓專案繼續維護下去。";
+    el.donateModal.classList.remove("hidden");
+    el.donateModal.setAttribute("aria-hidden", "false");
+    window.requestAnimationFrame(function () {
+      if (el.donateModalCard) el.donateModalCard.focus();
+    });
+  }
+
+  function closeDonateModal() {
+    if (!el.donateModal || el.donateModal.classList.contains("hidden")) return;
+    el.donateModal.classList.add("hidden");
+    el.donateModal.setAttribute("aria-hidden", "true");
+    pendingDownloadUrl = "";
+    if (donateModalTrigger) donateModalTrigger.focus();
+    donateModalTrigger = null;
+  }
+
+  function startPendingDownload() {
+    var url = pendingDownloadUrl;
+    closeDonateModal();
+    if (!url) return;
+    window.open(url, "_blank", "noopener");
   }
 
   function cleanupCategoryKey(item) {
