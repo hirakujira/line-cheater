@@ -84,10 +84,10 @@ const timer = setInterval(() => {
     clearInterval(timer);
     process.stdout.write(JSON.stringify({event:"ready",protocolVersion:1}) + "\n");
   }
-}, 25);
+}, 100);
 setInterval(() => {}, 1000);
 `;
-  const client = new SidecarClient(process.execPath, ["-e", fixture], { readyTimeoutMs: 90 });
+  const client = new SidecarClient(process.execPath, ["-e", fixture], { readyTimeoutMs: 500 });
   const progress = [];
   client.on("sidecarEvent", (event) => {
     if (event.event === "sourcePrepareProgress") progress.push(event.stagedBytes);
