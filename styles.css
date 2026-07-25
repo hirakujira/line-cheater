@@ -704,6 +704,32 @@ body.image-modal-open { overflow: hidden; }
   border-radius: 12px;
   box-shadow: 0 8px 20px rgba(15, 118, 110, 0.17);
 }
+.landing-nav-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.landing-donate-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border: 1px solid #0f766e;
+  border-radius: 8px;
+  color: #fff;
+  background: #0f766e;
+  box-shadow: 0 6px 14px rgba(15, 118, 110, 0.14);
+  font-size: 0.78rem;
+  font-weight: 800;
+  text-decoration: none;
+  transition: border-color 150ms ease, background 150ms ease, box-shadow 150ms ease, transform 150ms ease;
+}
+.landing-donate-link:hover, .landing-donate-link:focus-visible {
+  border-color: #115e59;
+  background: #115e59;
+  box-shadow: 0 8px 18px rgba(15, 118, 110, 0.2);
+  transform: translateY(-1px);
+}
 .landing-github-link {
   padding: 7px 11px;
   border: 1px solid #d6e1de;
