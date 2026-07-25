@@ -709,11 +709,19 @@ body.image-modal-open { overflow: hidden; }
   align-items: center;
   gap: 8px;
 }
-.landing-donate-link {
+.landing-nav-actions > a {
+  box-sizing: border-box;
   display: inline-flex;
   align-items: center;
+  justify-content: center;
+  width: 80px;
+  min-height: 37px;
+  padding: 7px 8px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.landing-donate-link {
   gap: 6px;
-  padding: 8px 12px;
   border: 1px solid #0f766e;
   border-radius: 8px;
   color: #fff;
@@ -731,7 +739,6 @@ body.image-modal-open { overflow: hidden; }
   transform: translateY(-1px);
 }
 .landing-github-link {
-  padding: 7px 11px;
   border: 1px solid #d6e1de;
   border-radius: 8px;
   color: #52625a;
