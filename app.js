@@ -19,6 +19,8 @@
   var chatResizeTimer = null;
   var packageInProgress = false;
   var imageModalTrigger = null;
+  var donateModalTrigger = null;
+  var pendingDownloadUrl = "";
 
   var state = {
     files: [],
@@ -171,6 +173,10 @@
     el.packageModalProgress = document.getElementById("packageModalProgress");
     el.packageModalProgressLabel = document.getElementById("packageModalProgressLabel");
     el.packageModalClose = document.getElementById("packageModalClose");
+    el.donateModal = document.getElementById("donateModal");
+    el.donateModalCard = el.donateModal && el.donateModal.querySelector(".package-modal-card");
+    el.donateModalSupport = document.getElementById("donateModalSupport");
+    el.donateModalContinue = document.getElementById("donateModalContinue");
     el.imageModal = document.getElementById("imageModal");
     el.imageModalCard = el.imageModal && el.imageModal.querySelector(".image-modal-card");
     el.imageModalImage = document.getElementById("imageModalImage");
@@ -334,12 +340,30 @@
     });
     el.runDiffButton.addEventListener("click", runBrowserDiff);
     el.packageModalClose.addEventListener("click", closePackageModal);
+    [el.macDownload, el.windowsDownload].forEach(function (link) {
+      if (!link) return;
+      link.addEventListener("click", handleDesktopDownloadClick);
+    });
+    if (el.donateModal) {
+      el.donateModalContinue.addEventListener("click", function () {
+        startPendingDownload();
+      });
+      el.donateModalSupport.addEventListener("click", function () {
+        var message = document.getElementById("donateModalMessage");
+        if (message) message.textContent = "已在新分頁開啟抖內頁面，感謝支持！點「繼續下載」即可取得安裝檔。";
+      });
+      el.donateModal.addEventListener("click", function (event) {
+        if (event.target === el.donateModal || event.target.classList.contains("package-modal-backdrop")) closeDonateModal();
+      });
+    }
     el.imageModalClose.addEventListener("click", closeImageModal);
     el.imageModal.addEventListener("click", function (event) {
       if (event.target === el.imageModal || event.target.classList.contains("image-modal-backdrop")) closeImageModal();
     });
     document.addEventListener("keydown", function (event) {
-      if (event.key === "Escape") closeImageModal();
+      if (event.key !== "Escape") return;
+      closeImageModal();
+      closeDonateModal();
     });
     window.addEventListener("resize", scheduleChatLayoutRefresh);
     window.addEventListener("hashchange", function () {
@@ -2027,6 +2051,44 @@
     if (el.diffPanel) el.diffPanel.inert = false;
     if (imageModalTrigger) imageModalTrigger.focus();
     imageModalTrigger = null;
+  }
+
+  function handleDesktopDownloadClick(event) {
+    if (!el.donateModal) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button !== 0) return;
+    var link = event.currentTarget;
+    var url = link && link.href;
+    if (!url) return;
+    event.preventDefault();
+    openDonateModal(url, link);
+  }
+
+  function openDonateModal(url, trigger) {
+    pendingDownloadUrl = url;
+    donateModalTrigger = trigger || null;
+    var message = document.getElementById("donateModalMessage");
+    if (message) message.textContent = "LINE Cheater 完全免費、開源，也不會上傳你的資料。如果它幫你省下了時間，歡迎抖內一杯咖啡，讓專案繼續維護下去。";
+    el.donateModal.classList.remove("hidden");
+    el.donateModal.setAttribute("aria-hidden", "false");
+    window.requestAnimationFrame(function () {
+      if (el.donateModalCard) el.donateModalCard.focus();
+    });
+  }
+
+  function closeDonateModal() {
+    if (!el.donateModal || el.donateModal.classList.contains("hidden")) return;
+    el.donateModal.classList.add("hidden");
+    el.donateModal.setAttribute("aria-hidden", "true");
+    pendingDownloadUrl = "";
+    if (donateModalTrigger) donateModalTrigger.focus();
+    donateModalTrigger = null;
+  }
+
+  function startPendingDownload() {
+    var url = pendingDownloadUrl;
+    closeDonateModal();
+    if (!url) return;
+    window.open(url, "_blank", "noopener");
   }
 
   function cleanupCategoryKey(item) {

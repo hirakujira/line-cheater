@@ -77,6 +77,10 @@
                 <span><strong>下載 Windows 版</strong><small id="windowsDownloadMeta">正在檢查最新版本</small></span>
               </a>
             </div>
+            <a class="edition-tutorial-link" href="https://hiraku.dev/2026/07/8187/" target="_blank" rel="noopener noreferrer">
+              <span aria-hidden="true">📖</span>
+              使用教學
+            </a>
             <p id="releaseStatus" class="release-status" role="status" aria-live="polite">正在讀取最新桌面版資訊。</p>
           </article>
 
@@ -456,6 +460,20 @@ python3 cli/line_migrator.py verify-index \
         </div>
         <p id="packageModalProgressLabel" class="package-modal-progress-label">0%</p>
         <button id="packageModalClose" class="button button-primary package-modal-close hidden" type="button">完成</button>
+      </section>
+    </div>
+
+    <div id="donateModal" class="package-modal donate-modal hidden" role="dialog" aria-modal="true" aria-labelledby="donateModalTitle" aria-describedby="donateModalMessage">
+      <div class="package-modal-backdrop" aria-hidden="true"></div>
+      <section class="package-modal-card" role="document" tabindex="-1">
+        <div class="package-modal-state" aria-hidden="true">♥</div>
+        <p class="section-kicker">下載前的小提醒</p>
+        <h2 id="donateModalTitle">覺得好用嗎？</h2>
+        <p id="donateModalMessage" class="package-modal-message">LINE Cheater 完全免費、開源，也不會上傳你的資料。如果它幫你省下了時間，歡迎抖內一杯咖啡，讓專案繼續維護下去。</p>
+        <div class="donate-modal-actions">
+          <a id="donateModalSupport" class="button button-primary" href="https://zeuik.gumroad.com/l/line-cheater" target="_blank" rel="noopener noreferrer">抖內支持</a>
+          <button id="donateModalContinue" class="button button-secondary" type="button">繼續下載</button>
+        </div>
       </section>
     </div>
 
