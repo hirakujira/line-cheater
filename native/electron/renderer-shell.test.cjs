@@ -60,6 +60,7 @@ test("selects the platform-native desktop icon and packages Windows assets", () 
   assert.match(main, /path\.join\(__dirname, "assets", "icon\.png"\)/);
   assert.match(windowsPackager, /assets", "icon\.ico/);
   assert.match(windowsPackager, /rcedit-x64\.exe/);
+  assert.match(windowsPackager, /node_modules",\s+"electron",\s+"install\.js/);
 });
 
 test("separates source selection from the sidebar workspace", () => {

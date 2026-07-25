@@ -20,6 +20,13 @@ if (process.arch !== "x64") {
 }
 
 const electronRuntime = path.join(electronRoot, "node_modules", "electron", "dist");
+const electronInstaller = path.join(
+  electronRoot,
+  "node_modules",
+  "electron",
+  "install.js"
+);
+const electronBinary = path.join(electronRuntime, "electron.exe");
 const releaseBinary = path.join(
   repositoryRoot,
   "target",
@@ -138,8 +145,14 @@ function verifyZip() {
   }
 }
 
-if (!fs.existsSync(electronRuntime)) {
-  throw new Error("Electron runtime is missing. Run npm ci in native/electron first.");
+if (!fs.existsSync(electronBinary)) {
+  if (!fs.existsSync(electronInstaller)) {
+    throw new Error("Electron installer is missing. Run npm ci in native/electron first.");
+  }
+  run(process.execPath, [electronInstaller]);
+}
+if (!fs.existsSync(electronBinary)) {
+  throw new Error("Electron runtime is missing after running the Electron installer.");
 }
 if (!fs.existsSync(releaseBinary)) {
   throw new Error("Release sidecar is missing. Run the package:win npm script.");

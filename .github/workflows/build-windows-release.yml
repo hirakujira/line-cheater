@@ -53,6 +53,11 @@ jobs:
         working-directory: native/electron
         run: npm ci
 
+      - name: Install Electron runtime
+        shell: bash
+        working-directory: native/electron
+        run: node node_modules/electron/install.js
+
       - name: Build and verify Windows package
         shell: bash
         working-directory: native/electron
