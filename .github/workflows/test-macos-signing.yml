@@ -1,0 +1,146 @@
+name: Test macOS Developer ID signing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-macos-signing
+  cancel-in-progress: true
+
+jobs:
+  sign-and-verify:
+    runs-on: macos-14
+
+    steps:
+      - name: Check out selected ref
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: native/electron/package-lock.json
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Import Developer ID certificate
+        id: signing
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          test -n "$MACOS_CERTIFICATE_BASE64" || {
+            echo "MACOS_CERTIFICATE_BASE64 is not configured." >&2
+            exit 1
+          }
+          test -n "$MACOS_SIGN_IDENTITY" || {
+            echo "MACOS_SIGN_IDENTITY is not configured." >&2
+            exit 1
+          }
+          case "$MACOS_SIGN_IDENTITY" in
+            "Developer ID Application:"*) ;;
+            *)
+              echo "MACOS_SIGN_IDENTITY must be a Developer ID Application identity." >&2
+              exit 1
+              ;;
+          esac
+
+          keychain_path="$RUNNER_TEMP/line-cheater-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          certificate_path="$RUNNER_TEMP/line-cheater-signing.p12"
+
+          printf '%s' "$MACOS_CERTIFICATE_BASE64" | base64 -D > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" -k "$keychain_path" -P "" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security list-keychain -d user -s "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain_path"
+
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "Imported the passwordless P12 into a temporary keychain."
+
+      - name: Verify Developer ID identity
+        shell: bash
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          security find-identity -v -p codesigning
+          security find-identity -v -p codesigning | grep -F "$MACOS_SIGN_IDENTITY"
+
+      - name: Install Electron dependencies
+        working-directory: native/electron
+        run: npm ci
+
+      - name: Install Electron runtime
+        working-directory: native/electron
+        run: node node_modules/electron/install.js
+
+      - name: Build and verify signed DMG
+        env:
+          SKIP_NPM_CI: "1"
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: native/electron/scripts/package-dmg.sh
+
+      - name: Verify signed app and DMG
+        shell: bash
+        env:
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./native/electron/package.json').version")"
+          app="native/electron/dist/mac-arm64/LINE Cheater.app"
+          dmg="native/electron/dist/LINE-Cheater-${version}-macOS-arm64.dmg"
+          zip="native/electron/dist/LINE-Cheater-${version}-macOS-arm64.zip"
+          sums="native/electron/dist/SHA256SUMS.txt"
+
+          test -d "$app"
+          test -f "$dmg"
+          test -f "$zip"
+          test -f "$sums"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          details="$(codesign -dvvv "$app" 2>&1)"
+          printf '%s\n' "$details"
+          printf '%s\n' "$details" | grep -F "Authority=$MACOS_SIGN_IDENTITY"
+          printf '%s\n' "$details" | grep -F "Runtime Version="
+          printf '%s\n' "$details" | grep -E "Signed Time=|Timestamp="
+          "$app/Contents/Resources/bin/line-cheater" --version
+          hdiutil verify "$dmg"
+          (
+            cd native/electron/dist
+            shasum -a 256 -c SHA256SUMS.txt
+          )
+
+          echo "Signature verification passed. Notarization is not performed by this test."
+          spctl --assess --type execute --verbose=4 "$app" || \
+            echo "spctl did not accept the app; this is expected before notarization."
+
+      - name: Upload signed test artifacts
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: line-cheater-macos-signed-test-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            native/electron/dist/LINE-Cheater-*-macOS-arm64.dmg
+            native/electron/dist/LINE-Cheater-*-macOS-arm64.zip
+            native/electron/dist/SHA256SUMS.txt
+
+      - name: Remove temporary signing material
+        if: ${{ always() && steps.signing.outputs.available == 'true' }}
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/line-cheater-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/line-cheater-signing.p12"
