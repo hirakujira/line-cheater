@@ -133,6 +133,7 @@ struct FileRecord {
     path: String,
     bytes: u64,
     modified_ns: i64,
+    content_sha256: String,
     kind: Option<AttachmentKind>,
     message_id: String,
     chat_hint: String,
@@ -212,6 +213,7 @@ impl Catalog {
             ",
         )?;
         ensure_column(&connection, "files", "sha256", "TEXT")?;
+        ensure_column(&connection, "files", "content_sha256", "TEXT")?;
         ensure_column(&connection, "files", "message_pk", "INTEGER")?;
         ensure_column(&connection, "files", "message_chat_pk", "INTEGER")?;
         ensure_column(&connection, "files", "message_timestamp", "INTEGER")?;
@@ -275,12 +277,144 @@ impl Catalog {
         Ok(self.meta("source_path")?.map(PathBuf::from))
     }
 
+    pub fn source_fingerprint(&self) -> Result<Option<String>> {
+        self.meta("source_fingerprint")
+    }
+
+    pub fn source_matches_current(&self, source: &Path, kind: SourceKind) -> Result<bool> {
+        let Some(bound) = self.source_path()? else {
+            return Ok(false);
+        };
+        let bound = bound.canonicalize().ok();
+        let current = source.canonicalize()?;
+        if bound.as_ref() != Some(&current) {
+            return Ok(false);
+        }
+        let Some(stored_fingerprint) = self.meta("source_fingerprint")? else {
+            return Ok(false);
+        };
+        if stored_fingerprint != source_metadata_fingerprint(&current, kind)? {
+            return Ok(false);
+        }
+        self.content_matches_catalog(&current, kind)
+    }
+
+    fn content_matches_catalog(&self, source: &Path, kind: SourceKind) -> Result<bool> {
+        let mut statement = self.connection.prepare(
+            "SELECT path, bytes, modified_ns, content_sha256
+             FROM files ORDER BY path ASC",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut archive = if kind == SourceKind::ImazingArchive {
+            Some(ZipArchive::new(File::open(source)?)?)
+        } else {
+            None
+        };
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            let bytes = row.get::<_, i64>(1)?.max(0) as u64;
+            let modified_ns: i64 = row.get(2)?;
+            let Some(expected_digest) = row.get::<_, Option<String>>(3)? else {
+                return Ok(false);
+            };
+            let digest = match archive.as_mut() {
+                Some(archive) => {
+                    let mut entry = match archive.by_name(&path) {
+                        Ok(entry) => entry,
+                        Err(_) => return Ok(false),
+                    };
+                    if entry.size() != bytes {
+                        return Ok(false);
+                    }
+                    hash_reader(&mut entry)?
+                }
+                None => {
+                    let file_path = if kind == SourceKind::Sqlite {
+                        source.to_path_buf()
+                    } else {
+                        safe_source_join(source, &path)?
+                    };
+                    let before = file_record_fingerprint(&file_path)?;
+                    if before != (bytes, modified_ns) {
+                        return Ok(false);
+                    }
+                    let digest = hash_directory_file(&file_path, bytes, modified_ns)?;
+                    if file_record_fingerprint(&file_path)? != before {
+                        return Ok(false);
+                    }
+                    digest
+                }
+            };
+            if digest != expected_digest {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn recover_interrupted_operations(&self, source: &Path, kind: SourceKind) -> Result<()> {
+        if self.meta("scan_status")?.as_deref() == Some("scanning") {
+            if self.source_matches_current(source, kind)? {
+                self.set_meta("scan_status", "resumable")?;
+            } else {
+                self.clear_all_removal_plans()?;
+                self.set_meta("scan_status", "not_started")?;
+                self.set_meta("scan_last_path", "")?;
+            }
+        }
+        if self.meta("context_status")?.as_deref() == Some("indexing") {
+            self.clear_all_removal_plans()?;
+            self.connection.execute(
+                "
+                UPDATE files SET
+                    message_pk = NULL,
+                    message_chat_pk = NULL,
+                    message_timestamp = NULL,
+                    message_sender_pk = NULL,
+                    message_sender_name = NULL,
+                    message_content_type = NULL,
+                    message_text = NULL,
+                    context_source = NULL,
+                    context_chat_id = NULL,
+                    context_chat_title = NULL,
+                    context_chat_kind = NULL,
+                    reference_status = 'unconfirmed'
+                WHERE attachment_kind IS NOT NULL
+                ",
+                [],
+            )?;
+            self.set_meta("context_status", "not_started")?;
+        }
+        if self.meta("hash_status")?.as_deref() == Some("running") {
+            if self.source_matches_current(source, kind)? {
+                self.set_meta("hash_status", "resumable")?;
+            } else {
+                self.clear_duplicate_hashes()?;
+                self.set_meta("hash_status", "not_started")?;
+            }
+        }
+        self.clear_active_job("search")?;
+        self.clear_active_job("candidate")?;
+        Ok(())
+    }
+
     pub fn marked_paths(&self) -> Result<Vec<String>> {
         let mut statement = self
             .connection
             .prepare("SELECT path FROM all_removal_plan ORDER BY path")?;
         let rows = statement.query_map([], |row| row.get(0))?;
         Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+    }
+
+    pub fn content_digest_for_path(&self, path: &str) -> Result<Option<String>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT content_sha256 FROM files WHERE path = ?1",
+                [path],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     pub fn scan_source<F>(
@@ -307,23 +441,48 @@ impl Catalog {
         }
         self.set_meta("source_path", &source_key)?;
         self.set_meta("source_kind", &format!("{kind:?}"))?;
-        let source_fingerprint = source_metadata_fingerprint(&source)?;
-        if kind == SourceKind::ImazingArchive
-            && self
-                .meta("source_fingerprint")?
-                .is_some_and(|value| value != source_fingerprint)
-        {
+        let source_fingerprint = source_metadata_fingerprint(&source, kind)?;
+        let previous_fingerprint = self.meta("source_fingerprint")?;
+        let source_changed = previous_fingerprint
+            .as_ref()
+            .is_some_and(|value| value != &source_fingerprint);
+        let source_fingerprint_missing =
+            existing_source.is_some() && previous_fingerprint.is_none();
+        if source_changed || source_fingerprint_missing {
+            self.clear_all_removal_plans()?;
             self.connection
                 .execute("UPDATE files SET sha256 = NULL", [])?;
+            self.set_meta("hash_status", "not_started")?;
         }
         self.set_meta("source_fingerprint", &source_fingerprint)?;
-        let scan_id = self
-            .meta("scan_id")?
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0)
-            + 1;
+        let resume_scan = matches!(
+            self.meta("scan_status")?.as_deref(),
+            Some("scanning" | "resumable")
+        ) && !source_changed
+            && !source_fingerprint_missing
+            && kind == SourceKind::Directory
+            && self.meta("scan_last_path")?.is_some();
+        let scan_id = if resume_scan {
+            self.meta("scan_id")?
+                .and_then(|value| value.parse::<i64>().ok())
+                .context("resumable scan is missing its scan ID")?
+        } else {
+            self.meta("scan_id")?
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0)
+                + 1
+        };
+        let resume_after = if resume_scan {
+            self.meta("scan_last_path")?
+                .filter(|value| !value.is_empty())
+        } else {
+            None
+        };
         self.set_meta("scan_id", &scan_id.to_string())?;
         self.set_meta("scan_status", "scanning")?;
+        if !resume_scan {
+            self.set_meta("scan_last_path", "")?;
+        }
 
         let mut batch = Vec::with_capacity(CATALOG_BATCH_SIZE);
         let mut progress = CatalogScanProgress {
@@ -333,7 +492,10 @@ impl Catalog {
         };
         match kind {
             SourceKind::Directory => {
-                for entry in WalkDir::new(&source).follow_links(false) {
+                for entry in WalkDir::new(&source)
+                    .follow_links(false)
+                    .sort_by_file_name()
+                {
                     let entry = match entry {
                         Ok(entry) => entry,
                         Err(error) => {
@@ -352,14 +514,29 @@ impl Catalog {
                         }
                     };
                     let relative = entry.path().strip_prefix(&source).unwrap_or(entry.path());
-                    batch.push(file_record(
-                        relative.to_string_lossy().replace('\\', "/"),
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    if resume_after
+                        .as_deref()
+                        .is_some_and(|last| relative.as_str() <= last)
+                    {
+                        continue;
+                    }
+                    let content_sha256 = hash_directory_file(
+                        entry.path(),
                         metadata.len(),
                         modified_ns(metadata.modified().ok()),
+                    )?;
+                    batch.push(file_record(
+                        relative,
+                        metadata.len(),
+                        modified_ns(metadata.modified().ok()),
+                        content_sha256,
                     ));
                     update_progress(&mut progress, batch.last().expect("record exists"));
                     if batch.len() == CATALOG_BATCH_SIZE {
+                        let last_path = batch.last().expect("record exists").path.clone();
                         self.upsert_batch(scan_id, &mut batch)?;
+                        self.set_meta("scan_last_path", &last_path)?;
                         on_progress(progress);
                     }
                 }
@@ -368,15 +545,18 @@ impl Catalog {
                 let file = File::open(&source)?;
                 let mut archive = ZipArchive::new(file)?;
                 for index in 0..archive.len() {
-                    let entry = archive.by_index(index)?;
+                    let mut entry = archive.by_index(index)?;
                     if entry.is_dir() {
                         continue;
                     }
                     let path = String::from_utf8_lossy(entry.name_raw()).replace('\\', "/");
-                    batch.push(file_record(path, entry.size(), 0));
+                    let content_sha256 = hash_reader(&mut entry)?;
+                    batch.push(file_record(path, entry.size(), 0, content_sha256));
                     update_progress(&mut progress, batch.last().expect("record exists"));
                     if batch.len() == CATALOG_BATCH_SIZE {
+                        let last_path = batch.last().expect("record exists").path.clone();
                         self.upsert_batch(scan_id, &mut batch)?;
+                        self.set_meta("scan_last_path", &last_path)?;
                         on_progress(progress);
                     }
                 }
@@ -392,14 +572,24 @@ impl Catalog {
                     path,
                     metadata.len(),
                     modified_ns(metadata.modified().ok()),
+                    hash_directory_file(
+                        &source,
+                        metadata.len(),
+                        modified_ns(metadata.modified().ok()),
+                    )?,
                 ));
                 update_progress(&mut progress, batch.last().expect("record exists"));
             }
         }
-        self.upsert_batch(scan_id, &mut batch)?;
+        if !batch.is_empty() {
+            let last_path = batch.last().expect("record exists").path.clone();
+            self.upsert_batch(scan_id, &mut batch)?;
+            self.set_meta("scan_last_path", &last_path)?;
+        }
         self.connection
             .execute("DELETE FROM files WHERE seen_scan <> ?1", [scan_id])?;
         self.set_meta("scan_status", "complete")?;
+        self.set_meta("scan_last_path", "")?;
         self.set_meta("scan_completed_at", &unix_seconds().to_string())?;
         on_progress(progress);
         self.stats()
@@ -1760,6 +1950,26 @@ impl Catalog {
     where
         F: FnMut(DuplicateHashProgress) -> Result<()>,
     {
+        self.set_meta("hash_status", "running")?;
+        let result = self.hash_duplicate_candidates_inner(source, kind, &mut on_progress);
+        if result.is_err() {
+            let _ = self.clear_duplicate_hashes();
+            let _ = self.set_meta("hash_status", "not_started");
+        } else {
+            self.set_meta("hash_status", "complete")?;
+        }
+        result
+    }
+
+    fn hash_duplicate_candidates_inner<F>(
+        &self,
+        source: &Path,
+        kind: SourceKind,
+        on_progress: &mut F,
+    ) -> Result<DuplicateHashProgress>
+    where
+        F: FnMut(DuplicateHashProgress) -> Result<()>,
+    {
         if kind == SourceKind::Sqlite {
             bail!("a direct Line.sqlite source has no attachment files");
         }
@@ -1767,6 +1977,9 @@ impl Catalog {
             .canonicalize()
             .with_context(|| format!("source does not exist: {}", source.display()))?;
         validate_bound_source(self, &source)?;
+        if !self.source_matches_current(&source, kind)? {
+            bail!("source changed since the last scan; rescan before hashing duplicates");
+        }
         let read_connection = Connection::open(&self.path)?;
         read_connection.pragma_update(None, "query_only", true)?;
         read_connection.pragma_update(None, "temp_store", "FILE")?;
@@ -1804,7 +2017,7 @@ impl Catalog {
         )?;
         let mut rows = statement.query([])?;
         let archive_fingerprint = if kind == SourceKind::ImazingArchive {
-            Some(source_metadata_fingerprint(&source)?)
+            Some(source_metadata_fingerprint(&source, kind)?)
         } else {
             None
         };
@@ -1860,11 +2073,17 @@ impl Catalog {
         }
         update_hash_batch(&mut write_connection, &mut pending)?;
         if let Some(before) = archive_fingerprint
-            && source_metadata_fingerprint(&source)? != before
+            && source_metadata_fingerprint(&source, kind)? != before
         {
             bail!("source archive changed while hashing");
         }
         Ok(progress)
+    }
+
+    fn clear_duplicate_hashes(&self) -> Result<()> {
+        self.connection
+            .execute("UPDATE files SET sha256 = NULL", [])?;
+        Ok(())
     }
 
     pub fn list_duplicate_groups(
@@ -2072,6 +2291,31 @@ impl Catalog {
         })
     }
 
+    pub fn set_active_job(&self, kind: &str, job_id: Option<&str>) -> Result<()> {
+        let key = format!("active_{kind}_job_id");
+        match job_id.filter(|value| !value.is_empty()) {
+            Some(value) => self.set_meta(&key, value),
+            None => self.clear_meta(&key),
+        }
+    }
+
+    pub fn clear_active_job(&self, kind: &str) -> Result<()> {
+        self.clear_meta(&format!("active_{kind}_job_id"))
+    }
+
+    pub fn active_job(&self) -> Result<Option<(String, String)>> {
+        for (kind, key) in [
+            ("scan", "active_scan_job_id"),
+            ("hash", "active_hash_job_id"),
+            ("candidate", "active_candidate_job_id"),
+        ] {
+            if let Some(job_id) = self.meta(key)? {
+                return Ok(Some((kind.to_string(), job_id)));
+            }
+        }
+        Ok(None)
+    }
+
     fn upsert_batch(&mut self, scan_id: i64, batch: &mut Vec<FileRecord>) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -2100,6 +2344,12 @@ impl Catalog {
         )?;
         Ok(())
     }
+
+    fn clear_meta(&self, key: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM meta WHERE key = ?1", [key])?;
+        Ok(())
+    }
 }
 
 fn insert_records(
@@ -2109,17 +2359,17 @@ fn insert_records(
 ) -> Result<()> {
     let mut statement = transaction.prepare(
         "
-        INSERT INTO files(path, bytes, modified_ns, attachment_kind, message_id, chat_hint, seen_scan)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        INSERT INTO files(path, bytes, modified_ns, content_sha256, attachment_kind, message_id, chat_hint, seen_scan)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
         ON CONFLICT(path) DO UPDATE SET
             bytes = excluded.bytes,
             modified_ns = excluded.modified_ns,
+            content_sha256 = excluded.content_sha256,
             attachment_kind = excluded.attachment_kind,
             message_id = excluded.message_id,
             chat_hint = excluded.chat_hint,
             sha256 = CASE
-                WHEN files.bytes = excluded.bytes
-                 AND files.modified_ns = excluded.modified_ns
+                WHEN files.content_sha256 = excluded.content_sha256
                 THEN files.sha256
                 ELSE NULL
             END,
@@ -2132,6 +2382,7 @@ fn insert_records(
             record.path,
             bytes,
             record.modified_ns,
+            record.content_sha256,
             record.kind.map(AttachmentKind::as_str),
             record.message_id,
             record.chat_hint,
@@ -2149,7 +2400,7 @@ fn update_progress(progress: &mut CatalogScanProgress, record: &FileRecord) {
     }
 }
 
-fn file_record(path: String, bytes: u64, modified_ns: i64) -> FileRecord {
+fn file_record(path: String, bytes: u64, modified_ns: i64, content_sha256: String) -> FileRecord {
     let normalized = path.replace('\\', "/");
     let segments: Vec<&str> = normalized.split('/').collect();
     let attachment = segments
@@ -2174,6 +2425,7 @@ fn file_record(path: String, bytes: u64, modified_ns: i64) -> FileRecord {
         path: normalized,
         bytes,
         modified_ns,
+        content_sha256,
         kind,
         message_id,
         chat_hint,
@@ -2417,13 +2669,57 @@ fn file_record_fingerprint(path: &Path) -> Result<(u64, i64)> {
     Ok((metadata.len(), modified_ns(metadata.modified().ok())))
 }
 
-fn source_metadata_fingerprint(path: &Path) -> Result<String> {
-    let metadata = fs::metadata(path)?;
-    Ok(format!(
-        "{}:{}",
-        metadata.len(),
-        modified_ns(metadata.modified().ok())
-    ))
+fn hash_directory_file(path: &Path, bytes: u64, modified_ns: i64) -> Result<String> {
+    let before = file_record_fingerprint(path)?;
+    if before != (bytes, modified_ns) {
+        bail!("source file changed while scanning: {}", path.display());
+    }
+    let digest = hash_reader(BufReader::with_capacity(
+        HASH_BUFFER_BYTES,
+        File::open(path)?,
+    ))?;
+    if file_record_fingerprint(path)? != before {
+        bail!("source file changed while scanning: {}", path.display());
+    }
+    Ok(digest)
+}
+
+fn source_metadata_fingerprint(path: &Path, kind: SourceKind) -> Result<String> {
+    let mut hasher = Sha256::new();
+    if kind == SourceKind::Directory {
+        let mut entries = Vec::new();
+        for entry in WalkDir::new(path).follow_links(false) {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative = entry.path().strip_prefix(path).with_context(|| {
+                format!(
+                    "source entry is outside the source root: {}",
+                    entry.path().display()
+                )
+            })?;
+            let metadata = entry.metadata()?;
+            entries.push((
+                relative.to_string_lossy().replace('\\', "/"),
+                metadata.len(),
+                modified_ns(metadata.modified().ok()),
+            ));
+        }
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        hasher.update((entries.len() as u64).to_le_bytes());
+        for (relative, bytes, modified) in entries {
+            hasher.update(relative.as_bytes());
+            hasher.update([0]);
+            hasher.update(bytes.to_le_bytes());
+            hasher.update(modified.to_le_bytes());
+        }
+    } else {
+        let metadata = fs::metadata(path)?;
+        hasher.update(metadata.len().to_le_bytes());
+        hasher.update(modified_ns(metadata.modified().ok()).to_le_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn validate_sha256(value: &str) -> Result<()> {

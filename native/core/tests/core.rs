@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use anyhow::anyhow;
 use line_backup_native::{
     AttachmentKind, Catalog, ChatCursor, LineDatabase, LineSquareDatabase, MessageCursor,
     NativeSession, SourceKind, UnifiedGroupDatabase, build_candidate, inspect_source,
@@ -229,6 +230,193 @@ fn inspects_private_store_database_and_opens_read_only() {
     let database = LineDatabase::open(&prepared.database_path).unwrap();
     assert!(database.is_read_only().unwrap());
     assert_eq!(database.quick_check().unwrap(), "ok");
+}
+
+#[test]
+fn detects_when_a_catalog_source_directory_has_changed() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let catalog_path = temporary.path().join("work/catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    assert!(
+        catalog
+            .source_matches_current(&source, SourceKind::Directory)
+            .unwrap()
+    );
+    let attachment = catalog
+        .list_attachments(None, 10, Some(AttachmentKind::Original), None)
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+    catalog.set_marked(&attachment.path, true).unwrap();
+
+    fs::write(source.join("new-top-level-file"), b"changed source").unwrap();
+    assert!(
+        !catalog
+            .source_matches_current(&source, SourceKind::Directory)
+            .unwrap()
+    );
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    assert!(catalog.marked_paths().unwrap().is_empty());
+}
+
+#[test]
+fn detects_when_a_nested_catalog_source_file_has_changed() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let catalog_path = temporary.path().join("work/catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    let nested = source.join(
+        "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Message Attachments/u1/12345678.jpg",
+    );
+    fs::write(&nested, b"changed nested attachment").unwrap();
+    assert!(
+        !catalog
+            .source_matches_current(&source, SourceKind::Directory)
+            .unwrap()
+    );
+}
+
+#[test]
+fn detects_same_size_same_mtime_content_replacement() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let catalog_path = temporary.path().join("work/catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    let nested = source.join(
+        "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Message Attachments/u1/12345678.jpg",
+    );
+    let original_mtime = fs::metadata(&nested).unwrap().modified().unwrap();
+    let original = fs::read(&nested).unwrap();
+    let replacement = vec![b'X'; original.len()];
+    assert_ne!(original, replacement);
+    fs::write(&nested, replacement).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&nested)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(original_mtime))
+        .unwrap();
+
+    assert!(
+        !catalog
+            .source_matches_current(&source, SourceKind::Directory)
+            .unwrap()
+    );
+}
+
+#[test]
+fn recovers_catalog_state_after_an_interrupted_operation() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let catalog_path = temporary.path().join("work/catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    let attachment = catalog
+        .list_attachments(None, 10, Some(AttachmentKind::Original), None)
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap();
+    catalog.set_marked(&attachment.path, true).unwrap();
+    drop(catalog);
+
+    let connection = Connection::open(&catalog_path).unwrap();
+    connection
+        .execute(
+            "INSERT INTO meta(key, value) VALUES ('scan_status', 'scanning')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO meta(key, value) VALUES ('hash_status', 'running')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute("UPDATE files SET sha256 = printf('%064d', 1)", [])
+        .unwrap();
+    drop(connection);
+
+    let recovered = Catalog::open(&catalog_path).unwrap();
+    recovered
+        .recover_interrupted_operations(&source, SourceKind::Directory)
+        .unwrap();
+    assert_eq!(recovered.stats().unwrap().scan_status, "resumable");
+    assert_eq!(recovered.marked_paths().unwrap().len(), 1);
+    let hash_count: i64 = Connection::open(&catalog_path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE sha256 IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(hash_count, 3);
+}
+
+#[test]
+fn resumes_an_interrupted_directory_scan_from_its_last_path() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let resumed_path = source.join("zz-resume.bin");
+    fs::write(&resumed_path, b"resume me").unwrap();
+    let catalog_path = temporary.path().join("work/catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    drop(catalog);
+
+    let connection = Connection::open(&catalog_path).unwrap();
+    connection
+        .execute("DELETE FROM files WHERE path = 'zz-resume.bin'", [])
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO meta(key, value) VALUES ('scan_status', 'scanning')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO meta(key, value) VALUES ('scan_last_path', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ["Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Message Thumbnails/u1/12345678.thumb"],
+        )
+        .unwrap();
+    drop(connection);
+
+    let mut resumed = Catalog::open(&catalog_path).unwrap();
+    resumed
+        .recover_interrupted_operations(&source, SourceKind::Directory)
+        .unwrap();
+    assert_eq!(resumed.stats().unwrap().scan_status, "resumable");
+    resumed
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    assert_eq!(resumed.stats().unwrap().scan_status, "complete");
+    assert_eq!(resumed.stats().unwrap().file_count, 4);
 }
 
 #[test]
@@ -602,7 +790,7 @@ fn catalogs_attachments_on_disk_and_persists_plan() {
 }
 
 #[test]
-fn opening_a_native_session_clears_persisted_removal_plans() {
+fn opening_a_native_session_preserves_persisted_removal_plans() {
     let temporary = TempDir::new().unwrap();
     let source = make_fixture(temporary.path());
     let work = temporary.path().join("work");
@@ -631,13 +819,15 @@ fn opening_a_native_session_clears_persisted_removal_plans() {
     drop(session);
 
     let catalog = Catalog::open(&work.join("catalog.sqlite")).unwrap();
-    assert!(catalog.marked_paths().unwrap().is_empty());
+    let marked_paths = catalog.marked_paths().unwrap();
+    assert_eq!(marked_paths.len(), 2);
+    assert!(marked_paths.contains(&attachment.path));
     let report = catalog
         .advanced_cleanup_report(0, 0, false, 0, 0, 0)
         .unwrap();
-    assert_eq!(report.planned_chats, 0);
-    assert_eq!(report.planned_database_messages, 0);
-    assert_eq!(report.planned_files, 0);
+    assert_eq!(report.planned_chats, 1);
+    assert_eq!(report.planned_database_messages, 4);
+    assert_eq!(report.planned_files, 2);
 }
 
 #[test]
@@ -1114,7 +1304,7 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
         "{\"id\":\"2\",\"method\":\"listMessages\",\"params\":{\"chatPk\":7,\"limit\":2}}\n",
         "{\"id\":\"3\",\"method\":\"searchMessages\",\"params\":{\"query\":\"photo\",\"limit\":10}}\n",
         "{\"id\":\"4\",\"method\":\"listMessages\",\"params\":{\"chatPk\":7,\"limit\":1001}}\n",
-        "{\"id\":\"5\",\"method\":\"scanCatalog\"}\n",
+        "{\"id\":\"5\",\"jobId\":\"scan-job\",\"method\":\"scanCatalog\"}\n",
         "{\"id\":\"6\",\"method\":\"listAttachments\",\"params\":{\"limit\":10}}\n",
         "{\"id\":\"7\",\"method\":\"stageAttachmentPreview\",\"params\":{\"path\":\"Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Message Attachments/u1/12345678.jpg\"}}\n",
         "{\"id\":\"9\",\"method\":\"listMessages\",\"params\":{\"chatPk\":7,\"limit\":10}}\n",
@@ -1126,6 +1316,10 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
         "{\"id\":\"15\",\"method\":\"advancedCleanupReport\"}\n",
         "{\"id\":\"16\",\"method\":\"setChatRemovalPlanned\",\"params\":{\"source\":\"line\",\"chatPk\":7,\"planned\":true}}\n",
         "{\"id\":\"17\",\"method\":\"sessionInfo\"}\n",
+        "{\"id\":\"18\",\"method\":\"listChats\",\"params\":{\"limit\":1,\"cursor\":{\"lastUpdated\":410,\"source\":\"square\",\"pk\":8}}}\n",
+        "{\"id\":\"19\",\"method\":\"listChats\",\"params\":{\"limit\":1,\"beforeCursor\":{\"lastUpdated\":200,\"source\":\"line\",\"pk\":7}}}\n",
+        "{\"id\":\"20\",\"method\":\"listChats\",\"params\":{\"limit\":1,\"cursor\":{\"lastUpdated\":410,\"source\":\"square\",\"pk\":8}}}\n",
+        "{\"id\":\"21\",\"method\":\"searchMessages\",\"params\":{\"query\":\"photo\",\"limit\":10}}\n",
         "{\"id\":\"8\",\"method\":\"shutdown\"}\n"
     );
     let mut input = std::io::BufReader::new(requests.as_bytes());
@@ -1143,6 +1337,8 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
             .expect("response ID exists")
     };
     assert_eq!(response("0")["result"]["quickCheck"], "ok");
+    assert_eq!(response("0")["result"]["fts5Available"], true);
+    assert_eq!(response("0")["result"]["catalogSourceCurrent"], false);
     assert_eq!(
         response("1")["result"]["items"].as_array().unwrap().len(),
         1
@@ -1156,6 +1352,7 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
     assert_eq!(response("3")["result"]["items"][0]["id"], "12345678");
     assert_eq!(response("4")["ok"], false);
     assert_eq!(response("4")["error"]["code"], "operation_failed");
+    assert_eq!(response("5")["jobId"], "scan-job");
     let attachment = response("6")["result"]["items"]
         .as_array()
         .unwrap()
@@ -1195,6 +1392,20 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
     assert_eq!(response("16")["result"]["plannedChats"], 1);
     assert_eq!(response("16")["result"]["plannedFiles"], 2);
     assert_eq!(response("17")["result"]["quickCheck"], "ok");
+    assert_eq!(response("18")["result"]["items"][0]["source"], "line");
+    assert_eq!(
+        response("18")["result"]["nextCursor"],
+        serde_json::Value::Null
+    );
+    assert_eq!(response("19")["result"]["items"][0]["source"], "square");
+    assert_eq!(response("19")["result"]["hasPrevious"], false);
+    assert_eq!(response("20")["result"]["items"][0]["source"], "line");
+    assert_eq!(response("21")["result"]["items"][0]["id"], "12345678");
+    let indexed_messages: i64 = Connection::open(work.join("search.sqlite"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM messages_fts", [], |row| row.get(0))
+        .unwrap();
+    assert!(indexed_messages > 0);
     assert_eq!(response("8")["result"]["shuttingDown"], true);
 }
 
@@ -1321,11 +1532,14 @@ fn advanced_cleanup_rewrites_candidate_sqlite_and_removes_chat_files_only() {
     assert_eq!(fs::read(&square_path).unwrap(), original_square);
 
     let mut archive = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+    let marked = catalog.marked_paths().unwrap();
     let attachment = catalog
         .list_attachments(None, 10, Some(AttachmentKind::Original), None)
         .unwrap()
         .items
-        .remove(0);
+        .into_iter()
+        .find(|item| marked.contains(&item.path))
+        .unwrap();
     assert!(archive.by_name(&attachment.path).is_err());
     assert!(archive.by_name(path_only_chat_file).is_err());
 
@@ -1439,6 +1653,51 @@ fn raw_copies_archive_candidate_and_removes_marked_entry() {
         .read_to_end(&mut lock)
         .unwrap();
     assert_eq!(lock, b"lock");
+}
+
+#[test]
+fn builds_zip64_candidate_with_more_than_u16_entries() {
+    let temporary = TempDir::new().unwrap();
+    let source_directory = make_fixture(temporary.path());
+    let database = inspect_source(&source_directory).unwrap().database_path;
+    let archive_path = temporary.path().join("LINE-large.imazingapp");
+    let mut writer =
+        zip::ZipWriter::new(fs::File::create(&archive_path).unwrap()).set_auto_large_file();
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file(".lock", options).unwrap();
+    writer.write_all(b"lock").unwrap();
+    writer
+        .start_file("Payload/LINE.app/Info.plist", options)
+        .unwrap();
+    writer.write_all(b"plist").unwrap();
+    writer.start_file(&database, options).unwrap();
+    writer
+        .write_all(&fs::read(source_directory.join(&database)).unwrap())
+        .unwrap();
+    for index in 0..65_536_u32 {
+        writer
+            .start_file(
+                format!("Payload/LINE.app/Resources/{index:05}.bin"),
+                options,
+            )
+            .unwrap();
+        writer.write_all(&[(index & 0xff) as u8]).unwrap();
+    }
+    writer.finish().unwrap();
+
+    let work = temporary.path().join("zip64-work");
+    let mut catalog = Catalog::open(&work.join("catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&archive_path, SourceKind::ImazingArchive, |_| {})
+        .unwrap();
+    let output = temporary.path().join("LINE-large-candidate.imazingapp");
+    let report = build_candidate(&archive_path, &output, &catalog, false, |_| Ok(())).unwrap();
+    assert!(report.input_entries > u16::MAX as u64);
+    assert!(report.output_entries > u16::MAX as u64);
+    assert!(report.used_zip64);
+
+    let archive = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+    assert_eq!(archive.len() as u64, report.output_entries);
 }
 
 #[test]
@@ -1569,4 +1828,41 @@ fn hashes_only_same_size_candidates_and_pages_duplicate_members() {
         .unwrap();
     assert_eq!(resumed.candidate_files, 0);
     assert_eq!(resumed.processed_files, 0);
+}
+
+#[test]
+fn clears_partial_duplicate_hashes_when_hashing_is_interrupted() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let attachment_root = source.join(
+        "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Message Attachments/c999",
+    );
+    fs::create_dir_all(&attachment_root).unwrap();
+    for offset in 0..101_u32 {
+        fs::write(
+            attachment_root.join(format!("{:08}.bin", 10_000_000 + offset)),
+            b"same bytes",
+        )
+        .unwrap();
+    }
+
+    let mut catalog = Catalog::open(&temporary.path().join("work/catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    let result = catalog.hash_duplicate_candidates(&source, SourceKind::Directory, |progress| {
+        if progress.processed_files >= 100 {
+            Err(anyhow!("test interruption"))
+        } else {
+            Ok(())
+        }
+    });
+    assert!(result.is_err());
+    assert!(
+        catalog
+            .list_duplicate_groups(None, 10)
+            .unwrap()
+            .items
+            .is_empty()
+    );
 }

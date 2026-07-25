@@ -94,8 +94,10 @@ Verified implementation:
 - [x] Add long-running JSONL sidecar protocol for desktop IPC.
 - [x] Add bounded native message search and enrich each attachment page with
   exact `ZMESSAGE.ZID` context when available.
-- [ ] Add a resumable disk-backed FTS index; the initial native search uses a
-  bounded-result read-only SQLite `LIKE` scan.
+- [x] Add a resumable disk-backed FTS5 index in the private work directory;
+  desktop searches use it after a current catalog is verified and retain the
+  bounded bidirectional message cursor. Unsupported/invalid index cases fall
+  back to the read-only SQLite `LIKE` scan.
 - [x] Add streaming SHA-256, size pre-grouping, on-disk checkpoints, and
   duplicate-group/member pages.
 - [x] Add initial ZIP64/raw-copy candidate construction and validation.
@@ -145,8 +147,8 @@ Verified implementation:
   preview.
 - [x] Present the desktop product as LINE Cheater with a two-screen native app
   shell: source selection and preparation first, an explicit Next action, then
-  a persistent sidebar that switches between mutually exclusive Browse and
-  Cleanup workspaces.
+  a persistent sidebar that switches between mutually exclusive Browse,
+  Cleanup, and exact Duplicate Review workspaces.
 - [x] Lead the welcome screen with `.imazingapp` and label it `推薦`; keep the
   unpacked backup directory as the secondary choice and hide the diagnostic
   direct-`Line.sqlite` picker from the end-user UI.
@@ -160,26 +162,39 @@ Verified implementation:
   original/thumbnail controls below the image.
 - [x] Add a repeatable macOS arm64 packager that bundles the optimized Rust
   sidecar, custom icon, ad-hoc signature, ZIP, DMG, and SHA-256 checksums.
+- [x] Add Windows x64 GitHub Actions packaging and release workflows that bundle
+  the Windows Rust sidecar, native icon, ZIP, and SHA-256 checksums.
+- [x] Add user-visible cancellation for catalog, duplicate hashing, and
+  candidate creation. Cancellation terminates and recreates the sidecar,
+  resumes committed directory-scan batches and duplicate-hash checkpoints,
+  and removes partial candidate output.
+- [x] Add protocol-level `jobId` values and persisted active-job metadata for
+  catalog, FTS index, duplicate hashing, and candidate jobs. Candidate output
+  remains restart-from-zero because ZIP central-directory writes cannot be
+  safely resumed in place.
 - [x] Replace the generated SVG icon with the supplied folder/chat/shield
   artwork normalized to a full-bleed 1024 × 1024 macOS PNG master. The source
   has no black corner matte or pre-applied system mask; packaging validates its
   dimensions and derives all ten legacy `.iconset` sizes before building the
   `.icns`.
-- [ ] Add Apple Developer ID signing/notarization, Intel/universal macOS,
-  Windows, and Linux packages with the correct sidecar for each target.
-- [ ] Port duplicate review, cleanup-plan exports, and the remaining analysis
-  UX.
-- [ ] Validate native candidates with iMazing restore before calling the ZIP64
-  writer production-compatible.
+- [ ] Complete Apple notarization, Intel/universal macOS, Linux packages, and
+  Windows signing. The macOS workflow now imports an optional passwordless P12
+  and uses `MACOS_SIGN_IDENTITY` when both secrets are present.
+- [x] Port exact duplicate review into the desktop UI; cleanup-plan exports and
+  the remaining analysis UX are still pending.
+- [x] Validate a native candidate through an actual iMazing restore; repeat this
+  across more backup variants before calling the ZIP64 writer production-safe.
+- [x] Add a >65,535-entry ZIP64 candidate stress fixture and a process-tree
+  peak-RSS measurement script. A >4 GiB single-entry test still requires a
+  dedicated sparse-file runner.
 
 ### Latest verification record
 
-2026-07-24:
+2026-07-25:
 
 - Rust: 1.96.0.
-- Native tests: 13 passed; renderer provider tests: 7 passed; Electron sidecar
-  tests: 2 passed; app-shell/package contract tests: 9 passed; existing Python CLI
-  tests: 19 passed.
+- Native tests: 28 passed; renderer provider tests: 7 passed; Electron tests:
+  38 passed; existing Python CLI tests: 19 passed.
 - Electron: 43.2.0 pinned; `npm audit` reported 0 vulnerabilities.
 - Ignored real fixture: 1.1 GB, 13,512 files, 11,239 classified attachments.
 - Catalog scan: approximately 0.36 seconds on the current machine.
@@ -267,15 +282,17 @@ Verified implementation:
 - Generated candidate fixtures verify directory streaming, archive raw-copy,
   explicit attachment removal, complete CRC reads, and protected core hashes.
 - The macOS arm64 release package embeds an arm64 optimized Rust sidecar and
-  Electron runtime. The 281 MiB app, 116 MiB ZIP, and 130 MiB DMG passed deep
+  Electron runtime. The 281 MiB app, 118 MiB ZIP, and 132 MiB DMG passed deep
   ad-hoc signature verification, ZIP entry validation, DMG CRC verification,
   bundled-sidecar execution, and SHA-256 generation. The packaged app was
   launched through macOS and reached the LINE Cheater welcome/source screen
   without loading a personal backup.
 - This artifact is not Developer ID signed or notarized. Treat it as a tester
   build; do not describe it as Gatekeeper-ready public distribution.
-- Peak RSS was not recorded because the sandbox denied the platform `sysctl`
-  call used by `/usr/bin/time -l`. Do not infer a memory figure from this run.
+- The process-tree RSS script measured the complete 28-test native suite,
+  including the >65,535-entry ZIP64 fixture, at a peak of 132,752 KiB. This is
+  a synthetic test-suite figure, not a 200 GB backup acceptance result; the
+  production fixture matrix still needs separate directory/archive runs.
 
 Do not assume checked items are production-ready. The project must pass the
 verification gates below before a release.
@@ -308,7 +325,8 @@ cargo run -p line-cheater -- \
   messages --source /path/to/LINE --chat-pk 42 --limit 180
 
 # Search message text with a bounded result page. This initial implementation
-# scans the read-only source SQLite; it does not build an FTS index yet.
+# CLI search remains a bounded read-only LIKE query; desktop serve builds the
+# disposable FTS5 index after catalog verification.
 cargo run -p line-cheater -- \
   --work-dir /path/to/work \
   search --source /path/to/LINE --query "keyword" --limit 180
@@ -408,16 +426,21 @@ Supported methods:
 - `buildCandidate`
 - `shutdown`
 
-`scanCatalog` may emit `catalogProgress` and `catalogContextProgress` events
-carrying the originating `requestId`; duplicate hashing emits
-`duplicateHashProgress`; `buildCandidate` emits `candidateProgress`. Input lines
-larger than 1 MiB are rejected. Output pages remain subject to the 1,000-record
-core limit.
+`scanCatalog`, `searchMessages`, `hashDuplicateCandidates`, and `buildCandidate`
+may receive a top-level UUID `jobId`. Progress events echo both `requestId` and
+`jobId`; successful responses echo the job ID as well. `scanCatalog` may emit
+`catalogProgress` and `catalogContextProgress`, search-index construction emits
+`searchIndexProgress`, duplicate hashing emits `duplicateHashProgress`, and
+`buildCandidate` emits `candidateProgress`. Input lines larger than 1 MiB are
+rejected. Output pages remain subject to the 1,000-record core limit.
 
-Protocol v1 currently processes one request at a time. Cancellation tokens and
-parallel read-only jobs are future protocol additions; add them without changing
-existing method semantics. A broken stdout pipe aborts candidate construction
-and removes the core-owned `.partial` file.
+Protocol v1 still processes one request at a time. Desktop cancellation kills
+the sidecar, then reopens the same source/work directory: committed directory
+scan batches resume after their last ordered path, committed duplicate hashes
+are retained, and candidate partial output is removed and rebuilt from zero.
+The catalog persists active job IDs so a restart can distinguish resumable scan
+and hash work from stale search/candidate jobs. A broken stdout pipe aborts
+candidate construction and removes the core-owned `.partial` file.
 
 ## Electron desktop boundary
 
@@ -474,28 +497,39 @@ It contains:
   to have no matching `ZCHAT`.
 
 A catalog is bound to one canonical source path. Reusing it for another source
-is rejected.
+is rejected. Directory sources store a deterministic recursive metadata manifest
+and a streaming SHA-256 for every cataloged file; archive and SQLite sources
+store the same content digest for each entry. A later session first compares
+metadata and then verifies the stored content digests before allowing cleanup,
+search indexing, or candidate creation. This catches a file replaced with
+identical size and mtime. It does make source verification proportional to the
+backup size, so it is intentionally done only at operation boundaries and not
+for every rendered row.
 
-Scans commit every 1,000 records. An interrupted scan leaves valid committed
-batches and `scan_status=scanning`; rerunning is idempotent. The current
-implementation re-enumerates the source and upserts existing paths rather than
-resuming from an exact directory cursor. Exact checkpoint continuation is still
-future work. Cleanup-context schema version 3 includes companion-database titles
-and the source database for every exact attachment context;
-older complete catalogs are reported as stale and reindexed automatically.
+Scans commit every 1,000 records. An interrupted directory scan leaves valid
+committed batches and resumes after its last ordered path when the already
+cataloged content still matches. Duplicate hashes are committed every 100
+files and resume from rows whose hash is still null. If a source change is
+detected, cleanup plans and derived hashes are invalidated and a complete scan
+is required. Cleanup-context schema version 3 includes companion-database
+titles and the source database for every exact attachment context; older
+complete catalogs are reported as stale and reindexed automatically.
 
 Duplicate hashing first selects attachment rows whose positive byte size occurs
-more than once, then reads each candidate with one reusable 1 MiB buffer. Hashes
-are committed every 100 files, so rerunning after cancellation resumes from
-the last committed batch. Directory rescans preserve a hash only when size and
-mtime are unchanged; a changed archive source fingerprint clears cached hashes.
+more than once, then reads each candidate with one reusable 1 MiB buffer. If a
+hash job fails because the source changes or the callback reports an error, the
+partial duplicate cache is cleared; a process cancellation is different because
+the committed batches remain resumable. Directory rescans preserve a hash only
+when the stored content digest is unchanged; a changed archive source
+fingerprint clears cached hashes.
 The duplicate-group query requires equal SHA-256 and byte size, reports
 reclaimable bytes as `(file_count - 1) * bytes`, and is cursor-paginated.
 
-This checkpoint is a performance cache rather than a trust boundary. A file
-that changes without changing detectable source metadata is outside the current
-cache invalidation model; candidate construction still performs its independent
-source and protected-core checks.
+The content digest is deliberately separate from the optional duplicate-group
+digest: it protects source identity even when a file is not an attachment
+candidate. If an older catalog has no content digests, it is treated as stale
+and must be scanned again rather than silently trusted. Candidate construction
+still performs independent copy-time stability and protected-core checks.
 
 ### Cleanup parity contract
 
@@ -580,13 +614,15 @@ does not exist. This may be slow on a database without an index on
 `ZMESSAGE(ZCHAT, ZTIMESTAMP, Z_PK)`. Never modify the source to add that index;
 future work should persist chat statistics in `catalog.sqlite`.
 
-`searchMessages` applies an escaped, non-empty `LIKE` pattern to `ZTEXT`, returns
-at most 1,000 rows, and uses the same `(timestamp, pk)` continuation cursor as
-message browsing. This bounds response memory but may still rescan a large
-message table for each page. The production search path should incrementally
-copy message text into a disposable FTS5 database in the work directory, commit
-in batches, bind it to the source database fingerprint, and page hits without
-changing the source.
+`searchMessages` uses a disposable `search.sqlite` FTS5 database in the work
+directory after the catalog's source content has been verified. The index copies
+message text and the bounded result fields in a transaction, binds its metadata
+to the catalog source fingerprint, and can be rebuilt safely after interruption.
+Search results keep the same `(timestamp, pk)` forward/backward cursor and
+1,000-row limit. FTS queries use unicode61 token/prefix matching; if FTS5 is
+unavailable, the source schema is unusual, or the index query fails, the core
+falls back to the escaped read-only SQLite `LIKE` implementation. Neither path
+creates tables or indexes in the original LINE databases.
 
 `scanCatalog` extracts numeric message ID hints from media filenames and
 correlates attachment rows in 200-ID batches against both message databases.
@@ -674,27 +710,43 @@ fixture rather than requiring a personal backup:
 - Cancellation and restart during catalog, hash, and candidate jobs.
 - Peak RSS target under 1 GB for the native core.
 
+The repository now includes `native/electron/scripts/measure-peak-rss.sh`. It
+polls macOS `ps` every 100 ms and reports aggregate RSS for the command and its
+descendants without requiring `/usr/bin/time -l` or `sysctl` access:
+
+```sh
+native/electron/scripts/measure-peak-rss.sh -- \
+  target/release/line-cheater --work-dir /tmp/line-cheater-rss catalog \
+  --source /path/to/synthetic-line-backup
+```
+
+The JSON output contains only `peakRssKiB`, exit code, sampling interval, and
+scope. Use synthetic or ignored local fixtures; do not put source paths or
+message data in logs.
+
 ## Next implementation steps
 
 The next owner should proceed in this order:
 
-1. Add cancellation tokens and job IDs to the existing `serve` JSONL protocol,
-   including catalog, hashing, and candidate jobs.
-2. Port the web cleanup-plan JSON/text exports and duplicate review UI.
+1. Add an explicit cancellation token that the Rust sidecar can observe without
+   process termination. Current job IDs and restart-based scan/hash resumption
+   are safe, but candidate ZIP output still restarts from zero.
+2. Port the web cleanup-plan JSON/text exports.
    Source-aware community browsing is implemented; add cross-store coalescing
    if a future fixture contains the same normalized chat ID in both databases,
    preserving a merged chronological message stream like the web app.
-3. Move chat counts into the work catalog and add a resumable FTS5 sidecar keyed
-   by the source database fingerprint.
+3. Move chat counts into the work catalog and extend the FTS5 sidecar with
+   richer tokenization and an explicit indexed-message count in the UI.
 4. Manually regress directory, SQLite, and `.imazingapp` native pickers on
-   macOS/Windows/Linux. The macOS arm64 bundle/sidecar is repeatable; add
-   Developer ID notarization, Intel/universal builds, Windows/Linux packaging,
-   and release CI.
+   macOS/Windows/Linux. The macOS arm64 and Windows x64 bundle/sidecar paths
+   are automated; complete Apple notarization, Intel/universal builds, Linux
+   packaging, and Windows signing.
 5. Replace in-memory ZIP central-directory bookkeeping for million-entry
-   archives and add cancellation.
-6. Add synthetic ZIP64 stress fixtures: more than 65,535 entries, one entry
-   larger than 4 GiB, restart, cancellation, and measured peak RSS.
-7. Validate generated ZIP64 candidates with iMazing dry-run and restore.
+   archives and add the sparse >4 GiB single-entry runner.
+6. Add cancellation/restart coverage for the FTS build and measured peak RSS
+   across directory and archive fixtures.
+7. Repeat generated ZIP64 candidate validation across more iMazing backup
+   variants; one real restore path has already been verified.
 8. Measure the Electron and Rust processes separately; only evaluate a Tauri
    shell if Electron's measured baseline is unacceptable.
 

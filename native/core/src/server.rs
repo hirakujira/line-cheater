@@ -7,10 +7,12 @@ use serde_json::{Value, json};
 
 use crate::candidate::build_candidate;
 use crate::catalog::Catalog;
-use crate::database::{LineDatabase, LineSquareDatabase, OrphanMessage, UnifiedGroupDatabase};
+use crate::database::{
+    Fts5MessageIndex, LineDatabase, LineSquareDatabase, OrphanMessage, UnifiedGroupDatabase,
+};
 use crate::model::{
     AdvancedCleanupReport, AttachmentCursor, AttachmentKind, Chat, ChatCursor, ChatPage,
-    CleanupGroupPage, DEFAULT_PAGE_SIZE, DuplicateGroupCursor, MessageCursor,
+    CleanupGroupPage, DEFAULT_PAGE_SIZE, DuplicateGroupCursor, MessageCursor, MessagePage,
 };
 use crate::source::{PreparedSource, prepare_source};
 
@@ -23,6 +25,7 @@ pub struct NativeSession {
     square_database: Option<LineSquareDatabase>,
     unified_group_database: Option<UnifiedGroupDatabase>,
     catalog: Catalog,
+    fts5_index: Option<Fts5MessageIndex>,
     quick_check: Option<String>,
 }
 
@@ -41,13 +44,15 @@ impl NativeSession {
             .map(UnifiedGroupDatabase::open)
             .transpose()?;
         let catalog = Catalog::open(&work_dir.join("catalog.sqlite"))?;
-        catalog.clear_all_removal_plans()?;
+        catalog.recover_interrupted_operations(&prepared.original_path, prepared.report.kind)?;
+        let fts5_index = Fts5MessageIndex::open(&work_dir.join("search.sqlite")).ok();
         Ok(Self {
             prepared,
             database,
             square_database,
             unified_group_database,
             catalog,
+            fts5_index,
             quick_check: None,
         })
     }
@@ -60,12 +65,69 @@ impl NativeSession {
         self.quick_check = Some(value.clone());
         Ok(value)
     }
+
+    fn search_messages_with_fts<W: Write>(
+        &mut self,
+        params: &MessageSearchParams,
+        request: &Request,
+        output: &mut W,
+    ) -> Result<Option<MessagePage>> {
+        let Some(source_key) = self.catalog.source_fingerprint()? else {
+            return Ok(None);
+        };
+        if !self
+            .catalog
+            .source_matches_current(&self.prepared.original_path, self.prepared.report.kind)?
+        {
+            return Ok(None);
+        }
+        let Some(index) = self.fts5_index.as_mut() else {
+            return Ok(None);
+        };
+        self.catalog
+            .set_active_job("search", request.job_id.as_deref())?;
+        let build_result = index.ensure_built(
+            &source_key,
+            &self.database,
+            self.square_database.as_ref(),
+            |processed| {
+                if processed % 256 == 0 {
+                    let _ = write_json_line(
+                        output,
+                        &json!({
+                            "event": "searchIndexProgress",
+                            "requestId": request.id,
+                            "jobId": request.job_id,
+                            "processedMessages": processed,
+                        }),
+                    );
+                }
+            },
+        );
+        if let Err(error) = build_result {
+            let _ = self.catalog.clear_active_job("search");
+            return Err(error);
+        }
+        let result = index.search(
+            &params.query,
+            &params.source,
+            params.chat_pk,
+            params.cursor,
+            params.before_cursor,
+            params.limit,
+            self.prepared.account_id.as_deref(),
+        );
+        self.catalog.clear_active_job("search")?;
+        Ok(Some(result?))
+    }
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Request {
     id: String,
+    #[serde(default)]
+    job_id: Option<String>,
     method: String,
     #[serde(default)]
     params: Value,
@@ -75,6 +137,8 @@ struct Request {
 #[serde(rename_all = "camelCase")]
 struct Response<'a> {
     id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_id: Option<&'a str>,
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<Value>,
@@ -259,7 +323,13 @@ pub fn serve<R: BufRead, W: Write>(
         match read_bounded_line(input, &mut line, MAX_REQUEST_BYTES)? {
             ReadLine::Eof => break,
             ReadLine::TooLarge => {
-                write_error(output, "", "request_too_large", "request exceeds 1 MiB")?;
+                write_error(
+                    output,
+                    "",
+                    None,
+                    "request_too_large",
+                    "request exceeds 1 MiB",
+                )?;
                 continue;
             }
             ReadLine::Line => {}
@@ -273,6 +343,7 @@ pub fn serve<R: BufRead, W: Write>(
                 write_error(
                     output,
                     "",
+                    None,
                     "invalid_request",
                     &format!("invalid JSON request: {error}"),
                 )?;
@@ -285,6 +356,7 @@ pub fn serve<R: BufRead, W: Write>(
                 output,
                 &Response {
                     id: &request.id,
+                    job_id: request.job_id.as_deref(),
                     ok: true,
                     result: Some(result),
                     error: None,
@@ -293,6 +365,7 @@ pub fn serve<R: BufRead, W: Write>(
             Err(error) => write_error(
                 output,
                 &request.id,
+                request.job_id.as_deref(),
                 "operation_failed",
                 &format!("{error:#}"),
             )?,
@@ -310,8 +383,19 @@ fn handle_request<W: Write>(
     output: &mut W,
 ) -> Result<Value> {
     match request.method.as_str() {
+        "recoverInterruptedOperations" => {
+            session.catalog.recover_interrupted_operations(
+                &session.prepared.original_path,
+                session.prepared.report.kind,
+            )?;
+            Ok(json!({ "recovered": true }))
+        }
         "sessionInfo" => {
             let quick_check = session.quick_check()?;
+            let active_job = session
+                .catalog
+                .active_job()?
+                .map(|(kind, job_id)| json!({ "kind": kind, "jobId": job_id }));
             Ok(json!({
                 "protocolVersion": SIDECAR_PROTOCOL_VERSION,
                 "source": session.prepared.report,
@@ -319,6 +403,14 @@ fn handle_request<W: Write>(
                 "quickCheck": quick_check,
                 "lineSquareLoaded": session.square_database.is_some(),
                 "unifiedGroupLoaded": session.unified_group_database.is_some(),
+                "catalogSourceCurrent": session
+                    .catalog
+                    .source_matches_current(
+                        &session.prepared.original_path,
+                        session.prepared.report.kind,
+                    )?,
+                "activeJob": active_job,
+                "fts5Available": session.fts5_index.is_some(),
                 "catalog": session.catalog.stats()?,
             }))
         }
@@ -444,48 +536,54 @@ fn handle_request<W: Write>(
             if params.cursor.is_some() && params.before_cursor.is_some() {
                 anyhow::bail!("message search pagination cannot use both cursor and beforeCursor");
             }
-            let mut page = match params.source.as_str() {
-                "line" => match params.before_cursor {
-                    Some(cursor) => session.database.search_messages_for_account_before(
-                        &params.query,
-                        params.chat_pk,
-                        cursor,
-                        params.limit,
-                        session.prepared.account_id.as_deref(),
-                    )?,
-                    None => session.database.search_messages_for_account(
-                        &params.query,
-                        params.chat_pk,
-                        params.cursor,
-                        params.limit,
-                        session.prepared.account_id.as_deref(),
-                    )?,
-                },
-                "square" => match params.before_cursor {
-                    Some(cursor) => session
-                        .square_database
-                        .as_ref()
-                        .context("LineSquare.sqlite is not available")?
-                        .search_messages_before(
+            let mut page = if let Ok(Some(page)) =
+                session.search_messages_with_fts(&params, request, output)
+            {
+                page
+            } else {
+                match params.source.as_str() {
+                    "line" => match params.before_cursor {
+                        Some(cursor) => session.database.search_messages_for_account_before(
                             &params.query,
                             params.chat_pk,
                             cursor,
                             params.limit,
                             session.prepared.account_id.as_deref(),
                         )?,
-                    None => session
-                        .square_database
-                        .as_ref()
-                        .context("LineSquare.sqlite is not available")?
-                        .search_messages(
+                        None => session.database.search_messages_for_account(
                             &params.query,
                             params.chat_pk,
                             params.cursor,
                             params.limit,
                             session.prepared.account_id.as_deref(),
                         )?,
-                },
-                _ => anyhow::bail!("message source must be `line` or `square`"),
+                    },
+                    "square" => match params.before_cursor {
+                        Some(cursor) => session
+                            .square_database
+                            .as_ref()
+                            .context("LineSquare.sqlite is not available")?
+                            .search_messages_before(
+                                &params.query,
+                                params.chat_pk,
+                                cursor,
+                                params.limit,
+                                session.prepared.account_id.as_deref(),
+                            )?,
+                        None => session
+                            .square_database
+                            .as_ref()
+                            .context("LineSquare.sqlite is not available")?
+                            .search_messages(
+                                &params.query,
+                                params.chat_pk,
+                                params.cursor,
+                                params.limit,
+                                session.prepared.account_id.as_deref(),
+                            )?,
+                    },
+                    _ => anyhow::bail!("message source must be `line` or `square`"),
+                }
             };
             session
                 .catalog
@@ -494,6 +592,9 @@ fn handle_request<W: Write>(
         }
         "scanCatalog" => {
             let request_id = request.id.clone();
+            session
+                .catalog
+                .set_active_job("scan", request.job_id.as_deref())?;
             session.catalog.scan_source(
                 &session.prepared.original_path,
                 session.prepared.report.kind,
@@ -503,6 +604,7 @@ fn handle_request<W: Write>(
                         &json!({
                             "event": "catalogProgress",
                             "requestId": request_id,
+                            "jobId": request.job_id,
                             "files": progress.files,
                             "bytes": progress.bytes,
                             "attachments": progress.attachments,
@@ -521,6 +623,7 @@ fn handle_request<W: Write>(
                         &json!({
                             "event": "catalogContextProgress",
                             "requestId": context_request_id,
+                            "jobId": request.job_id,
                             "processedFiles": progress.processed_files,
                             "totalFiles": progress.total_files,
                             "referencedFiles": progress.referenced_files,
@@ -531,6 +634,7 @@ fn handle_request<W: Write>(
                 },
             )?;
             let stats = session.catalog.stats()?;
+            session.catalog.clear_active_job("scan")?;
             Ok(serde_json::to_value(stats)?)
         }
         "listAttachments" => {
@@ -630,6 +734,9 @@ fn handle_request<W: Write>(
         }
         "hashDuplicateCandidates" => {
             let request_id = request.id.clone();
+            session
+                .catalog
+                .set_active_job("hash", request.job_id.as_deref())?;
             let result = session.catalog.hash_duplicate_candidates(
                 &session.prepared.original_path,
                 session.prepared.report.kind,
@@ -642,6 +749,7 @@ fn handle_request<W: Write>(
                             &json!({
                                 "event": "duplicateHashProgress",
                                 "requestId": request_id,
+                                "jobId": request.job_id,
                                 "candidateFiles": progress.candidate_files,
                                 "processedFiles": progress.processed_files,
                                 "totalBytes": progress.total_bytes,
@@ -653,6 +761,7 @@ fn handle_request<W: Write>(
                     }
                 },
             )?;
+            session.catalog.clear_active_job("hash")?;
             Ok(serde_json::to_value(result)?)
         }
         "listDuplicateGroups" => {
@@ -675,6 +784,9 @@ fn handle_request<W: Write>(
         "buildCandidate" => {
             let params: BuildCandidateParams = parse_params(request)?;
             let request_id = request.id.clone();
+            session
+                .catalog
+                .set_active_job("candidate", request.job_id.as_deref())?;
             let report = build_candidate(
                 &session.prepared.original_path,
                 &params.output,
@@ -689,6 +801,7 @@ fn handle_request<W: Write>(
                             &json!({
                                 "event": "candidateProgress",
                                 "requestId": request_id,
+                                "jobId": request.job_id,
                                 "processedBytes": progress.processed_bytes,
                                 "totalBytes": progress.total_bytes,
                                 "processedEntries": progress.processed_entries,
@@ -700,6 +813,7 @@ fn handle_request<W: Write>(
                     }
                 },
             )?;
+            session.catalog.clear_active_job("candidate")?;
             Ok(serde_json::to_value(report)?)
         }
         "shutdown" => Ok(json!({ "shuttingDown": true })),
@@ -831,6 +945,7 @@ fn default_cleanup_sort() -> String {
 fn write_error<W: Write>(
     output: &mut W,
     id: &str,
+    job_id: Option<&str>,
     code: &'static str,
     message: &str,
 ) -> Result<()> {
@@ -838,6 +953,7 @@ fn write_error<W: Write>(
         output,
         &Response {
             id,
+            job_id,
             ok: false,
             result: None,
             error: Some(ErrorBody {

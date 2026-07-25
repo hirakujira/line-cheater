@@ -4,6 +4,8 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 const sourceKinds = new Set(["directory", "archive", "sqlite"]);
 const eventNames = new Set([
+  "operationStarted",
+  "searchIndexProgress",
   "catalogProgress",
   "catalogContextProgress",
   "duplicateHashProgress",
@@ -17,6 +19,9 @@ contextBridge.exposeInMainWorld("lineNativeBridge", Object.freeze({
   },
   chooseCandidateOutput() {
     return ipcRenderer.invoke("line-native:choose-candidate-output");
+  },
+  cancelOperation() {
+    return ipcRenderer.invoke("line-native:cancel-operation");
   },
   attachmentPreviewUrl(path) {
     if (typeof path !== "string" || !path || new TextEncoder().encode(path).length > 4096) {

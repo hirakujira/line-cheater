@@ -1,12 +1,10 @@
-use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, File};
-use std::hash::{Hash, Hasher};
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 use zip::ZipArchive;
 
@@ -191,17 +189,18 @@ fn is_imazing_archive(path: &Path) -> bool {
 }
 
 fn source_fingerprint(path: &Path) -> Result<String> {
-    let metadata = fs::metadata(path)?;
-    let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
-    metadata.len().hash(&mut hasher);
-    metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|value| value.as_nanos())
-        .hash(&mut hasher);
-    Ok(format!("{:016x}", hasher.finish()))
+    let _ = fs::metadata(path)?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn sibling_with_suffix(database: &Path, suffix: &str) -> PathBuf {

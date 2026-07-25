@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -118,6 +118,9 @@ where
         bail!("a direct Line.sqlite is not a complete backup and cannot become .imazingapp");
     }
     validate_catalog_source(catalog, &source)?;
+    if !catalog.source_matches_current(&source, report.kind)? {
+        bail!("source changed since the last scan; rescan the backup before building a candidate");
+    }
     validate_output(&source, output, report.kind)?;
     let marked: HashSet<String> = catalog.marked_paths()?.into_iter().collect();
     for path in &marked {
@@ -143,6 +146,7 @@ where
         SourceKind::Directory => build_from_directory(
             &source,
             &temporary,
+            catalog,
             &marked,
             &rewrites,
             full_crc,
@@ -151,6 +155,7 @@ where
         SourceKind::ImazingArchive => build_from_archive(
             &source,
             &temporary,
+            catalog,
             &marked,
             &rewrites,
             full_crc,
@@ -392,6 +397,7 @@ fn sibling_entry_name(database_name: &str, filename: &str) -> String {
 fn build_from_archive<F>(
     source: &Path,
     temporary: &Path,
+    catalog: &Catalog,
     marked: &HashSet<String>,
     rewrites: &DatabaseRewrites,
     full_crc: bool,
@@ -422,7 +428,7 @@ where
     let mut processed_bytes = 0_u64;
     let mut output_entries = 0_u64;
     for index in 0..archive.len() {
-        let entry = archive.by_index(index)?;
+        let mut entry = archive.by_index(index)?;
         ensure_stable_archive_name(&entry)?;
         let name = entry.name().to_string();
         processed_bytes = processed_bytes.saturating_add(entry.compressed_size());
@@ -462,7 +468,15 @@ where
             })?;
             continue;
         }
-        writer.raw_copy_file(entry)?;
+        let expected_digest = catalog
+            .content_digest_for_path(&name)?
+            .context("catalog is missing a source content digest")?;
+        let digest = hash_reader(&mut entry)?;
+        if digest != expected_digest {
+            bail!("source archive entry changed while candidate was being written: {name}");
+        }
+        drop(entry);
+        writer.raw_copy_file(archive.by_index(index)?)?;
         output_entries += 1;
         on_progress(CandidateProgress {
             processed_bytes,
@@ -480,6 +494,9 @@ where
     }
     if file_fingerprint(source)? != before_fingerprint {
         bail!("source .imazingapp changed while candidate was being written");
+    }
+    if !catalog.source_matches_current(source, SourceKind::ImazingArchive)? {
+        bail!("source .imazingapp content changed while candidate was being written");
     }
     verify_candidate(
         temporary,
@@ -519,6 +536,7 @@ where
 fn build_from_directory<F>(
     source: &Path,
     temporary: &Path,
+    catalog: &Catalog,
     marked: &HashSet<String>,
     rewrites: &DatabaseRewrites,
     full_crc: bool,
@@ -588,14 +606,20 @@ where
             continue;
         }
         let before = file_fingerprint(entry.path())?;
+        let expected_digest = catalog
+            .content_digest_for_path(&relative)?
+            .context("catalog is missing a source content digest")?;
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
             .large_file(before.bytes >= ZIP64_BYTES_THR);
         writer.start_file(&relative, options)?;
-        let mut input = BufReader::with_capacity(HASH_BUFFER_BYTES, File::open(entry.path())?);
-        let copied = std::io::copy(&mut input, &mut writer)?;
+        let input = BufReader::with_capacity(HASH_BUFFER_BYTES, File::open(entry.path())?);
+        let (copied, digest) = copy_and_hash(input, &mut writer)?;
         if copied != before.bytes || file_fingerprint(entry.path())? != before {
             bail!("source file changed while it was being copied: {relative}");
+        }
+        if digest != expected_digest {
+            bail!("source file content changed while it was being copied: {relative}");
         }
         processed_bytes = processed_bytes.saturating_add(copied);
         output_entries += 1;
@@ -615,6 +639,9 @@ where
     let protected_after = hash_directory_protected(source)?;
     if protected_after != protected_before {
         bail!("protected source files changed while candidate was being written");
+    }
+    if !catalog.source_matches_current(source, SourceKind::Directory)? {
+        bail!("source directory content changed while candidate was being written");
     }
     verify_candidate(
         temporary,
@@ -856,6 +883,22 @@ fn hash_reader(mut reader: impl Read) -> Result<String> {
         digest.update(&buffer[..read]);
     }
     Ok(format!("{:x}", digest.finalize()))
+}
+
+fn copy_and_hash(mut reader: impl Read, mut writer: impl Write) -> Result<(u64, String)> {
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0_u8; HASH_BUFFER_BYTES];
+    let mut copied = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        writer.write_all(&buffer[..read])?;
+        digest.update(&buffer[..read]);
+        copied = copied.saturating_add(read as u64);
+    }
+    Ok((copied, format!("{:x}", digest.finalize())))
 }
 
 fn catalog_directory_work(
