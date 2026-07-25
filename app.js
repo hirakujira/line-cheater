@@ -435,7 +435,7 @@
       if (el.releaseStatus) {
         el.releaseStatus.textContent = macAsset && windowsAsset
           ? "下載連結由 GitHub 最新正式 Release 提供。"
-          : "部分平台尚未找到對應資產，可前往 GitHub Releases 查看所有版本。";
+          : "也可前往 GitHub Releases 查看所有版本。";
       }
       highlightCurrentPlatform();
     }).catch(function () {
@@ -466,17 +466,17 @@
       meta.textContent = asset.version + " · " + platformLabel;
       link.removeAttribute("title");
     } else {
-      meta.textContent = "尚未提供，前往 Releases 查看";
-      link.title = "尚未找到此平台的正式 Release，將開啟 GitHub Releases。";
+      meta.textContent = platformLabel;
+      link.title = "開啟 GitHub Releases 選擇版本。";
     }
   }
 
   function setDesktopReleaseFallback(hasError) {
-    configurePlatformDownload(el.macDownload, el.macDownloadMeta, null, "");
-    configurePlatformDownload(el.windowsDownload, el.windowsDownloadMeta, null, "");
+    configurePlatformDownload(el.macDownload, el.macDownloadMeta, null, "macOS 12+ · Apple Silicon");
+    configurePlatformDownload(el.windowsDownload, el.windowsDownloadMeta, null, "Windows 10/11 · x64");
     if (el.releaseStatus) {
       el.releaseStatus.textContent = hasError
-        ? "目前無法取得最新版本，請從 GitHub Releases 選擇下載檔。"
+        ? "從 GitHub Releases 選擇最新的下載檔。"
         : "正在讀取最新桌面版資訊。";
     }
     highlightCurrentPlatform();
