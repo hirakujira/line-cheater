@@ -88,6 +88,15 @@ struct DuplicateSymlinkPlan {
     links: HashMap<String, DuplicateSymlink>,
 }
 
+#[derive(Clone, Copy)]
+struct CandidateBuildPlan<'a> {
+    catalog: &'a Catalog,
+    marked: &'a HashSet<String>,
+    rewrites: &'a DatabaseRewrites,
+    duplicate_symlinks: &'a DuplicateSymlinkPlan,
+    full_crc: bool,
+}
+
 impl DuplicateSymlinkPlan {
     fn linked_entries(&self) -> u64 {
         self.links.len() as u64
@@ -160,6 +169,13 @@ where
     };
     let cleanup_plan = catalog.database_cleanup_plan()?;
     let rewrites = prepare_database_rewrites(&source, catalog, &cleanup_plan)?;
+    let build_plan = CandidateBuildPlan {
+        catalog,
+        marked: &marked,
+        rewrites: &rewrites,
+        duplicate_symlinks: &duplicate_symlinks,
+        full_crc,
+    };
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -173,26 +189,12 @@ where
     }
 
     let build_result = match report.kind {
-        SourceKind::Directory => build_from_directory(
-            &source,
-            &temporary,
-            catalog,
-            &marked,
-            &rewrites,
-            &duplicate_symlinks,
-            full_crc,
-            &mut on_progress,
-        ),
-        SourceKind::ImazingArchive => build_from_archive(
-            &source,
-            &temporary,
-            catalog,
-            &marked,
-            &rewrites,
-            &duplicate_symlinks,
-            full_crc,
-            &mut on_progress,
-        ),
+        SourceKind::Directory => {
+            build_from_directory(&source, &temporary, build_plan, &mut on_progress)
+        }
+        SourceKind::ImazingArchive => {
+            build_from_archive(&source, &temporary, build_plan, &mut on_progress)
+        }
         SourceKind::Sqlite => unreachable!(),
     };
     match build_result {
@@ -485,16 +487,19 @@ fn sibling_entry_name(database_name: &str, filename: &str) -> String {
 fn build_from_archive<F>(
     source: &Path,
     temporary: &Path,
-    catalog: &Catalog,
-    marked: &HashSet<String>,
-    rewrites: &DatabaseRewrites,
-    duplicate_symlinks: &DuplicateSymlinkPlan,
-    full_crc: bool,
+    plan: CandidateBuildPlan<'_>,
     on_progress: &mut F,
 ) -> Result<CandidateReport>
 where
     F: FnMut(CandidateProgress) -> Result<()>,
 {
+    let CandidateBuildPlan {
+        catalog,
+        marked,
+        rewrites,
+        duplicate_symlinks,
+        full_crc,
+    } = plan;
     let before_fingerprint = file_fingerprint(source)?;
     let build_info = inspect_archive_for_build(source)?;
     let input_entries = build_info.entries;
@@ -617,16 +622,7 @@ where
     if !catalog.source_matches_current(source, SourceKind::ImazingArchive)? {
         bail!("source .imazingapp content changed while candidate was being written");
     }
-    verify_candidate(
-        temporary,
-        marked,
-        &protected_before,
-        &rewrites.hashes(),
-        &rewrites.skipped_sidecars,
-        duplicate_symlinks,
-        full_crc,
-        output_entries,
-    )?;
+    verify_candidate(temporary, plan, &protected_before, output_entries)?;
     let output_bytes = fs::metadata(temporary)?.len();
     let mut protected_entries_verified: Vec<String> = protected_before
         .keys()
@@ -664,16 +660,19 @@ where
 fn build_from_directory<F>(
     source: &Path,
     temporary: &Path,
-    catalog: &Catalog,
-    marked: &HashSet<String>,
-    rewrites: &DatabaseRewrites,
-    duplicate_symlinks: &DuplicateSymlinkPlan,
-    full_crc: bool,
+    plan: CandidateBuildPlan<'_>,
     on_progress: &mut F,
 ) -> Result<CandidateReport>
 where
     F: FnMut(CandidateProgress) -> Result<()>,
 {
+    let CandidateBuildPlan {
+        catalog,
+        marked,
+        rewrites,
+        duplicate_symlinks,
+        full_crc,
+    } = plan;
     let protected_before = hash_directory_protected(source)?;
     if !protected_before
         .keys()
@@ -802,16 +801,7 @@ where
     if !catalog.source_matches_current(source, SourceKind::Directory)? {
         bail!("source directory content changed while candidate was being written");
     }
-    verify_candidate(
-        temporary,
-        marked,
-        &protected_before,
-        &rewrites.hashes(),
-        &rewrites.skipped_sidecars,
-        duplicate_symlinks,
-        full_crc,
-        output_entries,
-    )?;
+    verify_candidate(temporary, plan, &protected_before, output_entries)?;
     let output_bytes = fs::metadata(temporary)?.len();
     let mut protected_entries_verified: Vec<String> = protected_before
         .keys()
@@ -967,14 +957,19 @@ fn ensure_stable_archive_name<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> Res
 
 fn verify_candidate(
     candidate: &Path,
-    marked: &HashSet<String>,
+    plan: CandidateBuildPlan<'_>,
     protected_before: &HashMap<String, String>,
-    rewritten_hashes: &HashMap<String, String>,
-    skipped_entries: &HashSet<String>,
-    duplicate_symlinks: &DuplicateSymlinkPlan,
-    full_crc: bool,
     expected_entries: u64,
 ) -> Result<()> {
+    let CandidateBuildPlan {
+        marked,
+        rewrites,
+        duplicate_symlinks,
+        full_crc,
+        ..
+    } = plan;
+    let rewritten_hashes = rewrites.hashes();
+    let skipped_entries = &rewrites.skipped_sidecars;
     let file = File::open(candidate)?;
     let mut archive = ZipArchive::new(file)?;
     if archive.len() as u64 != expected_entries {
@@ -1043,7 +1038,7 @@ fn verify_candidate(
             bail!("protected entry hash changed in candidate: {name}");
         }
     }
-    for (name, expected_hash) in rewritten_hashes {
+    for (name, expected_hash) in &rewritten_hashes {
         let actual = hash_archive_entry(candidate, name)?;
         if &actual != expected_hash {
             bail!("rewritten SQLite entry hash changed in candidate: {name}");
