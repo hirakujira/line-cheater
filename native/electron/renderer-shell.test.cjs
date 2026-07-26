@@ -254,6 +254,25 @@ test("reuses cleanup overview while paging groups", () => {
   assert.match(renderer, /cleanupPage = cleanupOverview = null;/);
 });
 
+test("supports cleanup page jumps and restores the overview page after chat detail", () => {
+  assert.match(html, /id="cleanup-page-input"/);
+  assert.match(html, /id="cleanup-page-total"/);
+  assert.match(renderer, /function commitCleanupPageInput\(\)/);
+  assert.match(renderer, /cleanupPageInput\.addEventListener\("blur", commitCleanupPageInput\)/);
+  assert.match(renderer, /cleanupPageInput\.addEventListener\("keydown", \(event\) =>/);
+  assert.match(
+    renderer,
+    /cleanupState\.groupKey = open\.dataset\.openGroup;\s+syncCleanupPageInput\(\);\s+void loadCleanupPage\(\);/
+  );
+  assert.match(renderer, /cleanupState\.groupKey = null;\s+void loadCleanupPage\(\);/);
+  assert.doesNotMatch(
+    renderer,
+    /cleanupState\.groupKey = open\.dataset\.openGroup;\s+cleanupState\.page = 1/
+  );
+  assert.doesNotMatch(renderer, /cleanupPage = firstPage;\s+cleanupState\.page = 1/);
+  assert.match(styles, /\.cleanup-page-jump input\s*\{/);
+});
+
 test("opens cleanup thumbnails in the shared image modal", () => {
   assert.match(renderer, /preview\.type = "button"/);
   assert.match(renderer, /preview\.setAttribute\("aria-label", `放大預覽：\$\{caption\}`\)/);
