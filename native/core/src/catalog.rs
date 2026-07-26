@@ -3223,6 +3223,45 @@ fn validate_sha256(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentItem> {
+    let raw_kind: String = row.get(4)?;
+    let kind = match raw_kind.as_str() {
+        "original" => AttachmentKind::Original,
+        "thumbnail" => AttachmentKind::Thumbnail,
+        _ => unreachable!("catalog only stores known attachment kinds"),
+    };
+    let reference_status: String = row.get(8)?;
+    let context = if reference_status == "referenced" {
+        Some(AttachmentContext {
+            source: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
+            message_pk: row.get(9)?,
+            chat_pk: row.get(10)?,
+            chat_id: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+            chat_title: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
+            chat_kind: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
+            timestamp: row.get::<_, Option<i64>>(15)?.unwrap_or(0),
+            sender_pk: row.get(16)?,
+            sender_name: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
+            content_type: row.get(18)?,
+            text: row.get::<_, Option<String>>(19)?.unwrap_or_default(),
+        })
+    } else {
+        None
+    };
+    Ok(AttachmentItem {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        bytes: row.get::<_, i64>(2)?.max(0) as u64,
+        modified_ns: row.get(3)?,
+        kind,
+        message_id: row.get(5)?,
+        chat_hint: row.get(6)?,
+        marked_for_removal: row.get(7)?,
+        reference_status,
+        context,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -3293,43 +3332,4 @@ mod tests {
         write_archive(&archive_path, 48, Some(17));
         assert!(!validate_archive_catalog_parallel(&archive_path, &catalog_path, 4, 48).unwrap());
     }
-}
-
-fn attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentItem> {
-    let raw_kind: String = row.get(4)?;
-    let kind = match raw_kind.as_str() {
-        "original" => AttachmentKind::Original,
-        "thumbnail" => AttachmentKind::Thumbnail,
-        _ => unreachable!("catalog only stores known attachment kinds"),
-    };
-    let reference_status: String = row.get(8)?;
-    let context = if reference_status == "referenced" {
-        Some(AttachmentContext {
-            source: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
-            message_pk: row.get(9)?,
-            chat_pk: row.get(10)?,
-            chat_id: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
-            chat_title: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
-            chat_kind: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
-            timestamp: row.get::<_, Option<i64>>(15)?.unwrap_or(0),
-            sender_pk: row.get(16)?,
-            sender_name: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
-            content_type: row.get(18)?,
-            text: row.get::<_, Option<String>>(19)?.unwrap_or_default(),
-        })
-    } else {
-        None
-    };
-    Ok(AttachmentItem {
-        id: row.get(0)?,
-        path: row.get(1)?,
-        bytes: row.get::<_, i64>(2)?.max(0) as u64,
-        modified_ns: row.get(3)?,
-        kind,
-        message_id: row.get(5)?,
-        chat_hint: row.get(6)?,
-        marked_for_removal: row.get(7)?,
-        reference_status,
-        context,
-    })
 }
