@@ -253,7 +253,8 @@
     if (!output || typeof output !== "string") throw new TypeError("Candidate output path is required.");
     return this.bridge.request("buildCandidate", {
       output: output,
-      fullCrc: Boolean(options.fullCrc)
+      fullCrc: Boolean(options.fullCrc),
+      linkDuplicates: Boolean(options.linkDuplicates)
     });
   };
 

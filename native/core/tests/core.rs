@@ -1491,7 +1491,7 @@ fn builds_valid_directory_candidate_without_marked_attachment() {
     catalog.set_marked(&thumbnail.path, true).unwrap();
 
     let output = temporary.path().join("LINE-slim.imazingapp");
-    let report = build_candidate(&source, &output, &catalog, true, |_| Ok(())).unwrap();
+    let report = build_candidate(&source, &output, &catalog, true, false, |_| Ok(())).unwrap();
     assert_eq!(report.removed_entries, 1);
     assert!(report.full_crc_verified);
     assert!(!output.with_extension("imazingapp.partial").exists());
@@ -1589,7 +1589,7 @@ fn advanced_cleanup_rewrites_candidate_sqlite_and_removes_chat_files_only() {
     assert_eq!(advanced.planned_files, 3);
 
     let output = temporary.path().join("LINE-advanced.imazingapp");
-    let candidate = build_candidate(&source, &output, &catalog, true, |_| Ok(())).unwrap();
+    let candidate = build_candidate(&source, &output, &catalog, true, false, |_| Ok(())).unwrap();
     assert_eq!(candidate.removed_chats, 5);
     assert_eq!(candidate.removed_messages, 7);
     assert_eq!(candidate.rewritten_databases.len(), 2);
@@ -1706,7 +1706,8 @@ fn raw_copies_archive_candidate_and_removes_marked_entry() {
         .unwrap();
     catalog.set_marked(removable, true).unwrap();
     let output = temporary.path().join("LINE-raw-copy.imazingapp");
-    let report = build_candidate(&archive_path, &output, &catalog, true, |_| Ok(())).unwrap();
+    let report =
+        build_candidate(&archive_path, &output, &catalog, true, false, |_| Ok(())).unwrap();
     assert_eq!(report.removed_entries, 1);
     assert_eq!(report.input_entries - report.output_entries, 1);
     let mut archive = zip::ZipArchive::new(fs::File::open(output).unwrap()).unwrap();
@@ -1718,6 +1719,51 @@ fn raw_copies_archive_candidate_and_removes_marked_entry() {
         .read_to_end(&mut lock)
         .unwrap();
     assert_eq!(lock, b"lock");
+}
+
+#[test]
+fn writes_relative_duplicate_symlinks_into_archive_candidates() {
+    let temporary = TempDir::new().unwrap();
+    let source_directory = make_fixture(temporary.path());
+    let database = inspect_source(&source_directory).unwrap().database_path;
+    let private_store = "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test";
+    let canonical_path = format!("{private_store}/Message Attachments/c010/91000001.bin");
+    let linked_path = format!("{private_store}/Message Thumbnails/c020/91000002.thumb");
+    let archive_path = temporary.path().join("LINE-duplicates.imazingapp");
+    let mut writer = zip::ZipWriter::new(fs::File::create(&archive_path).unwrap());
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let database_bytes = fs::read(source_directory.join(&database)).unwrap();
+    for (name, bytes) in [
+        (".lock", b"lock".as_slice()),
+        ("Payload/LINE.app/Info.plist", b"plist".as_slice()),
+        (database.as_str(), database_bytes.as_slice()),
+        (&canonical_path, b"archive duplicate".as_slice()),
+        (&linked_path, b"archive duplicate".as_slice()),
+    ] {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap();
+
+    let catalog_path = temporary.path().join("archive-link-work/catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&archive_path, SourceKind::ImazingArchive, |_| {})
+        .unwrap();
+    catalog
+        .hash_duplicate_candidates(&archive_path, SourceKind::ImazingArchive, |_| Ok(()))
+        .unwrap();
+
+    let output = temporary.path().join("LINE-duplicates-linked.imazingapp");
+    let report = build_candidate(&archive_path, &output, &catalog, true, true, |_| Ok(())).unwrap();
+    assert_eq!(report.linked_duplicate_entries, 1);
+    let mut archive = zip::ZipArchive::new(fs::File::open(output).unwrap()).unwrap();
+    assert!(!archive.by_name(&canonical_path).unwrap().is_symlink());
+    let mut link = archive.by_name(&linked_path).unwrap();
+    assert!(link.is_symlink());
+    let mut target = String::new();
+    link.read_to_string(&mut target).unwrap();
+    assert_eq!(target, "../../Message Attachments/c010/91000001.bin");
 }
 
 #[test]
@@ -1755,7 +1801,8 @@ fn keeps_archive_directory_entries_in_candidate() {
     let output = temporary
         .path()
         .join("LINE-directories-candidate.imazingapp");
-    let report = build_candidate(&archive_path, &output, &catalog, true, |_| Ok(())).unwrap();
+    let report =
+        build_candidate(&archive_path, &output, &catalog, true, false, |_| Ok(())).unwrap();
     assert_eq!(report.removed_entries, 1);
     assert_eq!(report.input_entries - report.output_entries, 1);
 
@@ -1805,7 +1852,8 @@ fn builds_zip64_candidate_with_more_than_u16_entries() {
         .scan_source(&archive_path, SourceKind::ImazingArchive, |_| {})
         .unwrap();
     let output = temporary.path().join("LINE-large-candidate.imazingapp");
-    let report = build_candidate(&archive_path, &output, &catalog, false, |_| Ok(())).unwrap();
+    let report =
+        build_candidate(&archive_path, &output, &catalog, false, false, |_| Ok(())).unwrap();
     assert!(report.input_entries > u16::MAX as u64);
     assert!(report.output_entries > u16::MAX as u64);
     assert!(report.used_zip64);
@@ -1864,7 +1912,8 @@ fn advanced_cleanup_rewrites_database_inside_archive_candidate() {
         .unwrap();
 
     let output = temporary.path().join("LINE-archive-advanced.imazingapp");
-    let report = build_candidate(&archive_path, &output, &catalog, true, |_| Ok(())).unwrap();
+    let report =
+        build_candidate(&archive_path, &output, &catalog, true, false, |_| Ok(())).unwrap();
     assert_eq!(report.removed_chats, 1);
     assert_eq!(report.removed_messages, 4);
     assert_eq!(report.removed_entries, 2);
@@ -1926,6 +1975,7 @@ fn hashes_only_same_size_candidates_and_pages_duplicate_members() {
     assert_eq!(groups.items[0].reclaimable_bytes, 9);
     assert!(groups.items[0].has_original);
     assert!(groups.items[0].has_thumbnail);
+    assert!(groups.items[0].preview_path.is_some());
     let members = catalog
         .list_duplicate_members(&groups.items[0].sha256, None, 1)
         .unwrap();
@@ -1942,6 +1992,62 @@ fn hashes_only_same_size_candidates_and_pages_duplicate_members() {
         .unwrap();
     assert_eq!(resumed.candidate_files, 0);
     assert_eq!(resumed.processed_files, 0);
+}
+
+#[test]
+fn links_only_duplicate_members_that_remain_after_removal_planning() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let private_store = "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test";
+    let removed_path = format!("{private_store}/Message Attachments/c001/90000001.bin");
+    let canonical_path = format!("{private_store}/Message Attachments/c002/90000002.bin");
+    let linked_path = format!("{private_store}/Message Thumbnails/c003/90000003.thumb");
+    for path in [&removed_path, &canonical_path, &linked_path] {
+        fs::create_dir_all(source.join(path).parent().unwrap()).unwrap();
+        fs::write(source.join(path), b"same duplicate attachment").unwrap();
+    }
+
+    let mut catalog = Catalog::open(&temporary.path().join("link-work/catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .hash_duplicate_candidates(&source, SourceKind::Directory, |_| Ok(()))
+        .unwrap();
+    catalog.set_marked(&removed_path, true).unwrap();
+
+    let output = temporary.path().join("LINE-linked.imazingapp");
+    let report = build_candidate(&source, &output, &catalog, true, true, |_| Ok(())).unwrap();
+    assert_eq!(report.linked_duplicate_entries, 1);
+    assert_eq!(
+        report.linked_duplicate_bytes,
+        b"same duplicate attachment".len() as u64
+    );
+
+    let mut archive = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+    assert!(archive.by_name(&removed_path).is_err());
+    assert!(!archive.by_name(&canonical_path).unwrap().is_symlink());
+    let mut link = archive.by_name(&linked_path).unwrap();
+    assert!(link.is_symlink());
+    let mut target = String::new();
+    link.read_to_string(&mut target).unwrap();
+    assert_eq!(target, "../../Message Attachments/c002/90000002.bin");
+    drop(link);
+
+    catalog.set_marked(&canonical_path, true).unwrap();
+    catalog.set_marked(&linked_path, true).unwrap();
+    let all_removed_output = temporary
+        .path()
+        .join("LINE-all-duplicates-removed.imazingapp");
+    let all_removed = build_candidate(&source, &all_removed_output, &catalog, true, true, |_| {
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(all_removed.linked_duplicate_entries, 0);
+    let mut archive = zip::ZipArchive::new(fs::File::open(all_removed_output).unwrap()).unwrap();
+    assert!(archive.by_name(&removed_path).is_err());
+    assert!(archive.by_name(&canonical_path).is_err());
+    assert!(archive.by_name(&linked_path).is_err());
 }
 
 #[test]

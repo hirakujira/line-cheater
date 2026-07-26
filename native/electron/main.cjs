@@ -5,6 +5,12 @@ const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
+const {
+  clearSessionCache,
+  outputFallsInsideSession,
+  prepareSessionCache,
+  sessionWorkDir
+} = require("./session-cache.cjs");
 const { SidecarClient } = require("./sidecar-client.cjs");
 
 app.setName("LINE Cheater");
@@ -115,13 +121,20 @@ function sourceDialogOptions(kind) {
 }
 
 async function replaceSidecar(source) {
-  if (sidecar) await sidecar.dispose();
+  if (sidecar) {
+    const previous = sidecar;
+    sidecar = null;
+    await previous.dispose();
+  }
   outputTokens.clear();
   previewTokens.clear();
   activeSource = path.resolve(source);
-  const workKey = crypto.createHash("sha256").update(activeSource).digest("hex");
-  const workDir = path.join(app.getPath("userData"), "sessions", workKey);
-  fs.mkdirSync(workDir, { recursive: true });
+  const userDataPath = app.getPath("userData");
+  const { workDir } = prepareSessionCache(
+    userDataPath,
+    activeSource,
+    app.getVersion()
+  );
   const client = new SidecarClient(rustBinaryPath(), [
     "--work-dir", workDir,
     "serve", "--source", activeSource
@@ -154,6 +167,28 @@ async function replaceSidecar(source) {
     throw error;
   }
   return client.ready;
+}
+
+async function closeCompletedSession(client, workDir) {
+  if (sidecar === client) sidecar = null;
+  activeSource = null;
+  outputTokens.clear();
+  previewTokens.clear();
+  const warnings = [];
+  try {
+    await client.dispose();
+  } catch (error) {
+    warnings.push(`無法完全關閉背景核心：${error.message}`);
+  }
+  try {
+    clearSessionCache(app.getPath("userData"), workDir);
+  } catch (error) {
+    warnings.push(`無法刪除本機快取：${error.message}`);
+  }
+  return {
+    cacheCleared: warnings.length === 0,
+    cacheCleanupWarning: warnings.join(" ")
+  };
 }
 
 function sourceOpenError(error) {
@@ -290,19 +325,19 @@ async function registerIpc() {
     const safeParams = params && typeof params === "object" && !Array.isArray(params)
       ? structuredClone(params)
       : {};
+    const userDataPath = app.getPath("userData");
+    const workDir = sessionWorkDir(userDataPath, activeSource);
     if (method === "buildCandidate") {
       const token = String(safeParams.output || "");
       const output = outputTokens.get(token);
       if (!output) throw new Error("候選輸出授權已失效，請重新選擇位置。");
       outputTokens.delete(token);
+      if (outputFallsInsideSession(workDir, output)) {
+        throw new Error("候選輸出不能儲存在 LINE Cheater 的本機快取內。");
+      }
       safeParams.output = output;
     }
     const client = sidecar;
-    const workDir = path.join(
-      app.getPath("userData"),
-      "sessions",
-      crypto.createHash("sha256").update(path.resolve(activeSource)).digest("hex")
-    );
     const jobId = jobMethods.has(method) ? crypto.randomUUID() : null;
     const operation = { method, jobId, output: safeParams.output, workDir };
     activeOperation = operation;
@@ -314,7 +349,10 @@ async function registerIpc() {
       });
     }
     try {
-      return await client.request(method, safeParams, { jobId });
+      const result = await client.request(method, safeParams, { jobId });
+      if (method !== "buildCandidate") return result;
+      const cacheResult = await closeCompletedSession(client, workDir);
+      return { ...result, ...cacheResult };
     } finally {
       if (activeOperation === operation) activeOperation = null;
     }

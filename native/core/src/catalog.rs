@@ -122,6 +122,12 @@ pub struct DatabaseCleanupPlan {
     pub orphan_messages: Vec<PlannedMessage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DuplicateLinkMember {
+    pub path: String,
+    pub bytes: u64,
+}
+
 impl DatabaseCleanupPlan {
     pub fn is_empty(&self) -> bool {
         self.chats.is_empty() && self.orphan_messages.is_empty()
@@ -2104,7 +2110,8 @@ impl Catalog {
             "
             SELECT sha256, bytes, COUNT(*), {reclaimable},
                    MAX(CASE WHEN attachment_kind = 'original' THEN 1 ELSE 0 END),
-                   MAX(CASE WHEN attachment_kind = 'thumbnail' THEN 1 ELSE 0 END)
+                   MAX(CASE WHEN attachment_kind = 'thumbnail' THEN 1 ELSE 0 END),
+                   MIN(path)
             FROM files
             WHERE sha256 IS NOT NULL
             GROUP BY sha256, bytes
@@ -2129,6 +2136,7 @@ impl Catalog {
                     reclaimable_bytes: row.get::<_, i64>(3)?.max(0) as u64,
                     has_original: row.get::<_, i64>(4)? != 0,
                     has_thumbnail: row.get::<_, i64>(5)? != 0,
+                    preview_path: row.get(6)?,
                 })
             },
         )?;
@@ -2188,6 +2196,72 @@ impl Catalog {
             None
         };
         Ok(DuplicateMemberPage { items, next_cursor })
+    }
+
+    pub(crate) fn duplicate_link_groups(
+        &self,
+        excluded: &HashSet<String>,
+    ) -> Result<Vec<Vec<DuplicateLinkMember>>> {
+        if self.meta("hash_status")?.as_deref() != Some("complete") {
+            bail!("duplicate scan is not complete; scan exact duplicates before linking them");
+        }
+        let mut statement = self.connection.prepare(
+            "
+            SELECT sha256, bytes, path
+            FROM files
+            WHERE attachment_kind IS NOT NULL
+              AND sha256 IS NOT NULL
+              AND sha256 IN (
+                  SELECT sha256
+                  FROM files
+                  WHERE attachment_kind IS NOT NULL
+                    AND sha256 IS NOT NULL
+                  GROUP BY sha256, bytes
+                  HAVING COUNT(*) > 1
+              )
+            ORDER BY sha256 ASC, bytes ASC,
+                     CASE reference_status
+                         WHEN 'referenced' THEN 0
+                         WHEN 'unconfirmed' THEN 1
+                         ELSE 2
+                     END,
+                     CASE attachment_kind WHEN 'original' THEN 0 ELSE 1 END,
+                     path ASC
+            ",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u64,
+                DuplicateLinkMember {
+                    path: row.get(2)?,
+                    bytes: row.get::<_, i64>(1)?.max(0) as u64,
+                },
+            ))
+        })?;
+
+        let mut groups = Vec::new();
+        let mut current_key: Option<(String, u64)> = None;
+        let mut current_members = Vec::new();
+        for row in rows {
+            let (sha256, bytes, member) = row?;
+            let key = (sha256, bytes);
+            if current_key.as_ref().is_some_and(|value| value != &key) {
+                if current_members.len() > 1 {
+                    groups.push(std::mem::take(&mut current_members));
+                } else {
+                    current_members.clear();
+                }
+            }
+            current_key = Some(key);
+            if !excluded.contains(&member.path) {
+                current_members.push(member);
+            }
+        }
+        if current_members.len() > 1 {
+            groups.push(current_members);
+        }
+        Ok(groups)
     }
 
     fn cleanup_group(&self, group_key: &str) -> Result<CleanupGroup> {

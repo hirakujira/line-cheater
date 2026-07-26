@@ -57,7 +57,12 @@ handle, or arbitrary filesystem methods. The main process:
 - opens only credential-free `http:`/`https:` links through the system browser;
   renderer navigation, `file:` URLs, and other schemes remain blocked;
 - converts a one-use output token into the candidate path so the renderer cannot
-  choose arbitrary paths directly.
+  choose arbitrary paths directly;
+- binds every source-specific session cache to `app.getVersion()`, deleting and
+  rebuilding catalogs and staging data when that version is missing or changes;
+- closes the background core and deletes the complete source session after a
+  candidate passes full validation. Candidate output inside the internal cache
+  is rejected before construction.
 
 Do not replace this bridge with a general `ipcRenderer.send`, filesystem, shell,
 or child-process API.
@@ -139,9 +144,11 @@ developer machine.
 3. Keep the user on the source screen after preparation and enable an explicit
    Next action.
 4. Enter a native app shell with a persistent source summary and sidebar. The
-   sidebar switches between Browse, Cleanup, and Advanced; only one workspace is mounted
-   visibly at a time. The welcome header and sidebar reuse the packaged macOS
-   app icon rather than a separate lettermark.
+   sidebar switches between Browse, Cleanup, Exact Duplicates, and Advanced;
+   only one workspace is visible at a time. Exact Duplicates remains visible
+   but prompts the user to enable the guarded Advanced mode before it opens.
+   The welcome header and sidebar reuse the packaged macOS app icon rather than
+   a separate lettermark.
 5. Resolve chat names from the main, `LineSquare.sqlite`, and
    `UnifiedGroup.sqlite` databases plus rename system messages. Main and
    community chats share a source-aware cursor and keep the source needed to
@@ -168,11 +175,21 @@ developer machine.
 11. Mark original attachments and thumbnails independently, or use the reversible
    delete-all / keep-thumbnail group actions.
 12. Choose an output through a native save dialog and build a full-CRC candidate
-    with the web-style progress/success/error dialog.
+    with the web-style progress/success/error dialog. After successful output
+    validation, close the source session, clear its private local cache, and
+    return the underlying UI to source selection while keeping the result dialog
+    visible.
 13. Turn on the guarded desktop-only Advanced mode to plan deletion of a selected
     chat and its attachments, or use the Advanced sidebar page to include empty
     chats, system-only chats, and orphan `LineSquare` messages. The source remains
     read-only; only the newly built candidate receives the SQLite rewrite.
+14. In Advanced mode, scan exact duplicate attachments and preview each group
+    through the catalog-authorized image bridge. “Merge All Automatically” is
+    a reversible batch button: its second state cancels all automatic merging.
+    When enabled, candidate construction applies every file/chat removal first,
+    chooses a canonical file only from the surviving members, and replaces the
+    other survivors with relative ZIP symlinks. An entirely removed group
+    produces no links.
 
 Every next-page action replaces the current DOM window instead of appending to
 an unbounded array.
@@ -230,6 +247,10 @@ in the native catalog.
   matches the selected chat join the same removal plan. Empty/system-only
   detection uses actual `ZMESSAGE` rows rather than a cached `ZMESSAGECOUNT`;
   community orphan detection requires no matching `ZCHAT.Z_PK`.
+- Duplicate review is available only while Advanced mode is enabled. Group
+  previews use the same bounded local protocol as cleanup images. Duplicate
+  checkboxes may mark every member for deletion; the candidate writer excludes
+  those paths before selecting any symlink target.
 - Cleanup keeps the app workspace fixed instead of restoring a document-level
   scrollbar. The group list still replaces four rows at a time. Detail mode
   hides Previous/Next and uses one contained album scroller with sticky month

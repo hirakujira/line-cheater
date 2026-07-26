@@ -105,7 +105,7 @@
               <small>審核並建立瘦身檔</small>
             </span>
           </button>
-          <button class="sidebar-item" data-view="duplicates" type="button">
+          <button id="duplicates-nav" class="sidebar-item" data-view="duplicates" type="button">
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <circle cx="8" cy="8" r="3"></circle>
               <circle cx="16" cy="16" r="3"></circle>
@@ -307,11 +307,15 @@
                   <p class="section-kicker">EXACT DUPLICATES</p>
                   <h2 id="duplicates-heading-title">重複附件</h2>
                   <p class="muted">
-                    只把大小相同且 SHA-256 完全一致的檔案視為重複；來源備份保持唯讀，請逐組勾選要標記的副本。
+                    只把大小相同且 SHA-256 完全一致的附件視為重複。
                   </p>
                 </div>
                 <div class="duplicates-actions">
                   <button id="hash-duplicates" type="button" disabled>掃描完全相同附件</button>
+                  <button id="duplicate-auto-merge" class="secondary-button" type="button"
+                          aria-pressed="false" disabled>
+                    全部自動合併
+                  </button>
                   <button id="cancel-duplicate-scan" class="secondary-button hidden" type="button">
                     取消掃描
                   </button>
@@ -319,8 +323,8 @@
                 </div>
               </div>
               <div class="duplicates-warning">
-                <strong>雜湊是證據，不是刪除決策</strong>
-                <span>同一份內容可能出現在原始附件與縮圖中；請保留至少一份，並確認標記後的釋放容量。</span>
+                <strong>實驗性相容模式</strong>
+                <span>掃描後可按「全部自動合併」；系統會先排除已標記刪除的檔案，再從每組剩餘附件選一個實體檔案。</span>
               </div>
               <div id="duplicate-summary" class="duplicate-summary hidden" aria-live="polite"></div>
               <div id="duplicate-groups" class="duplicate-groups" aria-live="polite">

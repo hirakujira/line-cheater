@@ -244,6 +244,11 @@ Verified implementation:
   each Rust sidecar and Electron runtime is built natively.
 - [x] Port exact duplicate review into the desktop UI; cleanup-plan exports and
   the remaining analysis UX are still pending.
+- [x] Gate exact-duplicate scanning and cleanup behind desktop Advanced mode,
+  add catalog-authorized group previews, and let the candidate writer replace
+  retained duplicate members with verified relative ZIP symbolic links.
+  Removal plans are applied first: a canonical target is selected only from
+  surviving members, and groups with fewer than two survivors produce no link.
 - [x] Validate a native candidate through an actual iMazing restore; repeat this
   across more backup variants before calling the ZIP64 writer production-safe.
 - [x] Add a >65,535-entry ZIP64 candidate stress fixture and a process-tree
@@ -252,12 +257,12 @@ Verified implementation:
 
 ### Latest verification record
 
-2026-07-25:
+2026-07-26:
 
 - Rust: 1.96.0.
-- Native tests: 30 passed; renderer provider tests: 9 passed; Electron shell
-  tests: 33 passed (42 passed in the combined `npm test` command); existing
-  Python CLI tests: 19 passed.
+- Native tests: 32 passed; renderer provider tests: 10 passed; Electron
+  shell/cache tests: 38 passed (48 passed in the combined `npm test` command);
+  existing Python CLI tests: 19 passed.
 - Electron: 43.2.0 pinned; `npm audit` reported 0 vulnerabilities.
 - Ignored real fixture: 1.1 GB, 13,512 files, 11,239 classified attachments.
 - Catalog scan: approximately 0.36 seconds on the current machine.
@@ -276,6 +281,11 @@ Verified implementation:
   49,074,066 bytes. Streaming SHA-256 completed in approximately 3.1 seconds;
   an immediate second run selected 0 files, confirming the on-disk checkpoint.
   The first duplicate page contained 20 groups and a continuation cursor.
+- Generated directory and `.imazingapp` candidates preserved one canonical
+  regular attachment, replaced remaining exact survivors with relative ZIP
+  symlinks, excluded already-marked members before choosing the target, and
+  emitted no links when every member was removed. These are structural fixture
+  checks, not a claim that iMazing has restored the symlink candidates.
 - A no-match native message search over the 88 MiB SQLite completed in
   approximately 0.5 seconds. In the first 100 real attachment rows, 85 received
   an exact message context without exposing any private field in the test log.
@@ -433,8 +443,12 @@ cargo run -p line-cheater -- \
   --source /path/to/LINE.imazingapp \
   --catalog /path/to/work/catalog.sqlite \
   --output /path/to/LINE-slim.imazingapp \
+  --link-duplicates \
   --full-crc
 ```
+
+`--link-duplicates` is the experimental CLI equivalent of the desktop
+Advanced-mode option and requires a completed exact-duplicate hash scan.
 
 CLI cursor components are an atomic pair. Supplying only one component is an
 error. The sidecar's chat cursor additionally includes `source`; renderer code
@@ -536,7 +550,14 @@ request/response lines before parsing.
 
 Development work directories are source-path-hashed subdirectories under the
 Electron `userData/sessions` directory. They may contain staged SQLite and chat
-metadata and therefore must be treated as private local application data.
+metadata and therefore must be treated as private local application data. Each
+session carries the current `LINE Cheater` application version. A missing,
+invalid, or different version marker causes that source session to be deleted
+and rebuilt before the sidecar opens it. After a candidate `.imazingapp`
+finishes full validation, Electron closes the sidecar and deletes the complete
+per-source session, including catalogs, search indexes, staged databases, and
+preview files. Candidate output paths inside that internal session are rejected
+so successful output cannot be removed with the cache.
 
 ## Bounded-memory invariants
 
@@ -602,6 +623,21 @@ when the stored content digest is unchanged; a changed archive source
 fingerprint clears cached hashes.
 The duplicate-group query requires equal SHA-256 and byte size, reports
 reclaimable bytes as `(file_count - 1) * bytes`, and is cursor-paginated.
+The desktop presents that number as theoretical linkable capacity. Duplicate
+groups carry one catalog-authorized preview path; image bytes remain outside
+JSON and use the same bounded tokenized preview bridge as cleanup albums.
+
+Duplicate linking is enabled by a reversible “merge all automatically” button
+inside the Advanced-gated duplicate workspace. Candidate
+planning first loads the complete union of individually marked and chat-plan
+removals. For each exact-content group it then ignores every removed path,
+prefers referenced members and then original attachments among the survivors
+as the deterministic canonical file, and emits relative symbolic links for the
+remaining survivors.
+Zero or one survivor emits no link. Candidate validation requires every planned
+link to remain a symlink, contain the exact relative target, and resolve to a
+retained regular archive entry; the report separately records linked entry and
+source-byte counts.
 
 The content digest is deliberately separate from the optional duplicate-group
 digest: it protects source identity even when a file is not an attachment
@@ -739,6 +775,12 @@ limitations:
   delete exact planned chats/messages in a transaction, run `VACUUM` and
   `quick_check`, write the snapshot as the candidate database entry, and omit
   stale WAL/SHM sidecars. The selected source remains byte-for-byte untouched.
+- Advanced duplicate linking writes Unix symbolic-link entries into the ZIP.
+  Generated directory and `.imazingapp` fixtures verify link type, relative
+  target, removal-first planning, all-members-removed behavior, CRC, and
+  canonical-target retention. This is still an experimental compatibility mode:
+  successful iMazing import and physical-device restore must be verified on
+  macOS and Windows before claiming that links survive every restore pipeline.
 - Non-UTF-8 paths, entry names that cannot round-trip byte-for-byte, encrypted
   entries, duplicate entry names, and unsafe relative paths are rejected instead
   of silently rewritten.

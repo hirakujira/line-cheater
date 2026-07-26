@@ -247,6 +247,8 @@ struct BuildCandidateParams {
     output: PathBuf,
     #[serde(default)]
     full_crc: bool,
+    #[serde(default)]
+    link_duplicates: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -813,6 +815,7 @@ fn handle_request<W: Write>(
                 &params.output,
                 &session.catalog,
                 params.full_crc,
+                params.link_duplicates,
                 |progress| {
                     if progress.processed_entries % 64 == 0
                         || progress.processed_entries == progress.total_entries
