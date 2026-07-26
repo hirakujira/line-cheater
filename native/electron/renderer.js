@@ -198,12 +198,20 @@ function sourceDisplayName(path, kind) {
 
 function renderSessionSummary(info) {
   elements.sessionSummary.replaceChildren();
+  const performance = info.performance || {};
+  const performanceSummary = Number(performance.logicalCpus) > 0
+    ? `${Number(performance.logicalCpus).toLocaleString()} 核心 · ` +
+      `${formatBytes(performance.physicalMemoryBytes)} RAM · ` +
+      `${Number(performance.archiveWorkers || 1).toLocaleString()} 個封存／` +
+      `${Number(performance.sqliteWorkers || 1).toLocaleString()} 個 SQLite worker`
+    : "自動";
   for (const [label, value] of [
     ["類型", sourceKindLabel(info.source.kind)],
     ["SQLite 檢查", info.quickCheck],
     ["來源唯讀", info.readOnly ? "是" : "否"],
     ["群組名稱資料", info.unifiedGroupLoaded ? "已載入" : "未提供"],
     ["社群名稱資料", info.lineSquareLoaded ? "已載入" : "未提供"],
+    ["效能設定", performanceSummary],
     ["附件索引來源", info.catalogSourceCurrent ? "metadata 未變更" : "需要重新掃描"],
     ["附件索引", info.catalog.scanStatus === "complete" ? "已完成" : info.catalog.scanStatus]
   ]) {

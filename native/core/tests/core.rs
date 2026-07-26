@@ -587,6 +587,103 @@ fn pages_chats_and_messages_with_bounded_limits() {
 }
 
 #[test]
+fn persists_chat_statistics_outside_an_unindexed_read_only_source() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let database_path = source.join(inspect_source(&source).unwrap().database_path);
+    let mut connection = Connection::open(&database_path).unwrap();
+    connection
+        .execute_batch(
+            "
+            DROP INDEX message_chat_time;
+            INSERT INTO ZCHAT VALUES (8, 'unindexed-group', 1, 600, 'latest');
+            ",
+        )
+        .unwrap();
+    let transaction = connection.transaction().unwrap();
+    {
+        let mut insert = transaction
+            .prepare(
+                "INSERT INTO ZMESSAGE(
+                    Z_PK, ZID, ZTIMESTAMP, ZCHAT, ZSENDER, ZSENDSTATUS,
+                    ZCONTENTTYPE, ZMESSAGETYPE, ZTEXT, ZLATITUDE, ZLONGITUDE
+                 ) VALUES (?1, ?2, ?3, 8, 1, 0, ?4, 'R', ?5, NULL, NULL)",
+            )
+            .unwrap();
+        for offset in 0..10_000_i64 {
+            let system_message = offset % 10 == 0;
+            insert
+                .execute(params![
+                    100 + offset,
+                    format!("bulk-{offset}"),
+                    500 + offset,
+                    if system_message { 18 } else { 0 },
+                    if system_message {
+                        "系統訊息".to_string()
+                    } else {
+                        format!("message {offset}")
+                    }
+                ])
+                .unwrap();
+        }
+    }
+    transaction.commit().unwrap();
+    let source_schema_before = connection
+        .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    connection.close().unwrap();
+
+    let work = temporary.path().join("work");
+    let prepared = prepare_source(&source, &work).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    assert!(database.is_read_only().unwrap());
+    let chats = database.chats_for_index().unwrap();
+    let unindexed = chats
+        .iter()
+        .find(|chat| chat.id == "unindexed-group")
+        .unwrap();
+    assert_eq!(unindexed.message_count, 10_000);
+    assert_eq!(unindexed.human_message_count, 9_000);
+
+    let mut catalog = Catalog::open(&work.join("catalog.sqlite")).unwrap();
+    catalog.replace_chat_index(&chats).unwrap();
+    let page = catalog.list_indexed_chats(None, None, 1).unwrap();
+    assert_eq!(page.items[0].id, "unindexed-group");
+    assert!(page.next_cursor.is_some());
+    let second = catalog
+        .list_indexed_chats(page.next_cursor, None, 1)
+        .unwrap();
+    assert_eq!(second.items[0].id, "u1");
+    assert!(second.has_previous);
+
+    let source_connection = Connection::open(&database_path).unwrap();
+    let source_schema_after = source_connection
+        .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(source_schema_after, source_schema_before);
+}
+
+#[test]
 fn chat_backward_pagination_keeps_the_adjacent_page() {
     let temporary = TempDir::new().unwrap();
     let source = make_fixture(temporary.path());
@@ -1403,6 +1500,18 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
     };
     assert_eq!(response("0")["result"]["quickCheck"], "ok");
     assert_eq!(response("0")["result"]["fts5Available"], true);
+    assert!(
+        response("0")["result"]["performance"]["logicalCpus"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        response("0")["result"]["performance"]["archiveWorkers"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
     assert_eq!(response("0")["result"]["catalogSourceCurrent"], false);
     assert_eq!(
         response("1")["result"]["items"].as_array().unwrap().len(),
@@ -1471,6 +1580,11 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
         .query_row("SELECT COUNT(*) FROM messages_fts", [], |row| row.get(0))
         .unwrap();
     assert!(indexed_messages > 0);
+    let indexed_chats: i64 = Connection::open(work.join("catalog.sqlite"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM chats", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(indexed_chats, 2);
     assert_eq!(response("8")["result"]["shuttingDown"], true);
 }
 
