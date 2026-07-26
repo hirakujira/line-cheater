@@ -126,6 +126,8 @@ const elements = {
   cleanupList: document.querySelector("#cleanup-list"),
   cleanupPrev: document.querySelector("#cleanup-prev"),
   cleanupNext: document.querySelector("#cleanup-next"),
+  cleanupPageInput: document.querySelector("#cleanup-page-input"),
+  cleanupPageTotal: document.querySelector("#cleanup-page-total"),
   cleanupPageInfo: document.querySelector("#cleanup-page-info"),
   hashDuplicates: document.querySelector("#hash-duplicates"),
   cancelDuplicateScan: document.querySelector("#cancel-duplicate-scan"),
@@ -1456,6 +1458,7 @@ async function loadCleanupPage() {
   }
   disposeCleanupAlbum();
   cleanupLoading = true;
+  syncCleanupPageInput();
   elements.cleanupList.setAttribute("aria-busy", "true");
   try {
     let page;
@@ -1476,6 +1479,7 @@ async function loadCleanupPage() {
     setStatus(error.message, true);
   } finally {
     cleanupLoading = false;
+    syncCleanupPageInput();
     elements.cleanupList.removeAttribute("aria-busy");
     if (cleanupReloadPending && provider) {
       cleanupReloadPending = false;
@@ -1510,11 +1514,39 @@ function renderCleanupPage() {
   if (!cleanupPage) return;
   elements.cleanupView.classList.remove("is-detail");
   renderCleanupGroups(cleanupPage);
+  const page = Math.max(1, Number(cleanupPage.page) || cleanupState.page || 1);
+  const totalPages = Math.max(1, Number(cleanupPage.totalPages) || 1);
+  cleanupState.page = page;
+  elements.cleanupPageInput.value = String(page);
+  elements.cleanupPageInput.max = String(totalPages);
+  elements.cleanupPageTotal.textContent = String(totalPages);
   elements.cleanupPageInfo.textContent = cleanupPage.totalItems
-    ? `第 ${cleanupPage.page} / ${cleanupPage.totalPages} 頁 · ${cleanupPage.totalItems.toLocaleString()} 個分類`
-    : "第 1 頁";
-  elements.cleanupPrev.disabled = cleanupPage.page <= 1;
-  elements.cleanupNext.disabled = cleanupPage.page >= cleanupPage.totalPages;
+    ? `· ${cleanupPage.totalItems.toLocaleString()} 個分類`
+    : "";
+  elements.cleanupPrev.disabled = page <= 1;
+  elements.cleanupNext.disabled = page >= totalPages;
+  syncCleanupPageInput();
+}
+
+function syncCleanupPageInput() {
+  if (!elements.cleanupPageInput) return;
+  const totalPages = Math.max(1, Number(cleanupPage?.totalPages) || 1);
+  elements.cleanupPageInput.max = String(totalPages);
+  elements.cleanupPageTotal.textContent = String(totalPages);
+  elements.cleanupPageInput.disabled = cleanupLoading || Boolean(cleanupState.groupKey) || totalPages <= 1;
+}
+
+function commitCleanupPageInput() {
+  if (cleanupState.groupKey || !cleanupPage || cleanupLoading) return;
+  const totalPages = Math.max(1, Number(cleanupPage.totalPages) || 1);
+  const requested = Number.parseInt(elements.cleanupPageInput.value, 10);
+  const page = Number.isFinite(requested)
+    ? Math.min(totalPages, Math.max(1, requested))
+    : cleanupPage.page;
+  elements.cleanupPageInput.value = String(page);
+  if (page === cleanupPage.page) return;
+  cleanupState.page = page;
+  void loadCleanupPage();
 }
 
 function renderCleanupGroups(page) {
@@ -1655,6 +1687,7 @@ async function loadCleanupAlbum() {
   }
   cleanupLoading = true;
   disposeCleanupAlbum();
+  syncCleanupPageInput();
   const groupKey = cleanupState.groupKey;
   const renderGeneration = ++cleanupRenderGeneration;
   elements.cleanupList.setAttribute("aria-busy", "true");
@@ -1667,13 +1700,13 @@ async function loadCleanupAlbum() {
     if (cleanupState.groupKey !== groupKey) return;
     cleanupOverview = overview;
     cleanupPage = firstPage;
-    cleanupState.page = 1;
     renderCleanupOverview();
     renderCleanupAlbum(firstPage, renderGeneration);
   } catch (error) {
     setStatus(error.message, true);
   } finally {
     cleanupLoading = false;
+    syncCleanupPageInput();
     elements.cleanupList.removeAttribute("aria-busy");
     if (cleanupReloadPending && provider) {
       cleanupReloadPending = false;
@@ -2496,6 +2529,13 @@ elements.categorySummary.addEventListener("click", (event) => {
   elements.cleanupCategory.value = cleanupState.category;
   void loadCleanupPage();
 });
+elements.cleanupPageInput.addEventListener("blur", commitCleanupPageInput);
+elements.cleanupPageInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  commitCleanupPageInput();
+  elements.cleanupPageInput.blur();
+});
 elements.cleanupPrev.addEventListener("click", () => {
   if (cleanupState.groupKey || !cleanupPage || cleanupState.page <= 1) return;
   cleanupState.page -= 1;
@@ -2521,14 +2561,13 @@ elements.cleanupList.addEventListener("click", (event) => {
   const open = event.target.closest("button[data-open-group]");
   if (open) {
     cleanupState.groupKey = open.dataset.openGroup;
-    cleanupState.page = 1;
+    syncCleanupPageInput();
     void loadCleanupPage();
     return;
   }
   const back = event.target.closest("button[data-cleanup-back]");
   if (back) {
     cleanupState.groupKey = null;
-    cleanupState.page = 1;
     void loadCleanupPage();
     return;
   }

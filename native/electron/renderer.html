@@ -280,7 +280,12 @@
                 </div>
                 <nav class="cleanup-pagination" aria-label="附件瘦身清單分頁">
                   <button id="cleanup-prev" disabled>上一頁</button>
-                  <span id="cleanup-page-info">第 1 頁</span>
+                  <label class="cleanup-page-jump">
+                    <span>第</span>
+                    <input id="cleanup-page-input" type="number" min="1" step="1" inputmode="numeric" value="1" aria-label="清理聊天室頁碼">
+                    <span>/ <span id="cleanup-page-total">1</span> 頁</span>
+                  </label>
+                  <span id="cleanup-page-info" aria-live="polite"></span>
                   <button id="cleanup-next" disabled>下一頁</button>
                 </nav>
               </div>

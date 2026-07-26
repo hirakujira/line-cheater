@@ -62,6 +62,8 @@ grouped below rather than treated as separate feature changes.
   (`arm64`) and Intel (`x64`), resolves both assets from the latest formal
   GitHub Release, highlights a detected architecture when available, and keeps
   the Windows x64 download alongside them.
+- The cleanup chat list now supports direct page-number jumps and preserves the
+  overview page when entering a chat detail and returning to the list.
 
 ## Goal
 
