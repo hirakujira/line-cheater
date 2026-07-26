@@ -3,10 +3,13 @@ use std::collections::HashSet;
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::sync_channel;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 use zip::ZipArchive;
@@ -19,6 +22,7 @@ use crate::model::{
     DuplicateGroupCursor, DuplicateGroupPage, DuplicateHashProgress, DuplicateMemberPage, Message,
     MessageAttachment, checked_page_size,
 };
+use crate::performance::system_performance_profile;
 use crate::source::SourceKind;
 
 const CATALOG_BATCH_SIZE: usize = 1_000;
@@ -29,6 +33,7 @@ const MAX_CLEANUP_RESPONSE_FILES: usize = 1_000;
 const MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STAGED_PREVIEWS: usize = 32;
 const CONTEXT_INDEX_VERSION: &str = "3";
+const CHAT_INDEX_VERSION: &str = "1";
 const CLEANUP_GROUP_EXPR: &str = "
     CASE f.reference_status
         WHEN 'unreferenced' THEN '__unreferenced__'
@@ -158,7 +163,16 @@ impl Catalog {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
-        connection.pragma_update(None, "cache_size", -32_768_i64)?;
+        connection.pragma_update(
+            None,
+            "cache_size",
+            system_performance_profile().catalog_cache_kib,
+        )?;
+        connection.pragma_update(
+            None,
+            "threads",
+            system_performance_profile().sqlite_workers as i64,
+        )?;
         connection.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS meta (
@@ -212,6 +226,23 @@ impl Catalog {
                 marked_at INTEGER NOT NULL,
                 PRIMARY KEY(source, message_pk)
             );
+            CREATE TABLE IF NOT EXISTS chats (
+                source TEXT NOT NULL CHECK(source IN ('line', 'square')),
+                chat_pk INTEGER NOT NULL,
+                chat_id TEXT NOT NULL,
+                chat_type INTEGER NOT NULL,
+                chat_kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                title_source TEXT NOT NULL,
+                message_count INTEGER NOT NULL,
+                human_message_count INTEGER NOT NULL,
+                last_updated INTEGER NOT NULL,
+                last_message TEXT NOT NULL,
+                PRIMARY KEY(source, chat_pk)
+            );
+            CREATE INDEX IF NOT EXISTS chats_page
+                ON chats(last_updated DESC, source ASC, chat_pk ASC)
+                WHERE message_count > 0;
             CREATE VIEW IF NOT EXISTS all_removal_plan AS
                 SELECT path FROM removal_plan
                 UNION
@@ -302,10 +333,32 @@ impl Catalog {
         if stored_fingerprint != source_metadata_fingerprint(&current, kind)? {
             return Ok(false);
         }
-        self.content_matches_catalog(&current, kind)
+        if !self.content_matches_catalog(&current, kind)? {
+            return Ok(false);
+        }
+        if kind == SourceKind::ImazingArchive {
+            return Ok(stored_fingerprint == source_metadata_fingerprint(&current, kind)?);
+        }
+        Ok(true)
     }
 
     fn content_matches_catalog(&self, source: &Path, kind: SourceKind) -> Result<bool> {
+        if kind == SourceKind::ImazingArchive {
+            let file_count =
+                self.connection
+                    .query_row("SELECT COUNT(*) FROM files", [], |row| row.get::<_, i64>(0))?;
+            let source_bytes = fs::metadata(source)?.len();
+            let workers = system_performance_profile()
+                .archive_workers_for(source_bytes, file_count.max(0) as usize);
+            if workers > 1 {
+                return validate_archive_catalog_parallel(
+                    source,
+                    &self.path,
+                    workers,
+                    file_count.max(0) as usize,
+                );
+            }
+        }
         let mut statement = self.connection.prepare(
             "SELECT path, bytes, modified_ns, content_sha256
              FROM files ORDER BY path ASC",
@@ -458,7 +511,9 @@ impl Catalog {
             self.clear_all_removal_plans()?;
             self.connection
                 .execute("UPDATE files SET sha256 = NULL", [])?;
+            self.connection.execute("DELETE FROM chats", [])?;
             self.set_meta("hash_status", "not_started")?;
+            self.set_meta("chat_index_status", "not_started")?;
         }
         self.set_meta("source_fingerprint", &source_fingerprint)?;
         let resume_scan = matches!(
@@ -486,6 +541,8 @@ impl Catalog {
         };
         self.set_meta("scan_id", &scan_id.to_string())?;
         self.set_meta("scan_status", "scanning")?;
+        self.set_meta("chat_index_status", "not_started")?;
+        self.connection.execute("DELETE FROM chats", [])?;
         if !resume_scan {
             self.set_meta("scan_last_path", "")?;
         }
@@ -549,15 +606,13 @@ impl Catalog {
             }
             SourceKind::ImazingArchive => {
                 let file = File::open(&source)?;
-                let mut archive = ZipArchive::new(file)?;
-                for index in 0..archive.len() {
-                    let mut entry = archive.by_index(index)?;
-                    if entry.is_dir() {
-                        continue;
-                    }
-                    let path = String::from_utf8_lossy(entry.name_raw()).replace('\\', "/");
-                    let content_sha256 = hash_reader(&mut entry)?;
-                    batch.push(file_record(path, entry.size(), 0, content_sha256));
+                let archive = ZipArchive::new(file)?;
+                let entry_count = archive.len();
+                drop(archive);
+                let workers = system_performance_profile()
+                    .archive_workers_for(fs::metadata(&source)?.len(), entry_count);
+                scan_archive_records_parallel(&source, entry_count, workers, |record| {
+                    batch.push(record);
                     update_progress(&mut progress, batch.last().expect("record exists"));
                     if batch.len() == CATALOG_BATCH_SIZE {
                         let last_path = batch.last().expect("record exists").path.clone();
@@ -565,7 +620,8 @@ impl Catalog {
                         self.set_meta("scan_last_path", &last_path)?;
                         on_progress(progress);
                     }
-                }
+                    Ok(())
+                })?;
             }
             SourceKind::Sqlite => {
                 let metadata = fs::metadata(&source)?;
@@ -591,6 +647,11 @@ impl Catalog {
             let last_path = batch.last().expect("record exists").path.clone();
             self.upsert_batch(scan_id, &mut batch)?;
             self.set_meta("scan_last_path", &last_path)?;
+        }
+        if kind == SourceKind::ImazingArchive
+            && source_metadata_fingerprint(&source, kind)? != source_fingerprint
+        {
+            bail!("source .imazingapp changed while its catalog was being scanned");
         }
         self.connection
             .execute("DELETE FROM files WHERE seen_scan <> ?1", [scan_id])?;
@@ -1042,6 +1103,173 @@ impl Catalog {
             chat.planned_for_removal = planned.contains(&(chat.source.clone(), chat.pk));
         }
         Ok(())
+    }
+
+    pub fn replace_chat_index(&mut self, chats: &[Chat]) -> Result<()> {
+        self.set_meta("chat_index_status", "indexing")?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute("DELETE FROM chats", [])?;
+        {
+            let mut insert = transaction.prepare(
+                "
+                INSERT OR REPLACE INTO chats(
+                    source, chat_pk, chat_id, chat_type, chat_kind, title, title_source,
+                    message_count, human_message_count, last_updated, last_message
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ",
+            )?;
+            for chat in chats {
+                if !matches!(chat.source.as_str(), "line" | "square") {
+                    bail!("chat index source must be `line` or `square`");
+                }
+                insert.execute(params![
+                    chat.source,
+                    chat.pk,
+                    chat.id,
+                    chat.chat_type,
+                    chat.kind,
+                    chat.title,
+                    chat.title_source,
+                    chat.message_count,
+                    chat.human_message_count,
+                    chat.last_updated,
+                    chat.last_message,
+                ])?;
+            }
+        }
+        transaction.commit()?;
+        self.set_meta("chat_index_version", CHAT_INDEX_VERSION)?;
+        self.set_meta("chat_index_status", "complete")?;
+        self.set_meta("chat_index_completed_at", &unix_seconds().to_string())?;
+        Ok(())
+    }
+
+    pub fn chat_index_is_current(&self) -> Result<bool> {
+        Ok(
+            self.meta("chat_index_status")?.as_deref() == Some("complete")
+                && self.meta("chat_index_version")?.as_deref() == Some(CHAT_INDEX_VERSION),
+        )
+    }
+
+    pub fn list_indexed_chats(
+        &self,
+        after_cursor: Option<crate::model::ChatCursor>,
+        before_cursor: Option<crate::model::ChatCursor>,
+        limit: u32,
+    ) -> Result<crate::model::ChatPage> {
+        if after_cursor.is_some() && before_cursor.is_some() {
+            bail!("chat pagination cannot use both after and before cursors");
+        }
+        if !self.chat_index_is_current()? {
+            bail!("derived chat index is not ready");
+        }
+        let limit = checked_page_size(limit)?;
+        let boundary = after_cursor.as_ref().or(before_cursor.as_ref());
+        let cursor_filter = if before_cursor.is_some() {
+            "
+            AND (
+                c.last_updated > ?1
+                OR (
+                    c.last_updated = ?1
+                    AND (
+                        c.source < ?2
+                        OR (c.source = ?2 AND c.chat_pk < ?3)
+                    )
+                )
+            )
+            "
+        } else if after_cursor.is_some() {
+            "
+            AND (
+                c.last_updated < ?1
+                OR (
+                    c.last_updated = ?1
+                    AND (
+                        c.source > ?2
+                        OR (c.source = ?2 AND c.chat_pk > ?3)
+                    )
+                )
+            )
+            "
+        } else {
+            ""
+        };
+        let order = if before_cursor.is_some() {
+            "c.last_updated ASC, c.source DESC, c.chat_pk DESC"
+        } else {
+            "c.last_updated DESC, c.source ASC, c.chat_pk ASC"
+        };
+        let sql = format!(
+            "
+            SELECT c.chat_pk, c.source, c.chat_id, c.chat_type, c.chat_kind, c.title,
+                   c.title_source, c.message_count, c.human_message_count, c.last_updated,
+                   c.last_message,
+                   EXISTS(
+                       SELECT 1 FROM chat_removal_plan planned
+                       WHERE planned.source = c.source AND planned.chat_pk = c.chat_pk
+                   )
+            FROM chats c
+            WHERE c.message_count > 0
+            {cursor_filter}
+            ORDER BY {order}
+            LIMIT ?4
+            "
+        );
+        let fallback_cursor = crate::model::ChatCursor {
+            last_updated: i64::MAX,
+            source: "line".to_string(),
+            pk: 0,
+        };
+        let cursor = boundary.unwrap_or(&fallback_cursor);
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut rows = statement.query(params![
+            cursor.last_updated,
+            cursor.source,
+            cursor.pk,
+            limit as i64 + 1
+        ])?;
+        let mut items = Vec::with_capacity(limit);
+        while let Some(row) = rows.next()? {
+            items.push(Chat {
+                pk: row.get(0)?,
+                source: row.get(1)?,
+                id: row.get(2)?,
+                chat_type: row.get(3)?,
+                kind: row.get(4)?,
+                title: row.get(5)?,
+                title_source: row.get(6)?,
+                message_count: row.get(7)?,
+                human_message_count: row.get(8)?,
+                last_updated: row.get(9)?,
+                last_message: row.get(10)?,
+                planned_for_removal: row.get(11)?,
+            });
+        }
+        let has_extra = items.len() > limit;
+        if has_extra {
+            items.pop();
+        }
+        if before_cursor.is_some() {
+            items.reverse();
+        }
+        let next_cursor = if (before_cursor.is_some() && !items.is_empty()) || has_extra {
+            items.last().map(|chat| crate::model::ChatCursor {
+                last_updated: chat.last_updated,
+                source: chat.source.clone(),
+                pk: chat.pk,
+            })
+        } else {
+            None
+        };
+        Ok(crate::model::ChatPage {
+            items,
+            next_cursor,
+            has_previous: if before_cursor.is_some() {
+                has_extra
+            } else {
+                after_cursor.is_some()
+            },
+        })
     }
 
     pub fn set_chat_removal_planned(&self, chat: &Chat, planned: bool, reason: &str) -> Result<()> {
@@ -2726,6 +2954,198 @@ fn hash_reader(mut reader: impl Read) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+fn scan_archive_records_parallel<F>(
+    source: &Path,
+    entry_count: usize,
+    workers: usize,
+    mut on_record: F,
+) -> Result<()>
+where
+    F: FnMut(FileRecord) -> Result<()>,
+{
+    let workers = workers.clamp(1, entry_count.max(1));
+    if workers == 1 {
+        let mut archive = ZipArchive::new(File::open(source)?)?;
+        for index in 0..entry_count {
+            let mut entry = archive.by_index(index)?;
+            if entry.is_dir() {
+                continue;
+            }
+            let path = String::from_utf8_lossy(entry.name_raw()).replace('\\', "/");
+            let bytes = entry.size();
+            let content_sha256 = hash_reader(&mut entry)?;
+            on_record(file_record(path, bytes, 0, content_sha256))?;
+        }
+        return Ok(());
+    }
+
+    let next_index = AtomicUsize::new(0);
+    let cancelled = AtomicBool::new(false);
+    let (sender, receiver) = sync_channel::<Result<FileRecord>>(workers.saturating_mul(2));
+    let mut callback_error = None;
+    let mut worker_error = None;
+    thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let next_index = &next_index;
+            let cancelled = &cancelled;
+            handles.push(scope.spawn(move || {
+                let outcome = (|| -> Result<()> {
+                    let mut archive = ZipArchive::new(File::open(source)?)?;
+                    loop {
+                        if cancelled.load(Ordering::Relaxed) {
+                            return Ok(());
+                        }
+                        let index = next_index.fetch_add(1, Ordering::Relaxed);
+                        if index >= entry_count {
+                            return Ok(());
+                        }
+                        let mut entry = archive.by_index(index)?;
+                        if entry.is_dir() {
+                            continue;
+                        }
+                        let path = String::from_utf8_lossy(entry.name_raw()).replace('\\', "/");
+                        let bytes = entry.size();
+                        let content_sha256 = hash_reader(&mut entry)?;
+                        if sender
+                            .send(Ok(file_record(path, bytes, 0, content_sha256)))
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
+                    }
+                })();
+                if let Err(error) = outcome {
+                    cancelled.store(true, Ordering::Relaxed);
+                    let _ = sender.send(Err(error));
+                }
+            }));
+        }
+        drop(sender);
+        for result in receiver {
+            if callback_error.is_some() || worker_error.is_some() {
+                continue;
+            }
+            match result {
+                Ok(record) => {
+                    if let Err(error) = on_record(record) {
+                        cancelled.store(true, Ordering::Relaxed);
+                        callback_error = Some(error);
+                    }
+                }
+                Err(error) => {
+                    cancelled.store(true, Ordering::Relaxed);
+                    worker_error = Some(error);
+                }
+            }
+        }
+        for handle in handles {
+            if handle.join().is_err() && worker_error.is_none() {
+                worker_error = Some(anyhow::anyhow!("archive scan worker panicked"));
+            }
+        }
+    });
+    if let Some(error) = callback_error.or(worker_error) {
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn validate_archive_catalog_parallel(
+    source: &Path,
+    catalog_path: &Path,
+    workers: usize,
+    file_count: usize,
+) -> Result<bool> {
+    if file_count == 0 {
+        return Ok(true);
+    }
+    let workers = workers.clamp(1, file_count);
+    let bounds_connection = open_catalog_read_only(catalog_path)?;
+    let (minimum_id, maximum_id): (i64, i64) = bounds_connection.query_row(
+        "SELECT COALESCE(MIN(id), 0), COALESCE(MAX(id), 0) FROM files",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    drop(bounds_connection);
+    let id_span = u64::try_from(i128::from(maximum_id) - i128::from(minimum_id) + 1)
+        .context("catalog file ID range is invalid")?;
+    let ids_per_worker = id_span.div_ceil(workers as u64);
+    let cancelled = AtomicBool::new(false);
+    let mut matches = true;
+    thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let cancelled = &cancelled;
+            handles.push(scope.spawn(move || -> Result<bool> {
+                let outcome = (|| -> Result<bool> {
+                    let first_id =
+                        i128::from(minimum_id) + i128::from(ids_per_worker) * worker as i128;
+                    let last_id =
+                        (first_id + i128::from(ids_per_worker) - 1).min(i128::from(maximum_id));
+                    let first_id =
+                        i64::try_from(first_id).context("catalog worker ID range overflow")?;
+                    let last_id =
+                        i64::try_from(last_id).context("catalog worker ID range overflow")?;
+                    let connection = open_catalog_read_only(catalog_path)?;
+                    let mut statement = connection.prepare(
+                        "SELECT path, bytes, content_sha256
+                         FROM files
+                         WHERE id BETWEEN ?1 AND ?2
+                         ORDER BY id ASC",
+                    )?;
+                    let mut rows = statement.query(params![first_id, last_id])?;
+                    let mut archive = ZipArchive::new(File::open(source)?)?;
+                    while let Some(row) = rows.next()? {
+                        if cancelled.load(Ordering::Relaxed) {
+                            return Ok(true);
+                        }
+                        let path: String = row.get(0)?;
+                        let bytes = row.get::<_, i64>(1)?.max(0) as u64;
+                        let Some(expected_digest) = row.get::<_, Option<String>>(2)? else {
+                            cancelled.store(true, Ordering::Relaxed);
+                            return Ok(false);
+                        };
+                        let mut entry = match archive.by_name(&path) {
+                            Ok(entry) => entry,
+                            Err(_) => {
+                                cancelled.store(true, Ordering::Relaxed);
+                                return Ok(false);
+                            }
+                        };
+                        if entry.size() != bytes || hash_reader(&mut entry)? != expected_digest {
+                            cancelled.store(true, Ordering::Relaxed);
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                })();
+                if outcome.is_err() {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+                outcome
+            }));
+        }
+        for handle in handles {
+            let worker_matches = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("archive validation worker panicked"))??;
+            matches &= worker_matches;
+        }
+        Ok(())
+    })?;
+    Ok(matches)
+}
+
+fn open_catalog_read_only(path: &Path) -> Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let connection = Connection::open_with_flags(path, flags)?;
+    connection.pragma_update(None, "query_only", true)?;
+    connection.pragma_update(None, "trusted_schema", false)?;
+    Ok(connection)
+}
+
 fn safe_source_join(source: &Path, relative: &str) -> Result<PathBuf> {
     if relative.is_empty()
         || relative.starts_with('/')
@@ -2801,6 +3221,78 @@ fn validate_sha256(value: &str) -> Result<()> {
         bail!("sha256 must contain exactly 64 hexadecimal characters");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::io::Write;
+    use std::path::Path;
+
+    use tempfile::TempDir;
+    use zip::ZipWriter;
+    use zip::write::SimpleFileOptions;
+
+    use super::{
+        Catalog, FileRecord, scan_archive_records_parallel, validate_archive_catalog_parallel,
+    };
+    use crate::source::SourceKind;
+
+    fn write_archive(path: &Path, entries: usize, changed_entry: Option<usize>) {
+        let mut writer = ZipWriter::new(File::create(path).unwrap());
+        let options = SimpleFileOptions::default();
+        for index in 0..entries {
+            writer
+                .start_file(format!("payload/{index:04}.bin"), options)
+                .unwrap();
+            let fill = if changed_entry == Some(index) {
+                b'X'
+            } else {
+                b'A' + u8::try_from(index % 20).unwrap()
+            };
+            writer.write_all(&vec![fill; 32 * 1024]).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    fn record_map(records: Vec<FileRecord>) -> BTreeMap<String, (u64, String)> {
+        records
+            .into_iter()
+            .map(|record| (record.path, (record.bytes, record.content_sha256)))
+            .collect()
+    }
+
+    #[test]
+    fn parallel_archive_hashing_matches_sequential_results_and_detects_changes() {
+        let temporary = TempDir::new().unwrap();
+        let archive_path = temporary.path().join("parallel.imazingapp");
+        write_archive(&archive_path, 48, None);
+
+        let mut sequential = Vec::new();
+        scan_archive_records_parallel(&archive_path, 48, 1, |record| {
+            sequential.push(record);
+            Ok(())
+        })
+        .unwrap();
+        let mut parallel = Vec::new();
+        scan_archive_records_parallel(&archive_path, 48, 4, |record| {
+            parallel.push(record);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(record_map(parallel), record_map(sequential));
+
+        let catalog_path = temporary.path().join("catalog.sqlite");
+        let mut catalog = Catalog::open(&catalog_path).unwrap();
+        catalog
+            .scan_source(&archive_path, SourceKind::ImazingArchive, |_| {})
+            .unwrap();
+        assert!(validate_archive_catalog_parallel(&archive_path, &catalog_path, 4, 48).unwrap());
+
+        write_archive(&archive_path, 48, Some(17));
+        assert!(!validate_archive_catalog_parallel(&archive_path, &catalog_path, 4, 48).unwrap());
+    }
 }
 
 fn attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentItem> {

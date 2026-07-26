@@ -14,6 +14,7 @@ use crate::model::{
     AdvancedCleanupReport, AttachmentCursor, AttachmentKind, Chat, ChatCursor, ChatPage,
     CleanupGroupPage, DEFAULT_PAGE_SIZE, DuplicateGroupCursor, MessageCursor, MessagePage,
 };
+use crate::performance::system_performance_profile;
 use crate::source::{PreparedSource, prepare_source_reporting};
 
 pub const SIDECAR_PROTOCOL_VERSION: u32 = 1;
@@ -27,6 +28,7 @@ pub struct NativeSession {
     catalog: Catalog,
     fts5_index: Option<Fts5MessageIndex>,
     quick_check: Option<String>,
+    catalog_source_verified: bool,
 }
 
 impl NativeSession {
@@ -75,6 +77,7 @@ impl NativeSession {
             catalog,
             fts5_index,
             quick_check: None,
+            catalog_source_verified: false,
         })
     }
 
@@ -85,6 +88,19 @@ impl NativeSession {
         let value = self.database.quick_check()?;
         self.quick_check = Some(value.clone());
         Ok(value)
+    }
+
+    fn rebuild_chat_index(&mut self) -> Result<()> {
+        let mut chats = self.database.chats_for_index()?;
+        self.database.enrich_chat_titles(
+            &mut chats,
+            self.unified_group_database.as_ref(),
+            self.square_database.as_ref(),
+        )?;
+        if let Some(square_database) = self.square_database.as_ref() {
+            chats.extend(square_database.chats_for_index()?);
+        }
+        self.catalog.replace_chat_index(&chats)
     }
 
     fn search_messages_with_fts<W: Write>(
@@ -415,10 +431,16 @@ fn handle_request<W: Write>(
         }
         "sessionInfo" => {
             let quick_check = session.quick_check()?;
+            let performance = system_performance_profile();
             let active_job = session
                 .catalog
                 .active_job()?
                 .map(|(kind, job_id)| json!({ "kind": kind, "jobId": job_id }));
+            let catalog_source_current = session.catalog.source_matches_current(
+                &session.prepared.original_path,
+                session.prepared.report.kind,
+            )?;
+            session.catalog_source_verified = catalog_source_current;
             Ok(json!({
                 "protocolVersion": SIDECAR_PROTOCOL_VERSION,
                 "source": session.prepared.report,
@@ -426,14 +448,18 @@ fn handle_request<W: Write>(
                 "quickCheck": quick_check,
                 "lineSquareLoaded": session.square_database.is_some(),
                 "unifiedGroupLoaded": session.unified_group_database.is_some(),
-                "catalogSourceCurrent": session
-                    .catalog
-                    .source_matches_current(
-                        &session.prepared.original_path,
-                        session.prepared.report.kind,
-                    )?,
+                "catalogSourceCurrent": catalog_source_current,
                 "activeJob": active_job,
                 "fts5Available": session.fts5_index.is_some(),
+                "performance": {
+                    "logicalCpus": performance.logical_cpus,
+                    "physicalMemoryBytes": performance.physical_memory_bytes,
+                    "archiveWorkers": performance.archive_workers,
+                    "sqliteWorkers": performance.sqlite_workers,
+                    "lineCacheKiB": performance.line_cache_kib.unsigned_abs(),
+                    "lineMmapBytes": performance.line_mmap_bytes,
+                    "catalogCacheKiB": performance.catalog_cache_kib.unsigned_abs(),
+                },
                 "catalog": session.catalog.stats()?,
             }))
         }
@@ -441,6 +467,16 @@ fn handle_request<W: Write>(
             let params: ChatPageParams = parse_params(request)?;
             if params.cursor.is_some() && params.before_cursor.is_some() {
                 anyhow::bail!("chat pagination cannot use both cursor and beforeCursor");
+            }
+            if session.catalog_source_verified && !session.catalog.chat_index_is_current()? {
+                session.rebuild_chat_index()?;
+            }
+            if session.catalog_source_verified && session.catalog.chat_index_is_current()? {
+                return Ok(serde_json::to_value(session.catalog.list_indexed_chats(
+                    params.cursor,
+                    params.before_cursor,
+                    params.limit,
+                )?)?);
             }
             let line_page = if let Some(cursor) = params.before_cursor.clone() {
                 session.database.list_chats_before(cursor, params.limit)?
@@ -656,6 +692,8 @@ fn handle_request<W: Write>(
                     );
                 },
             )?;
+            session.rebuild_chat_index()?;
+            session.catalog_source_verified = true;
             let stats = session.catalog.stats()?;
             session.catalog.clear_active_job("scan")?;
             Ok(serde_json::to_value(stats)?)

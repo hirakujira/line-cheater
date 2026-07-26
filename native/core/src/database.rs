@@ -8,6 +8,7 @@ use crate::model::{
     AttachmentContext, Chat, ChatCursor, ChatPage, MAX_PAGE_SIZE, Message, MessageCursor,
     MessagePage, checked_page_size,
 };
+use crate::performance::system_performance_profile;
 
 const SQLITE_QUERY_BATCH_SIZE: usize = 900;
 
@@ -64,6 +65,16 @@ impl Fts5MessageIndex {
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         connection.pragma_update(None, "temp_store", "FILE")?;
+        connection.pragma_update(
+            None,
+            "cache_size",
+            system_performance_profile().catalog_cache_kib,
+        )?;
+        connection.pragma_update(
+            None,
+            "threads",
+            system_performance_profile().sqlite_workers as i64,
+        )?;
         connection.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS fts_meta (
@@ -272,10 +283,12 @@ impl LineDatabase {
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
         let connection = Connection::open_with_flags(path, flags)
             .with_context(|| format!("cannot open SQLite read-only: {}", path.display()))?;
+        let performance = system_performance_profile();
         connection.pragma_update(None, "query_only", true)?;
-        connection.pragma_update(None, "cache_size", -65_536_i64)?;
+        connection.pragma_update(None, "cache_size", performance.line_cache_kib)?;
         connection.pragma_update(None, "temp_store", "FILE")?;
-        connection.pragma_update(None, "mmap_size", 268_435_456_i64)?;
+        connection.pragma_update(None, "mmap_size", performance.line_mmap_bytes)?;
+        connection.pragma_update(None, "threads", performance.sqlite_workers as i64)?;
         connection.pragma_update(None, "trusted_schema", false)?;
 
         let chat_columns = table_columns(&connection, "ZCHAT")?;
@@ -433,6 +446,173 @@ impl LineDatabase {
 
     pub fn list_chats(&self, cursor: Option<ChatCursor>, limit: u32) -> Result<ChatPage> {
         self.list_chats_with_boundaries(cursor, None, limit)
+    }
+
+    /// Builds a disposable chat index with one bounded set of source-table scans.
+    ///
+    /// This deliberately does not add an index to the LINE database. Some LINE schemas do not
+    /// index `ZMESSAGE.ZCHAT`, which makes the correlated count queries used by interactive
+    /// fallback pagination scan the message table once per chat. The desktop persists these
+    /// derived rows in its private `catalog.sqlite` instead.
+    pub fn chats_for_index(&self) -> Result<Vec<Chat>> {
+        if !self.message_columns.contains("ZCHAT") {
+            return Ok(Vec::new());
+        }
+        let chat_id = text_expr("c", &self.chat_columns, &["ZMID", "ZID"]);
+        let chat_type = integer_expr("c", &self.chat_columns, "ZTYPE", "0");
+        let chat_name = text_expr("c", &self.chat_columns, &["ZNAME"]);
+        let last_message = text_expr("c", &self.chat_columns, &["ZLASTMESSAGE"]);
+        let timestamp = integer_expr("m", &self.message_columns, "ZTIMESTAMP", "0");
+        let last_updated = if self.chat_columns.contains("ZLASTUPDATED") {
+            "CAST(COALESCE(c.ZLASTUPDATED, 0) AS INTEGER)".to_string()
+        } else {
+            "CAST(COALESCE(stats.last_updated, 0) AS INTEGER)".to_string()
+        };
+        let (message_count, stats_join) = if self.chat_columns.contains("ZMESSAGECOUNT") {
+            (
+                "CAST(COALESCE(c.ZMESSAGECOUNT, 0) AS INTEGER)".to_string(),
+                "LEFT JOIN",
+            )
+        } else {
+            ("stats.message_count".to_string(), "JOIN")
+        };
+        let human_predicate = human_message_predicate("m", &self.message_columns);
+        let rename_text = if self.message_columns.contains("ZCONTENTTYPE")
+            && self.message_columns.contains("ZTEXT")
+        {
+            "COALESCE(rename.text, '')"
+        } else {
+            "''"
+        };
+        let rename_cte = if self.message_columns.contains("ZCONTENTTYPE")
+            && self.message_columns.contains("ZTEXT")
+        {
+            let rename_timestamp = integer_expr("r", &self.message_columns, "ZTIMESTAMP", "0");
+            format!(
+                ",
+                rename_messages AS (
+                    SELECT chat_pk, text
+                    FROM (
+                        SELECT CAST(r.ZCHAT AS INTEGER) AS chat_pk,
+                               CAST(r.ZTEXT AS TEXT) AS text,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY r.ZCHAT
+                                   ORDER BY {rename_timestamp} DESC, r.Z_PK DESC
+                               ) AS position
+                        FROM ZMESSAGE r
+                        WHERE CAST(r.ZCONTENTTYPE AS INTEGER) = 18
+                          AND r.ZTEXT IS NOT NULL
+                          AND (
+                              r.ZTEXT LIKE '%群組名稱%'
+                              OR LOWER(CAST(r.ZTEXT AS TEXT)) LIKE '%group%name%'
+                          )
+                    )
+                    WHERE position = 1
+                )"
+            )
+        } else {
+            String::new()
+        };
+        let rename_join = if rename_cte.is_empty() {
+            ""
+        } else {
+            " LEFT JOIN rename_messages rename ON rename.chat_pk = c.Z_PK"
+        };
+        let can_join_user =
+            self.user_columns.contains("ZMID") && self.chat_columns.contains("ZMID");
+        let can_join_group =
+            self.group_columns.contains("ZID") && self.chat_columns.contains("ZMID");
+        let user_name = if can_join_user {
+            coalesced_text_expr(
+                "u",
+                &self.user_columns,
+                &["ZCUSTOMNAME", "ZADDRESSBOOKNAME", "ZNAME", "ZMID"],
+            )
+        } else {
+            "''".to_string()
+        };
+        let group_name = if can_join_group {
+            coalesced_text_expr("g", &self.group_columns, &["ZNAME", "ZID"])
+        } else {
+            "''".to_string()
+        };
+        let joins = format!(
+            "{}{}{}",
+            if can_join_user {
+                " LEFT JOIN ZUSER u ON CAST(u.ZMID AS TEXT) = CAST(c.ZMID AS TEXT)"
+            } else {
+                ""
+            },
+            if can_join_group {
+                " LEFT JOIN ZGROUP g ON CAST(g.ZID AS TEXT) = CAST(c.ZMID AS TEXT)"
+            } else {
+                ""
+            },
+            rename_join
+        );
+        let sql = format!(
+            "
+            WITH message_stats AS (
+                SELECT CAST(m.ZCHAT AS INTEGER) AS chat_pk,
+                       COUNT(*) AS message_count,
+                       SUM(CASE WHEN {human_predicate} THEN 1 ELSE 0 END)
+                           AS human_message_count,
+                       MAX({timestamp}) AS last_updated
+                FROM ZMESSAGE m
+                GROUP BY m.ZCHAT
+            )
+            {rename_cte}
+            SELECT CAST(c.Z_PK AS INTEGER), {chat_id}, {chat_type}, {chat_name},
+                   {user_name}, {group_name}, {message_count},
+                   CAST(COALESCE(stats.human_message_count, 0) AS INTEGER),
+                   {last_updated}, {last_message}, {rename_text}
+            FROM ZCHAT c
+            {stats_join} message_stats stats ON stats.chat_pk = c.Z_PK
+            {joins}
+            WHERE {message_count} > 0
+            ORDER BY {last_updated} DESC, c.Z_PK ASC
+            "
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut rows = statement.query([])?;
+        let mut chats = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(1)?;
+            let chat_type: i64 = row.get(2)?;
+            let chat_name: String = row.get(3)?;
+            let user_name: String = row.get(4)?;
+            let group_name: String = row.get(5)?;
+            let rename_text: String = row.get(10)?;
+            let rename_name = extract_group_name_from_system_text(&rename_text);
+            let (title, title_source) = if chat_type == 0 && !user_name.is_empty() {
+                (user_name, "user".to_string())
+            } else if chat_type != 0 && !group_name.is_empty() {
+                (group_name, "group".to_string())
+            } else if chat_type != 0 && !rename_name.is_empty() {
+                (rename_name, "rename".to_string())
+            } else if !chat_name.is_empty() {
+                (chat_name, "chat".to_string())
+            } else if !id.is_empty() {
+                (id.clone(), "id".to_string())
+            } else {
+                ("未命名聊天室".to_string(), "unresolved".to_string())
+            };
+            chats.push(Chat {
+                pk: row.get(0)?,
+                source: "line".to_string(),
+                id,
+                chat_type,
+                kind: chat_kind(chat_type).to_string(),
+                title,
+                title_source,
+                message_count: row.get(6)?,
+                human_message_count: row.get(7)?,
+                last_updated: row.get(8)?,
+                last_message: row.get(9)?,
+                planned_for_removal: false,
+            });
+        }
+        Ok(chats)
     }
 
     pub fn list_chats_before(&self, cursor: ChatCursor, limit: u32) -> Result<ChatPage> {
@@ -1166,10 +1346,12 @@ impl UnifiedGroupDatabase {
                 path.display()
             )
         })?;
+        let performance = system_performance_profile();
         connection.pragma_update(None, "query_only", true)?;
-        connection.pragma_update(None, "cache_size", -16_384_i64)?;
+        connection.pragma_update(None, "cache_size", performance.unified_cache_kib)?;
         connection.pragma_update(None, "temp_store", "FILE")?;
-        connection.pragma_update(None, "mmap_size", 67_108_864_i64)?;
+        connection.pragma_update(None, "mmap_size", performance.unified_mmap_bytes)?;
+        connection.pragma_update(None, "threads", performance.sqlite_workers as i64)?;
         connection.pragma_update(None, "trusted_schema", false)?;
         let group_columns = table_columns(&connection, "ZUNIFIEDGROUP")?;
         if !group_columns.contains("ZID") || !group_columns.contains("ZNAME") {
@@ -1235,10 +1417,12 @@ impl LineSquareDatabase {
                 path.display()
             )
         })?;
+        let performance = system_performance_profile();
         connection.pragma_update(None, "query_only", true)?;
-        connection.pragma_update(None, "cache_size", -32_768_i64)?;
+        connection.pragma_update(None, "cache_size", performance.square_cache_kib)?;
         connection.pragma_update(None, "temp_store", "FILE")?;
-        connection.pragma_update(None, "mmap_size", 134_217_728_i64)?;
+        connection.pragma_update(None, "mmap_size", performance.square_mmap_bytes)?;
+        connection.pragma_update(None, "threads", performance.sqlite_workers as i64)?;
         connection.pragma_update(None, "trusted_schema", false)?;
 
         let chat_columns = table_columns(&connection, "ZCHAT")?;
@@ -1430,6 +1614,131 @@ impl LineSquareDatabase {
 
     pub fn list_chats(&self, cursor: Option<ChatCursor>, limit: u32) -> Result<ChatPage> {
         self.list_chats_with_boundaries(cursor, None, limit)
+    }
+
+    pub fn chats_for_index(&self) -> Result<Vec<Chat>> {
+        if !self.message_columns.contains("ZCHAT") {
+            return Ok(Vec::new());
+        }
+        let chat_id = text_expr("c", &self.chat_columns, &["ZMID", "ZID"]);
+        let chat_type = integer_expr("c", &self.chat_columns, "ZTYPE", "100");
+        let chat_name = text_expr("c", &self.chat_columns, &["ZNAME"]);
+        let can_join_square =
+            self.chat_columns.contains("ZSQUARE") && self.square_columns.contains("Z_PK");
+        let square_name = if can_join_square {
+            text_expr("s", &self.square_columns, &["ZNAME"])
+        } else {
+            "''".to_string()
+        };
+        let square_join = if can_join_square {
+            " LEFT JOIN ZSQUARE s ON s.Z_PK = c.ZSQUARE"
+        } else {
+            ""
+        };
+        let timestamp = integer_expr("m", &self.message_columns, "ZTIMESTAMP", "0");
+        let human_predicate = human_message_predicate("m", &self.message_columns);
+        let last_updated = if self.chat_columns.contains("ZLASTUPDATED") {
+            "CAST(COALESCE(c.ZLASTUPDATED, 0) AS INTEGER)".to_string()
+        } else {
+            "CAST(COALESCE(stats.last_updated, 0) AS INTEGER)".to_string()
+        };
+        let (message_count, stats_join) = if self.chat_columns.contains("ZMESSAGECOUNT") {
+            (
+                "CAST(COALESCE(c.ZMESSAGECOUNT, 0) AS INTEGER)".to_string(),
+                "LEFT JOIN",
+            )
+        } else {
+            ("stats.message_count".to_string(), "JOIN")
+        };
+        let (latest_message_cte, latest_message_join, last_message) =
+            if self.chat_columns.contains("ZLASTMESSAGE") {
+                (
+                    String::new(),
+                    "",
+                    text_expr("c", &self.chat_columns, &["ZLASTMESSAGE"]),
+                )
+            } else if self.message_columns.contains("ZTEXT") {
+                let latest_timestamp =
+                    integer_expr("latest", &self.message_columns, "ZTIMESTAMP", "0");
+                (
+                    format!(
+                        ",
+                        latest_messages AS (
+                            SELECT chat_pk, text
+                            FROM (
+                                SELECT CAST(latest.ZCHAT AS INTEGER) AS chat_pk,
+                                       CAST(COALESCE(latest.ZTEXT, '') AS TEXT) AS text,
+                                       ROW_NUMBER() OVER (
+                                           PARTITION BY latest.ZCHAT
+                                           ORDER BY {latest_timestamp} DESC, latest.Z_PK DESC
+                                       ) AS position
+                                FROM ZMESSAGE latest
+                            )
+                            WHERE position = 1
+                        )"
+                    ),
+                    " LEFT JOIN latest_messages latest_message ON latest_message.chat_pk = c.Z_PK",
+                    "COALESCE(latest_message.text, '')".to_string(),
+                )
+            } else {
+                (String::new(), "", "''".to_string())
+            };
+        let sql = format!(
+            "
+            WITH message_stats AS (
+                SELECT CAST(m.ZCHAT AS INTEGER) AS chat_pk,
+                       COUNT(*) AS message_count,
+                       SUM(CASE WHEN {human_predicate} THEN 1 ELSE 0 END)
+                           AS human_message_count,
+                       MAX({timestamp}) AS last_updated
+                FROM ZMESSAGE m
+                GROUP BY m.ZCHAT
+            )
+            {latest_message_cte}
+            SELECT CAST(c.Z_PK AS INTEGER), {chat_id}, {chat_type}, {chat_name},
+                   {square_name}, {message_count},
+                   CAST(COALESCE(stats.human_message_count, 0) AS INTEGER),
+                   {last_updated}, {last_message}
+            FROM ZCHAT c
+            {stats_join} message_stats stats ON stats.chat_pk = c.Z_PK
+            {square_join}
+            {latest_message_join}
+            WHERE {message_count} > 0
+            ORDER BY {last_updated} DESC, c.Z_PK ASC
+            "
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        let mut rows = statement.query([])?;
+        let mut chats = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(1)?;
+            let chat_name: String = row.get(3)?;
+            let square_name: String = row.get(4)?;
+            let (title, title_source) = if !square_name.is_empty() {
+                (square_name, "line-square".to_string())
+            } else if !chat_name.is_empty() {
+                (chat_name, "chat".to_string())
+            } else if !id.is_empty() {
+                (id.clone(), "id".to_string())
+            } else {
+                ("未命名社群".to_string(), "unresolved".to_string())
+            };
+            chats.push(Chat {
+                pk: row.get(0)?,
+                source: "square".to_string(),
+                id,
+                chat_type: row.get(2)?,
+                kind: "community".to_string(),
+                title,
+                title_source,
+                message_count: row.get(5)?,
+                human_message_count: row.get(6)?,
+                last_updated: row.get(7)?,
+                last_message: row.get(8)?,
+                planned_for_removal: false,
+            });
+        }
+        Ok(chats)
     }
 
     pub fn list_chats_before(&self, cursor: ChatCursor, limit: u32) -> Result<ChatPage> {

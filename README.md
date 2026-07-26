@@ -37,6 +37,7 @@ LINE Cheater 是用來瀏覽、搜尋、整理與瘦身 iOS LINE App Container �
 - 附件分類、篩選、原圖／縮圖個別標記
 - 完全相同附件掃描與安全保留一份
 - 大型備份的有界記憶體處理與可續跑工作
+- 依 CPU／實體記憶體自動調整 SQLite cache、mmap 與平行封存驗證 worker
 - 進階移除指定聊天室、空聊天室、僅系統訊息聊天室及孤立 `LineSquare` 訊息
 - 在新建候選檔內重寫 SQLite、執行 `VACUUM`，並串流建立 ZIP64 `.imazingapp`
 

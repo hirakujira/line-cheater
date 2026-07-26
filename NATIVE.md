@@ -699,9 +699,27 @@ The source connection uses:
 
 - `SQLITE_OPEN_READ_ONLY`
 - `PRAGMA query_only=ON`
-- approximately 64 MiB suggested page cache
+- a hardware-scaled, bounded suggested page cache
 - file-backed temporary storage
 - a bounded memory-mapping ceiling
+
+The native core detects logical CPU availability and physical memory once per
+process. A low-memory two-core machine stays near the original 64 MiB main
+SQLite cache and one archive worker. Larger systems scale gradually, with hard
+ceilings of 12 archive workers, a 4 GiB main SQLite cache, a 16 GiB mmap request,
+eight SQLite auxiliary workers, and a 1 GiB catalog cache. SQLite allocates
+page-cache memory on demand; these are ceilings rather than eager reservations.
+`sessionInfo.performance` reports the detected resources and selected worker
+counts.
+
+`.imazingapp` catalog scans and persisted-catalog content verification process
+independent ZIP entries through that bounded worker pool. Each worker has its
+own archive reader and SHA-256 state, while one catalog connection remains the
+only writer. The source metadata fingerprint is checked again after parallel
+work so an archive changed during validation is rejected. A single large
+deflated entry, such as `Line.sqlite`, is one ZIP stream and cannot itself be
+split safely across cores; parallelism primarily accelerates archives with many
+independent database, attachment, and metadata entries.
 
 Message pagination is keyset-based:
 
@@ -723,10 +741,17 @@ LINE schema differs by version, so query construction checks table columns
 before referring to optional fields. New schema variants must be added with
 fixtures and must preserve fallback behavior.
 
-The core currently queries message counts per chat when `ZCHAT.ZMESSAGECOUNT`
-does not exist. This may be slow on a database without an index on
-`ZMESSAGE(ZCHAT, ZTIMESTAMP, Z_PK)`. Never modify the source to add that index;
-future work should persist chat statistics in `catalog.sqlite`.
+During the attachment scan, the core now aggregates chat statistics with a
+bounded set of source-table scans and persists the derived rows in
+`catalog.sqlite`. Chat paging then uses the disposable catalog index instead of
+running per-chat counts against `ZMESSAGE`. This avoids repeated full scans on
+LINE databases that do not have an index beginning with `ZMESSAGE.ZCHAT`.
+Direct-SQLite diagnostic sessions and pre-scan requests retain the compatible
+read-only query fallback. The source database is never modified to add an index
+or cache table. A persisted chat index is served only after the current session
+has completed the existing source/catalog content verification; a changed or
+unverified source falls back to the read-only source query until the derived
+index is rebuilt.
 
 `searchMessages` uses a disposable `search.sqlite` FTS5 database in the work
 directory after the catalog's source content has been verified. The index copies
