@@ -12,6 +12,7 @@ const {
   sessionWorkDir
 } = require("./session-cache.cjs");
 const { SidecarClient } = require("./sidecar-client.cjs");
+const { findAvailableUpdate } = require("./update-checker.cjs");
 
 app.setName("LINE Cheater");
 
@@ -61,10 +62,38 @@ let mainWindow = null;
 let sidecar = null;
 let activeSource = null;
 let activeOperation = null;
+let updateCheckStarted = false;
 const outputTokens = new Map();
 const previewTokens = new Map();
 const MAX_PREVIEW_TOKENS = 128;
 const MAX_PREVIEW_BYTES = 16 * 1024 * 1024;
+
+async function checkForUpdates() {
+  if (updateCheckStarted || !app.isPackaged) return;
+  updateCheckStarted = true;
+  try {
+    const update = await findAvailableUpdate(
+      app.getVersion(),
+      (url, options) => net.fetch(url, options)
+    );
+    if (!update || !mainWindow || mainWindow.isDestroyed()) return;
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: "info",
+      title: "有新版本可用",
+      message: `LINE Cheater ${update.latestVersion} 已經發布`,
+      detail: `目前版本：${update.currentVersion}\n是否前往 GitHub Releases 下載更新？`,
+      buttons: ["前往下載", "稍後再說"],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true
+    });
+    if (response === 0) {
+      await shell.openExternal(update.releaseUrl, { activate: true });
+    }
+  } catch (error) {
+    console.warn(`Unable to check for LINE Cheater updates: ${error.message}`);
+  }
+}
 
 function assertTrustedSender(event) {
   if (!mainWindow || event.sender !== mainWindow.webContents) {
@@ -384,7 +413,10 @@ function createWindow() {
   mainWindow.webContents.on("will-navigate", (event, url) => {
     if (!url.startsWith(`${APP_ORIGIN}/`)) event.preventDefault();
   });
-  mainWindow.once("ready-to-show", () => mainWindow.show());
+  mainWindow.once("ready-to-show", () => {
+    mainWindow.show();
+    void checkForUpdates();
+  });
   mainWindow.on("closed", () => {
     mainWindow = null;
     if (sidecar) void sidecar.dispose();
