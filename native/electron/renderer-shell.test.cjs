@@ -24,6 +24,14 @@ const dmgNotarizer = fs.readFileSync(
   path.join(root, "scripts", "notarize-dmg.sh"),
   "utf8"
 );
+const signingImporter = fs.readFileSync(
+  path.join(root, "scripts", "import-signing-keychain.sh"),
+  "utf8"
+);
+const packageVerifier = fs.readFileSync(
+  path.join(root, "scripts", "verify-macos-package.sh"),
+  "utf8"
+);
 const macWorkflow = fs.readFileSync(
   path.join(root, "../../.github/workflows/release-macos.yml"),
   "utf8"
@@ -420,13 +428,20 @@ test("provides a self-checking DMG packaging script", () => {
 
 test("requires signing material for the dual-architecture macOS release", () => {
   assert.match(macWorkflow, /MACOS_CERTIFICATE_BASE64/);
-  assert.match(macWorkflow, /base64 -D/);
-  assert.match(macWorkflow, /security import .* -P \"\"/s);
   assert.match(macWorkflow, /MACOS_SIGN_IDENTITY:/);
-  assert.match(macWorkflow, /test -n \"\$\{MACOS_CERTIFICATE_BASE64\}\"/);
-  assert.match(macWorkflow, /test -n \"\$\{MACOS_SIGN_IDENTITY\}\"/);
-  assert.match(macWorkflow, /Developer ID Application/);
+  assert.match(macWorkflow, /import-signing-keychain\.sh/);
   assert.match(macWorkflow, /delete-keychain/);
+  assert.match(signingImporter, /Missing required signing variable/);
+  assert.match(signingImporter, /base64 -D/);
+  assert.match(signingImporter, /security import .* -P \"\"/s);
+  assert.match(signingImporter, /Developer ID Application:/);
+  assert.match(signingImporter, /find-identity -v -p codesigning/);
+  if (process.platform !== "win32") {
+    assert.equal(
+      fs.statSync(path.join(root, "scripts", "import-signing-keychain.sh")).mode & 0o111,
+      0o111
+    );
+  }
 });
 
 test("notarizes and staples the macOS DMG with GitHub Secrets", () => {
@@ -440,12 +455,23 @@ test("notarizes and staples the macOS DMG with GitHub Secrets", () => {
   assert.match(macWorkflow, /MACOS_NOTARY_APP_SPECIFIC_PASSWORD/);
   assert.match(macWorkflow, /notarize-dmg\.sh/);
   assert.match(macWorkflow, /Refresh checksums after DMG stapling/);
+  assert.match(macWorkflow, /uses: \.\/\.github\/actions\/setup-build/);
+  assert.match(macWorkflow, /verify-macos-package\.sh/);
+  assert.match(packageVerifier, /MACOS_CHECKSUM_FILE/);
+  assert.match(packageVerifier, /codesign --verify --deep --strict/);
+  assert.match(packageVerifier, /Resources\/bin\/line-cheater/);
+  assert.match(packageVerifier, /shasum -a 256 -c/);
+  assert.match(packageVerifier, /hdiutil verify/);
   assert.match(dmgNotarizer, /notarytool store-credentials/);
   assert.match(dmgNotarizer, /notarytool submit/);
   assert.match(dmgNotarizer, /stapler staple/);
   assert.match(dmgNotarizer, /stapler validate/);
   if (process.platform !== "win32") {
     assert.equal(fs.statSync(path.join(root, "scripts", "notarize-dmg.sh")).mode & 0o111, 0o111);
+    assert.equal(
+      fs.statSync(path.join(root, "scripts", "verify-macos-package.sh")).mode & 0o111,
+      0o111
+    );
   }
 });
 
@@ -460,6 +486,8 @@ test("provides a GitHub Actions Windows packaging workflow", () => {
   assert.match(workflow, /github\.event_name != 'workflow_run'/);
   assert.match(workflow, /actions\/upload-artifact@v6/);
   assert.match(workflow, /Windows-x64\.zip/);
+  assert.match(workflow, /uses: \.\/\.github\/actions\/setup-build/);
+  assert.match(workflow, /gh release upload/);
 });
 
 test("prefers the current debug sidecar during development", () => {
