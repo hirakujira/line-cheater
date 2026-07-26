@@ -259,7 +259,8 @@ for (const filename of [
   "renderer.js",
   "session-cache.cjs",
   "sidecar-client.cjs",
-  "styles.css"
+  "styles.css",
+  "update-checker.cjs"
 ]) {
   copyFile(
     path.join(electronRoot, filename),

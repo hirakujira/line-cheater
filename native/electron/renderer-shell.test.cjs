@@ -11,6 +11,7 @@ const renderer = fs.readFileSync(path.join(root, "renderer.js"), "utf8");
 const styles = fs.readFileSync(path.join(root, "styles.css"), "utf8");
 const main = fs.readFileSync(path.join(root, "main.cjs"), "utf8");
 const sessionCache = fs.readFileSync(path.join(root, "session-cache.cjs"), "utf8");
+const updateChecker = fs.readFileSync(path.join(root, "update-checker.cjs"), "utf8");
 const preload = fs.readFileSync(path.join(root, "preload.cjs"), "utf8");
 const macPackager = fs.readFileSync(
   path.join(root, "scripts", "package-macos.cjs"),
@@ -107,6 +108,7 @@ test("verifies the complete Windows package payload", () => {
     "renderer.js",
     "session-cache.cjs",
     "sidecar-client.cjs",
+    "update-checker.cjs",
     "styles.css",
     "icon.ico",
     "icon.png",
@@ -203,6 +205,22 @@ test("versions session cache and clears it after a successful candidate build", 
   assert.match(renderer, /setCandidateBuildDisabled\(!provider\)/);
   assert.match(macPackager, /"session-cache\.cjs"/);
   assert.match(windowsPackager, /"session-cache\.cjs"/);
+});
+
+test("checks packaged apps for newer stable GitHub releases at startup", () => {
+  assert.match(main, /const \{ findAvailableUpdate \} = require\("\.\/update-checker\.cjs"\)/);
+  assert.match(main, /updateCheckStarted \|\| !app\.isPackaged/);
+  assert.match(main, /void checkForUpdates\(\)/);
+  assert.match(main, /有新版本可用/);
+  assert.match(main, /shell\.openExternal\(update\.releaseUrl/);
+  assert.match(
+    updateChecker,
+    /https:\/\/api\.github\.com\/repos\/zeuikli\/line-cheater\/releases\/latest/
+  );
+  assert.match(updateChecker, /release\.draft === true/);
+  assert.match(updateChecker, /release\.prerelease === true/);
+  assert.match(macPackager, /"update-checker\.cjs"/);
+  assert.match(windowsPackager, /"update-checker\.cjs"/);
 });
 
 test("does not reuse an attachment catalog after the source metadata changes", () => {

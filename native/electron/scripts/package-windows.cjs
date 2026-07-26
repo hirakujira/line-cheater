@@ -59,6 +59,7 @@ const requiredPackageFiles = [
   path.join("resources", "app", "native", "electron", "session-cache.cjs"),
   path.join("resources", "app", "native", "electron", "sidecar-client.cjs"),
   path.join("resources", "app", "native", "electron", "styles.css"),
+  path.join("resources", "app", "native", "electron", "update-checker.cjs"),
   path.join("resources", "app", "native", "electron", "assets", "icon.ico"),
   path.join("resources", "app", "native", "electron", "assets", "icon.png"),
   path.join("resources", "app", "native", "frontend", "data-provider.js"),
@@ -224,7 +225,8 @@ for (const filename of [
   "renderer.js",
   "session-cache.cjs",
   "sidecar-client.cjs",
-  "styles.css"
+  "styles.css",
+  "update-checker.cjs"
 ]) {
   copyFile(
     path.join(electronRoot, filename),
