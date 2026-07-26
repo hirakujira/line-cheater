@@ -1,0 +1,38 @@
+name: Set up LINE Cheater build tools
+description: Install Node.js, the Rust toolchain, and the Electron dependencies shared by every build job.
+
+inputs:
+  rust-components:
+    description: Comma-separated rustup components to install.
+    required: false
+    default: ""
+  rust-targets:
+    description: Comma-separated rustup targets to install.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v5
+      with:
+        node-version: 22
+        cache: npm
+        cache-dependency-path: native/electron/package-lock.json
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.rust-components }}
+        targets: ${{ inputs.rust-targets }}
+
+    - name: Install Electron dependencies
+      shell: bash
+      working-directory: native/electron
+      run: npm ci
+
+    - name: Install Electron runtime
+      shell: bash
+      working-directory: native/electron
+      run: node node_modules/electron/install.js

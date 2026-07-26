@@ -50,14 +50,23 @@ grouped below rather than treated as separate feature changes.
 - `fbec01b` and `8c50949` synchronized the Cargo/Electron version metadata and
   lockfiles for the published `v0.1.13` and `v0.1.14` releases.
 - The macOS workflow now runs architecture-independent Rust/Electron checks
-  once on arm64, skips the duplicate Intel setup on push events, and keeps
-  native arm64/x64 release builds, package verification, signing, notarization,
-  and stapling on both architecture runners. Packaging can reuse those checks
-  without running the full test suite a second time.
+  once on arm64, resolves its matrix from the event so push events never start
+  an Intel runner, and keeps native arm64/x64 release builds, package
+  verification, signing, notarization, and stapling on both architecture
+  runners. Packaging can reuse those checks without running the full test suite
+  a second time.
 - The Windows workflow keeps Electron tests for pull requests and manual runs,
   while the post-macOS `workflow_run` reuses the already-passed cross-platform
   checks and performs only the native Windows build, ZIP assembly, extraction
-  verification, checksum validation, and bundled sidecar version check.
+  verification, checksum validation, and bundled sidecar version check. A
+  single Windows job covers every trigger and only the release attachment runs
+  separately with write permission.
+- Shared CI work lives in `.github/actions/setup-build` (Node, Rust, Electron
+  dependencies) plus `native/electron/scripts/verify-macos-package.sh` and
+  `native/electron/scripts/import-signing-keychain.sh`, so package
+  verification and Developer ID import exist once instead of per workflow. The
+  version bump and release publication jobs run on Linux runners because they
+  never touch macOS tooling.
 - The homepage now exposes separate direct macOS DMG buttons for Apple Silicon
   (`arm64`) and Intel (`x64`), resolves both assets from the latest formal
   GitHub Release, highlights a detected architecture when available, and keeps
