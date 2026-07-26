@@ -346,7 +346,7 @@ dependencies = [
 
 [[package]]
 name = "line-cheater"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "anyhow",
  "clap",
