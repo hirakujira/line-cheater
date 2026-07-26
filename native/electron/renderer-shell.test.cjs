@@ -53,19 +53,25 @@ test("uses LINE Cheater consistently as the desktop product name", () => {
   assert.equal(packageJson.productName, "LINE Cheater");
 });
 
-test("offers direct macOS architecture downloads on the homepage", () => {
-  assert.match(landingHtml, /id="macArm64Download"/);
-  assert.match(landingHtml, /Apple Silicon/);
-  assert.match(landingHtml, /id="macX64Download"/);
-  assert.match(landingHtml, /Intel Mac/);
+test("offers one macOS and one Windows download on the homepage", () => {
+  assert.match(landingHtml, /id="macDownload"/);
+  assert.match(landingHtml, /下載 macOS 版/);
   assert.match(landingHtml, /id="windowsDownload"/);
   assert.match(landingScript, /macOS-arm64\\\.dmg/);
   assert.match(landingScript, /macOS-x64\\\.dmg/);
-  assert.match(landingScript, /configurePlatformDownload\(el\.macArm64Download/);
-  assert.match(landingScript, /configurePlatformDownload\(el\.macX64Download/);
+  assert.match(landingScript, /configurePlatformDownload\(el\.macDownload/);
   assert.match(landingScript, /macArchitecture === "x64"/);
-  assert.match(landingStyles, /\.download-options-macos/);
-  assert.match(landingStyles, /\.platform-download-windows/);
+  assert.match(landingStyles, /\.desktop-download-options/);
+  assert.doesNotMatch(landingHtml, /id="macArm64Download"|id="macX64Download"/);
+});
+
+test("defaults cleanup to chat attachment size", () => {
+  assert.match(
+    html,
+    /<option value="size" selected>聊天室附件大小<\/option>/
+  );
+  assert.match(renderer, /const cleanupState = \{[\s\S]*?sort: "size"/);
+  assert.match(renderer, /elements\.cleanupSort\.value = "size"/);
 });
 
 test("reuses the macOS app icon for in-app branding", () => {

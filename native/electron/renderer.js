@@ -55,7 +55,7 @@ const cleanupState = {
   search: "",
   kind: "all",
   category: "all",
-  sort: "recent",
+  sort: "size",
   groupKey: null
 };
 
@@ -620,14 +620,14 @@ async function openSource(kind) {
       search: "",
       kind: "all",
       category: "all",
-      sort: "recent",
+      sort: "size",
       groupKey: null
     });
     setAdvancedMode(false);
     elements.cleanupSearch.value = "";
     elements.cleanupKind.value = "all";
     elements.cleanupCategory.value = "all";
-    elements.cleanupSort.value = "recent";
+    elements.cleanupSort.value = "size";
     elements.cleanupList.replaceChildren(emptyState("請先掃描附件。"));
     elements.duplicateGroups.replaceChildren(emptyState("先掃描附件，找出完全相同的檔案。"));
     elements.duplicateSummary.classList.add("hidden");

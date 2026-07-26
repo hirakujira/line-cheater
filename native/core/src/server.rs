@@ -963,7 +963,7 @@ fn default_cleanup_category() -> String {
 }
 
 fn default_cleanup_sort() -> String {
-    "recent".to_string()
+    "size".to_string()
 }
 
 fn write_error<W: Write>(
