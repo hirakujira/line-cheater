@@ -33,6 +33,8 @@ let duplicatePageNumber = 1;
 let duplicatePageCursors = [null];
 let duplicateExpandedSha = null;
 let duplicateHashResult = null;
+let duplicatePreviewGeneration = 0;
+let duplicateAutoMergeEnabled = false;
 const duplicateMembers = new Map();
 let imageModalTrigger = null;
 let cleanupPage = null;
@@ -53,7 +55,7 @@ const cleanupState = {
   search: "",
   kind: "all",
   category: "all",
-  sort: "recent",
+  sort: "size",
   groupKey: null
 };
 
@@ -137,6 +139,7 @@ const elements = {
   duplicatePrev: document.querySelector("#duplicate-prev"),
   duplicateNext: document.querySelector("#duplicate-next"),
   duplicatePageInfo: document.querySelector("#duplicate-page-info"),
+  duplicateAutoMerge: document.querySelector("#duplicate-auto-merge"),
   loadModal: document.querySelector("#load-modal"),
   loadModalCard: document.querySelector("#load-modal .package-modal-card"),
   loadModalMessage: document.querySelector("#load-modal-message"),
@@ -215,6 +218,7 @@ function renderSessionSummary(info) {
 
 function setWorkspaceView(view) {
   if (!["browse", "cleanup", "duplicates", "advanced"].includes(view)) return;
+  if (view === "duplicates" && !advancedMode) return;
   activeWorkspaceView = view;
   const labels = {
     browse: ["瀏覽", "查看聊天室與訊息內容"],
@@ -240,6 +244,18 @@ function setWorkspaceView(view) {
   if (view === "advanced" && provider && advancedMode) void loadAdvancedReport();
 }
 
+function requestWorkspaceView(view) {
+  if (view === "duplicates" && !advancedMode) {
+    if (!window.confirm(
+      "重複附件掃描與自動合併需要進階模式。要現在開啟進階模式嗎？"
+    )) {
+      return;
+    }
+    setAdvancedMode(true);
+  }
+  setWorkspaceView(view);
+}
+
 function enterWorkspace() {
   if (!provider) return;
   elements.welcomeScreen.classList.add("hidden");
@@ -252,6 +268,45 @@ function returnToWelcome() {
   elements.workspaceScreen.classList.add("hidden");
   elements.welcomeScreen.classList.remove("hidden");
   elements.enterWorkspace.focus();
+}
+
+function resetAfterCandidateBuild() {
+  sourceGeneration += 1;
+  chatRequestGeneration += 1;
+  messageRequestGeneration += 1;
+  selectedChatGeneration += 1;
+  messageRenderGeneration += 1;
+  provider = null;
+  activeSourceBytes = 0;
+  selectedSourceKind = null;
+  selectedChatPk = null;
+  selectedChat = null;
+  activeSearch = null;
+  advancedReport = null;
+  duplicateLoading = false;
+  duplicateScanComplete = false;
+  duplicatePage = null;
+  duplicateExpandedSha = null;
+  duplicateHashResult = null;
+  duplicateMembers.clear();
+  cleanupPage = null;
+  cleanupOverview = null;
+  cleanupReloadPending = false;
+  disposeCleanupAlbum();
+  setAdvancedMode(false);
+  activeWorkspaceView = "browse";
+  setWorkspaceView("browse");
+  elements.sourceReadyCard.classList.add("hidden");
+  elements.sessionSummary.classList.add("hidden");
+  elements.enterWorkspace.disabled = true;
+  elements.hashDuplicates.disabled = true;
+  setCandidateBuildDisabled(true);
+  for (const button of document.querySelectorAll("[data-source]")) {
+    button.classList.remove("is-selected");
+    button.setAttribute("aria-pressed", "false");
+  }
+  elements.workspaceScreen.classList.add("hidden");
+  elements.welcomeScreen.classList.remove("hidden");
 }
 
 function waitForUiPaint() {
@@ -357,6 +412,8 @@ async function cancelCurrentOperation(kind) {
       closeLoadModal();
     } else if (kind === "duplicate") {
       duplicateLoading = false;
+      duplicateScanComplete = false;
+      setDuplicateAutoMerge(false);
       elements.duplicateProgressLabel.textContent = "掃描已取消，部分雜湊已清除";
       elements.duplicateGroups.replaceChildren(emptyState("掃描已取消；請重新掃描以取得完整結果。"));
       elements.hashDuplicates.disabled = selectedSourceKind === "sqlite";
@@ -563,17 +620,18 @@ async function openSource(kind) {
       search: "",
       kind: "all",
       category: "all",
-      sort: "recent",
+      sort: "size",
       groupKey: null
     });
     setAdvancedMode(false);
     elements.cleanupSearch.value = "";
     elements.cleanupKind.value = "all";
     elements.cleanupCategory.value = "all";
-    elements.cleanupSort.value = "recent";
+    elements.cleanupSort.value = "size";
     elements.cleanupList.replaceChildren(emptyState("請先掃描附件。"));
     elements.duplicateGroups.replaceChildren(emptyState("先掃描附件，找出完全相同的檔案。"));
     elements.duplicateSummary.classList.add("hidden");
+    setDuplicateAutoMerge(false);
     elements.duplicateProgressLabel.textContent = "";
     elements.cancelDuplicateScan.classList.add("hidden");
     elements.duplicatePageInfo.textContent = "第 1 頁";
@@ -1186,13 +1244,20 @@ function renderDuplicateMembers(container, sha256, members) {
     checkbox.checked = member.markedForRemoval;
     checkbox.dataset.duplicateSha = sha256;
     checkbox.dataset.attachmentPath = member.path;
+    checkbox.setAttribute("aria-label", `標記刪除：${fileName(member.path)}`);
     const text = document.createElement("span");
     text.className = "duplicate-member-text";
     const name = document.createElement("strong");
     name.textContent = fileName(member.path);
     const detail = document.createElement("small");
     detail.textContent = `${member.kind === "thumbnail" ? "縮圖" : "原始附件"} · ${formatBytes(member.bytes)} · ${member.referenceStatus}`;
-    text.append(name, detail);
+    const context = document.createElement("small");
+    context.textContent = member.context
+      ? `${member.context.chatTitle || "未命名聊天室"} · ${member.context.senderName || "未知傳送者"} · ${formatTimestamp(member.context.timestamp)}`
+      : member.referenceStatus === "unreferenced"
+        ? "目前 SQLite 沒有引用這個路徑"
+        : "無法確認對應聊天室與訊息";
+    text.append(name, detail, context);
     const path = document.createElement("code");
     path.textContent = member.path;
     choice.append(checkbox, text, path);
@@ -1202,7 +1267,7 @@ function renderDuplicateMembers(container, sha256, members) {
 }
 
 async function loadDuplicateMembers(sha256, container) {
-  if (!provider || !container) return;
+  if (!provider || !advancedMode || !container) return;
   container.replaceChildren(emptyState("正在載入重複檔案…"));
   try {
     const page = await provider.listDuplicateMembers(sha256, { limit: 1000 });
@@ -1224,15 +1289,28 @@ async function loadDuplicateMembers(sha256, container) {
 function renderDuplicateGroup(group) {
   const card = document.createElement("article");
   card.className = "duplicate-group-card";
+  const body = document.createElement("div");
+  body.className = "duplicate-group-body";
+  const preview = document.createElement("button");
+  preview.type = "button";
+  preview.className = "duplicate-preview";
+  preview.disabled = true;
+  preview.previewPath = group.previewPath || "";
+  const previewFallback = document.createElement("span");
+  previewFallback.className = "duplicate-preview-fallback";
+  previewFallback.textContent = group.previewPath ? "載入預覽…" : "沒有預覽";
+  preview.append(previewFallback);
+  const content = document.createElement("div");
+  content.className = "duplicate-group-content";
   const header = document.createElement("div");
   header.className = "duplicate-group-header";
   const title = document.createElement("div");
   title.className = "duplicate-group-title";
   const heading = document.createElement("strong");
-  heading.textContent = duplicateHashLabel(group.sha256);
-  heading.title = group.sha256;
+  heading.textContent = group.previewPath ? fileName(group.previewPath) : "相同附件";
+  heading.title = group.previewPath || group.sha256;
   const summary = document.createElement("span");
-  summary.textContent = `${group.fileCount.toLocaleString()} 份 · 每份 ${formatBytes(group.bytes)} · 可回收 ${formatBytes(group.reclaimableBytes)}`;
+  summary.textContent = `${group.fileCount.toLocaleString()} 份 · 每份 ${formatBytes(group.bytes)} · 理論可合併 ${formatBytes(group.reclaimableBytes)}`;
   title.append(heading, summary);
   const expand = document.createElement("button");
   expand.type = "button";
@@ -1241,28 +1319,103 @@ function renderDuplicateGroup(group) {
   expand.textContent = duplicateExpandedSha === group.sha256 ? "收合檔案" : "查看檔案";
   expand.setAttribute("aria-expanded", String(duplicateExpandedSha === group.sha256));
   header.append(title, expand);
-  card.append(header);
+  content.append(header);
   const impact = document.createElement("p");
   impact.className = "duplicate-group-impact";
   impact.textContent = Boolean(group.hasOriginal) && Boolean(group.hasThumbnail)
-    ? "這組同時包含原始附件與縮圖；請確認保留的檔案種類。"
-    : "建議至少保留一份，並依聊天室脈絡確認是否真的可移除。";
-  card.append(impact);
+    ? "這組同時包含原始附件與縮圖；已標記刪除的檔案會先排除，其餘副本才會建立連結。"
+    : "可直接標記不需要的附件；其餘副本會保留原路徑並連到同組的一個實體檔案。";
+  content.append(impact);
   if (duplicateExpandedSha === group.sha256) {
     const members = document.createElement("div");
     members.className = "duplicate-members";
-    card.append(members);
+    content.append(members);
     if (duplicateMembers.has(group.sha256)) {
       renderDuplicateMembers(members, group.sha256, duplicateMembers.get(group.sha256));
     } else {
       void loadDuplicateMembers(group.sha256, members);
     }
   }
+  body.append(preview, content);
+  card.append(body);
   return card;
+}
+
+async function hydrateDuplicatePreviews(container, renderGeneration) {
+  const previews = Array.from(container.querySelectorAll(".duplicate-preview"))
+    .filter((preview) => preview.previewPath);
+  let next = 0;
+  async function worker() {
+    while (next < previews.length) {
+      const preview = previews[next++];
+      const path = preview.previewPath;
+      let url = null;
+      try {
+        url = await bridge.attachmentPreviewUrl(path);
+      } catch (_error) {
+        // Non-image duplicates keep a clear fallback instead of failing the group.
+      }
+      if (renderGeneration !== duplicatePreviewGeneration || !preview.isConnected) continue;
+      if (!url) {
+        preview.replaceChildren(Object.assign(document.createElement("span"), {
+          className: "duplicate-preview-fallback",
+          textContent: "無影像預覽"
+        }));
+        continue;
+      }
+      const caption = fileName(path);
+      const image = document.createElement("img");
+      image.alt = caption;
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.addEventListener("error", () => {
+        preview.disabled = true;
+        preview.replaceChildren(Object.assign(document.createElement("span"), {
+          className: "duplicate-preview-fallback",
+          textContent: "預覽失敗"
+        }));
+      }, { once: true });
+      preview.disabled = false;
+      preview.setAttribute("aria-label", `放大預覽：${caption}`);
+      preview.addEventListener("click", () => showImageModal(url, caption, preview));
+      preview.replaceChildren(image);
+      image.src = url;
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(4, previews.length) }, () => worker()));
+}
+
+function renderDuplicateAutoMergeControl() {
+  elements.duplicateAutoMerge.disabled =
+    !advancedMode || !duplicateScanComplete || duplicateLoading;
+  elements.duplicateAutoMerge.textContent = duplicateAutoMergeEnabled
+    ? "取消全部自動合併"
+    : "全部自動合併";
+  elements.duplicateAutoMerge.setAttribute(
+    "aria-pressed",
+    String(duplicateAutoMergeEnabled)
+  );
+}
+
+function setDuplicateAutoMerge(enabled) {
+  duplicateAutoMergeEnabled = Boolean(enabled) && advancedMode && duplicateScanComplete;
+  renderDuplicateAutoMergeControl();
+}
+
+function toggleDuplicateAutoMerge() {
+  if (elements.duplicateAutoMerge.disabled) return;
+  setDuplicateAutoMerge(!duplicateAutoMergeEnabled);
+  setStatus(
+    duplicateAutoMergeEnabled
+      ? "已選擇全部自動合併；建立候選檔時會先排除已標記刪除的附件。"
+      : "已取消全部自動合併；建立候選檔時不會寫入重複附件連結。",
+    false
+  );
 }
 
 function renderDuplicatePage(page) {
   duplicatePage = page;
+  const previewGeneration = ++duplicatePreviewGeneration;
   elements.duplicateGroups.replaceChildren();
   if (!page.items.length) {
     elements.duplicateGroups.append(emptyState("沒有找到完全相同的附件。"));
@@ -1271,20 +1424,21 @@ function renderDuplicatePage(page) {
     list.className = "duplicate-group-list";
     for (const group of page.items) list.append(renderDuplicateGroup(group));
     elements.duplicateGroups.append(list);
+    void hydrateDuplicatePreviews(elements.duplicateGroups, previewGeneration);
   }
   elements.duplicateSummary.classList.remove("hidden");
   const hashed = duplicateHashResult
     ? `本次檢查 ${duplicateHashResult.processedFiles.toLocaleString()} / ${duplicateHashResult.candidateFiles.toLocaleString()} 個候選檔案`
     : "已完成雜湊掃描";
   elements.duplicateSummary.textContent =
-    `${hashed} · 本頁 ${page.items.length.toLocaleString()} 組 · 可回收容量以每組保留一份估算`;
+    `${hashed} · 本頁 ${page.items.length.toLocaleString()} 組 · 理論容量以每組保留一個實體檔案估算`;
   elements.duplicatePageInfo.textContent = `第 ${duplicatePageNumber} 頁`;
   elements.duplicatePrev.disabled = duplicateLoading || duplicatePageNumber <= 1;
   elements.duplicateNext.disabled = duplicateLoading || !page.nextCursor;
 }
 
 async function loadDuplicateGroups(pageNumber = duplicatePageNumber) {
-  if (!provider || duplicateLoading || !duplicateScanComplete) return;
+  if (!provider || !advancedMode || duplicateLoading || !duplicateScanComplete) return;
   const cursor = duplicatePageCursors[pageNumber - 1] || null;
   duplicateLoading = true;
   elements.hashDuplicates.disabled = true;
@@ -1302,6 +1456,7 @@ async function loadDuplicateGroups(pageNumber = duplicatePageNumber) {
   } finally {
     duplicateLoading = false;
     elements.hashDuplicates.disabled = selectedSourceKind === "sqlite";
+    renderDuplicateAutoMergeControl();
     if (duplicatePage) {
       elements.duplicatePrev.disabled = duplicatePageNumber <= 1;
       elements.duplicateNext.disabled = !duplicatePage.nextCursor;
@@ -1310,7 +1465,7 @@ async function loadDuplicateGroups(pageNumber = duplicatePageNumber) {
 }
 
 async function hashDuplicates() {
-  if (!provider || duplicateLoading || selectedSourceKind === "sqlite") return;
+  if (!provider || !advancedMode || duplicateLoading || selectedSourceKind === "sqlite") return;
   duplicateLoading = true;
   duplicateScanComplete = false;
   duplicateHashResult = null;
@@ -1319,6 +1474,7 @@ async function hashDuplicates() {
   duplicatePageNumber = 1;
   duplicatePageCursors = [null];
   duplicateExpandedSha = null;
+  setDuplicateAutoMerge(false);
   elements.hashDuplicates.disabled = true;
   elements.cancelDuplicateScan.classList.remove("hidden");
   elements.cancelDuplicateScan.disabled = false;
@@ -1338,11 +1494,13 @@ async function hashDuplicates() {
     if (isOperationCancelled(error)) {
       elements.duplicateProgressLabel.textContent = "掃描已取消，部分雜湊已清除";
       elements.duplicateGroups.replaceChildren(emptyState("掃描已取消；請重新掃描以取得完整結果。"));
+      setDuplicateAutoMerge(false);
       setStatus("已取消重複附件掃描。", false);
       return;
     }
     elements.duplicateProgressLabel.textContent = "掃描失敗";
     elements.duplicateGroups.replaceChildren(emptyState(`掃描失敗：${error.message}`));
+    setDuplicateAutoMerge(false);
     setStatus(error.message, true);
   } finally {
     duplicateLoading = false;
@@ -1355,12 +1513,6 @@ async function changeDuplicateMark(checkbox) {
   const sha256 = checkbox.dataset.duplicateSha;
   const path = checkbox.dataset.attachmentPath;
   const members = duplicateMembers.get(sha256) || [];
-  const otherUnmarked = members.some((member) => member.path !== path && !member.markedForRemoval);
-  if (checkbox.checked && !otherUnmarked) {
-    checkbox.checked = false;
-    setStatus("每組重複附件至少要保留一份，無法標記最後一個檔案。", true);
-    return;
-  }
   checkbox.disabled = true;
   try {
     await provider.setAttachmentMarked(path, checkbox.checked);
@@ -1404,6 +1556,7 @@ async function scanCatalog(options) {
     duplicateMembers.clear();
     elements.cancelDuplicateScan.classList.add("hidden");
     elements.duplicateSummary.classList.add("hidden");
+    setDuplicateAutoMerge(false);
     elements.duplicateGroups.replaceChildren(emptyState("先掃描附件，找出完全相同的檔案。"));
     elements.duplicatePageInfo.textContent = "第 1 頁";
     elements.duplicatePrev.disabled = true;
@@ -2233,6 +2386,12 @@ async function applyGroupAction(groupKey, action, button) {
 function setAdvancedMode(enabled) {
   advancedMode = Boolean(enabled);
   elements.advancedMode.checked = advancedMode;
+  if (!advancedMode && duplicateLoading) void cancelCurrentOperation("duplicate");
+  if (!advancedMode) setDuplicateAutoMerge(false);
+  else renderDuplicateAutoMergeControl();
+  if (!advancedMode && activeWorkspaceView === "duplicates") {
+    setWorkspaceView("advanced");
+  }
   elements.cleanupNoAttachments.hidden = !advancedMode;
   elements.cleanupNoAttachments.disabled = !advancedMode;
   if (!advancedMode && cleanupState.category === "no_attachments") {
@@ -2385,15 +2544,32 @@ async function buildCandidate() {
     modalShown = true;
     packageInProgress = true;
     setCandidateBuildDisabled(true);
-    const report = await provider.buildCandidate(output.token, { fullCrc: true });
-    const successMessage =
+    const linkDuplicates =
+      advancedMode && duplicateScanComplete && duplicateAutoMergeEnabled;
+    const report = await provider.buildCandidate(output.token, {
+      fullCrc: true,
+      linkDuplicates
+    });
+    let successMessage =
       `候選檔完成：保留 ${report.outputEntries.toLocaleString()} 筆、` +
       `移除 ${report.removedEntries.toLocaleString()} 個檔案項目、` +
+      `以連結合併 ${report.linkedDuplicateEntries.toLocaleString()} 個重複附件、` +
       `${report.removedChats.toLocaleString()} 個聊天室與 ` +
       `${report.removedMessages.toLocaleString()} 則 SQLite 訊息，完整 CRC 驗證完成。`;
+    if (report.linkedDuplicateEntries > 0) {
+      successMessage += " 此候選檔使用實驗性 symbolic link，請先以 iMazing 測試還原。";
+    }
+    if (report.cacheCleared) {
+      successMessage += " LINE Cheater 的本機快取已清除；下次請重新選擇來源。";
+    } else {
+      successMessage +=
+        ` 候選檔已成功，但本機快取未能完全清除：` +
+        `${report.cacheCleanupWarning || "請重新啟動 LINE Cheater 後再試。"}。`;
+    }
     setStatus(successMessage);
     packageInProgress = false;
     completePackageModal(false, "瘦身 .imazingapp 已建立", successMessage);
+    resetAfterCandidateBuild();
   } catch (error) {
     if (isOperationCancelled(error)) {
       const message = "已取消建立候選檔；部分輸出與暫存資料已清除。";
@@ -2409,7 +2585,7 @@ async function buildCandidate() {
     }
   } finally {
     packageInProgress = false;
-    setCandidateBuildDisabled(false);
+    setCandidateBuildDisabled(!provider);
   }
 }
 
@@ -2433,18 +2609,19 @@ elements.enterWorkspace.addEventListener("click", enterWorkspace);
 elements.changeSource.addEventListener("click", returnToWelcome);
 const sidebarItems = Array.from(document.querySelectorAll("[data-view]"));
 for (const button of sidebarItems) {
-  button.addEventListener("click", () => setWorkspaceView(button.dataset.view));
+  button.addEventListener("click", () => requestWorkspaceView(button.dataset.view));
   button.addEventListener("keydown", (event) => {
     if (!["ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
-    const current = sidebarItems.indexOf(button);
+    const visibleItems = sidebarItems.filter((item) => !item.classList.contains("hidden"));
+    const current = visibleItems.indexOf(button);
     const next = event.key === "Home"
       ? 0
       : event.key === "End"
-        ? sidebarItems.length - 1
-        : (current + (event.key === "ArrowDown" ? 1 : -1) + sidebarItems.length) %
-          sidebarItems.length;
-    sidebarItems[next].focus();
+        ? visibleItems.length - 1
+        : (current + (event.key === "ArrowDown" ? 1 : -1) + visibleItems.length) %
+          visibleItems.length;
+    visibleItems[next].focus();
   });
 }
 elements.previousChats.addEventListener("click", () => void loadChats("previous"));
@@ -2456,7 +2633,7 @@ elements.retryMessages.addEventListener("click", () => void loadMessages(message
 elements.advancedMode.addEventListener("change", () => {
   if (elements.advancedMode.checked &&
       !window.confirm(
-        "進階模式可以建立會刪除聊天室並重寫 SQLite 副本的清理計畫。要繼續開啟嗎？"
+        "進階模式可以建立會刪除聊天室、重寫 SQLite，並以 symbolic link 合併重複附件的清理計畫。要繼續開啟嗎？"
       )) {
     elements.advancedMode.checked = false;
     return;
@@ -2467,6 +2644,7 @@ elements.refreshAdvancedReport.addEventListener("click", () => void loadAdvanced
 elements.planAutomaticCleanup.addEventListener("click", () => void toggleAutomaticCleanup());
 elements.scanCatalog.addEventListener("click", () => void scanCatalog());
 elements.hashDuplicates.addEventListener("click", () => void hashDuplicates());
+elements.duplicateAutoMerge.addEventListener("click", toggleDuplicateAutoMerge);
 elements.cancelDuplicateScan.addEventListener("click", () => void cancelCurrentOperation("duplicate"));
 elements.buildCandidate.addEventListener("click", () => void buildCandidate());
 elements.advancedBuildCandidate.addEventListener("click", () => void buildCandidate());

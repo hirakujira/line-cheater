@@ -88,6 +88,28 @@ test("normalizes duplicate digest requests", async () => {
   await assert.rejects(() => provider.listDuplicateMembers("bad"), TypeError);
 });
 
+test("forwards explicit duplicate-link candidate mode", async () => {
+  const calls = [];
+  const provider = new NativeDataProvider({
+    request: async (method, params) => {
+      calls.push({ method, params });
+      return {};
+    }
+  });
+  await provider.buildCandidate("output-token", {
+    fullCrc: true,
+    linkDuplicates: true
+  });
+  assert.deepEqual(calls[0], {
+    method: "buildCandidate",
+    params: {
+      output: "output-token",
+      fullCrc: true,
+      linkDuplicates: true
+    }
+  });
+});
+
 test("validates and forwards bounded message searches", async () => {
   const calls = [];
   const provider = new NativeDataProvider({

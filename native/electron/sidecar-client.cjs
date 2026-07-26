@@ -201,7 +201,24 @@ class SidecarClient extends EventEmitter {
       pending.reject(new Error("Rust sidecar is closing."));
     }
     this.pending.clear();
-    if (!this.child.killed) this.child.kill();
+    await new Promise((resolve) => {
+      if (this.child.exitCode !== null || this.child.signalCode !== null) {
+        resolve();
+        return;
+      }
+      let settled = false;
+      let timer = null;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      timer = setTimeout(finish, 2_000);
+      this.child.once("exit", finish);
+      this.child.once("error", finish);
+      if (!this.child.killed) this.child.kill();
+    });
   }
 }
 

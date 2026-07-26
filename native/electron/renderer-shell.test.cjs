@@ -10,6 +10,7 @@ const html = fs.readFileSync(path.join(root, "renderer.html"), "utf8");
 const renderer = fs.readFileSync(path.join(root, "renderer.js"), "utf8");
 const styles = fs.readFileSync(path.join(root, "styles.css"), "utf8");
 const main = fs.readFileSync(path.join(root, "main.cjs"), "utf8");
+const sessionCache = fs.readFileSync(path.join(root, "session-cache.cjs"), "utf8");
 const preload = fs.readFileSync(path.join(root, "preload.cjs"), "utf8");
 const macPackager = fs.readFileSync(
   path.join(root, "scripts", "package-macos.cjs"),
@@ -52,19 +53,25 @@ test("uses LINE Cheater consistently as the desktop product name", () => {
   assert.equal(packageJson.productName, "LINE Cheater");
 });
 
-test("offers direct macOS architecture downloads on the homepage", () => {
-  assert.match(landingHtml, /id="macArm64Download"/);
-  assert.match(landingHtml, /Apple Silicon/);
-  assert.match(landingHtml, /id="macX64Download"/);
-  assert.match(landingHtml, /Intel Mac/);
+test("offers one macOS and one Windows download on the homepage", () => {
+  assert.match(landingHtml, /id="macDownload"/);
+  assert.match(landingHtml, /下載 macOS 版/);
   assert.match(landingHtml, /id="windowsDownload"/);
   assert.match(landingScript, /macOS-arm64\\\.dmg/);
   assert.match(landingScript, /macOS-x64\\\.dmg/);
-  assert.match(landingScript, /configurePlatformDownload\(el\.macArm64Download/);
-  assert.match(landingScript, /configurePlatformDownload\(el\.macX64Download/);
+  assert.match(landingScript, /configurePlatformDownload\(el\.macDownload/);
   assert.match(landingScript, /macArchitecture === "x64"/);
-  assert.match(landingStyles, /\.download-options-macos/);
-  assert.match(landingStyles, /\.platform-download-windows/);
+  assert.match(landingStyles, /\.desktop-download-options/);
+  assert.doesNotMatch(landingHtml, /id="macArm64Download"|id="macX64Download"/);
+});
+
+test("defaults cleanup to chat attachment size", () => {
+  assert.match(
+    html,
+    /<option value="size" selected>聊天室附件大小<\/option>/
+  );
+  assert.match(renderer, /const cleanupState = \{[\s\S]*?sort: "size"/);
+  assert.match(renderer, /elements\.cleanupSort\.value = "size"/);
 });
 
 test("reuses the macOS app icon for in-app branding", () => {
@@ -98,6 +105,7 @@ test("verifies the complete Windows package payload", () => {
   for (const packagedFile of [
     "renderer.html",
     "renderer.js",
+    "session-cache.cjs",
     "sidecar-client.cjs",
     "styles.css",
     "icon.ico",
@@ -145,17 +153,30 @@ test("keeps browse, cleanup, and advanced as mutually exclusive native views", (
 });
 
 test("surfaces the existing exact-duplicate engine as a reviewable native view", () => {
-  assert.match(html, /data-view="duplicates"/);
+  assert.match(html, /id="duplicates-nav" class="sidebar-item" data-view="duplicates"/);
   assert.match(html, /id="duplicates-view" class="workspace-view hidden"/);
   assert.match(html, /id="hash-duplicates"/);
+  assert.match(html, /id="duplicate-auto-merge"[\s\S]*?aria-pressed="false" disabled/);
+  assert.doesNotMatch(html, /id="duplicate-link-cleanup"/);
   assert.match(renderer, /provider\.hashDuplicateCandidates\(\)/);
   assert.match(renderer, /provider\.listDuplicateGroups\(/);
   assert.match(renderer, /provider\.listDuplicateMembers\(/);
-  assert.match(renderer, /至少要保留一份/);
+  assert.match(renderer, /function requestWorkspaceView\(view\)/);
+  assert.match(renderer, /重複附件掃描與自動合併需要進階模式/);
+  assert.match(renderer, /setAdvancedMode\(true\)/);
+  assert.match(renderer, /function toggleDuplicateAutoMerge\(\)/);
+  assert.match(renderer, /"取消全部自動合併"/);
+  assert.match(renderer, /advancedMode && duplicateScanComplete && duplicateAutoMergeEnabled/);
+  assert.doesNotMatch(renderer, /至少要保留一份/);
   assert.match(preload, /"duplicateHashProgress"/);
   assert.match(html, /id="cancel-duplicate-scan"/);
   assert.match(renderer, /cancelCurrentOperation\("duplicate"\)/);
+  assert.match(renderer, /function hydrateDuplicatePreviews\(/);
+  assert.match(renderer, /bridge\.attachmentPreviewUrl\(path\)/);
+  assert.match(renderer, /showImageModal\(url, caption, preview\)/);
   assert.match(styles, /\.duplicate-group-card\s*\{/);
+  assert.match(styles, /\.duplicate-preview img\s*\{[^}]*object-fit: contain/);
+  assert.match(styles, /#duplicate-auto-merge\[aria-pressed="true"\]/);
 });
 
 test("can cancel long-running native work and recover its sidecar", () => {
@@ -166,6 +187,22 @@ test("can cancel long-running native work and recover its sidecar", () => {
   assert.match(main, /await current\.cancel\(\)/);
   assert.match(main, /recoverInterruptedOperations/);
   assert.match(main, /\.partial/);
+});
+
+test("versions session cache and clears it after a successful candidate build", () => {
+  assert.match(main, /prepareSessionCache\(/);
+  assert.match(main, /app\.getVersion\(\)/);
+  assert.match(sessionCache, /CACHE_VERSION_FILE = "\.line-cheater-cache-version"/);
+  assert.match(sessionCache, /cachedVersion\(workDir\) === version/);
+  assert.match(sessionCache, /clearSessionCache\(userDataPath, workDir\)/);
+  assert.match(main, /outputFallsInsideSession\(workDir, output\)/);
+  assert.match(main, /const cacheResult = await closeCompletedSession\(client, workDir\)/);
+  assert.match(main, /return \{ \.\.\.result, \.\.\.cacheResult \}/);
+  assert.match(renderer, /function resetAfterCandidateBuild\(\)/);
+  assert.match(renderer, /本機快取已清除；下次請重新選擇來源/);
+  assert.match(renderer, /setCandidateBuildDisabled\(!provider\)/);
+  assert.match(macPackager, /"session-cache\.cjs"/);
+  assert.match(windowsPackager, /"session-cache\.cjs"/);
 });
 
 test("does not reuse an attachment catalog after the source metadata changes", () => {

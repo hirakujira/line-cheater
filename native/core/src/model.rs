@@ -195,6 +195,7 @@ pub struct DuplicateGroup {
     pub reclaimable_bytes: u64,
     pub has_original: bool,
     pub has_thumbnail: bool,
+    pub preview_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

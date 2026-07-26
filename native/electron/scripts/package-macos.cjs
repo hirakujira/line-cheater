@@ -257,6 +257,7 @@ for (const filename of [
   "preload.cjs",
   "renderer.html",
   "renderer.js",
+  "session-cache.cjs",
   "sidecar-client.cjs",
   "styles.css"
 ]) {

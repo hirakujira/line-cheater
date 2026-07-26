@@ -39,6 +39,8 @@ pub struct CandidateReport {
     pub removed_entries: u64,
     pub removed_chats: u64,
     pub removed_messages: u64,
+    pub linked_duplicate_entries: u64,
+    pub linked_duplicate_bytes: u64,
     pub rewritten_databases: Vec<String>,
     pub output_bytes: u64,
     pub used_zip64: bool,
@@ -74,6 +76,37 @@ struct DatabaseRewrites {
     skipped_sidecars: HashSet<String>,
 }
 
+#[derive(Debug)]
+struct DuplicateSymlink {
+    canonical_path: String,
+    relative_target: String,
+    replaced_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct DuplicateSymlinkPlan {
+    links: HashMap<String, DuplicateSymlink>,
+}
+
+#[derive(Clone, Copy)]
+struct CandidateBuildPlan<'a> {
+    catalog: &'a Catalog,
+    marked: &'a HashSet<String>,
+    rewrites: &'a DatabaseRewrites,
+    duplicate_symlinks: &'a DuplicateSymlinkPlan,
+    full_crc: bool,
+}
+
+impl DuplicateSymlinkPlan {
+    fn linked_entries(&self) -> u64 {
+        self.links.len() as u64
+    }
+
+    fn linked_bytes(&self) -> u64 {
+        self.links.values().map(|entry| entry.replaced_bytes).sum()
+    }
+}
+
 impl DatabaseRewrites {
     fn removed_chats(&self) -> u64 {
         self.entries.values().map(|entry| entry.removed_chats).sum()
@@ -105,6 +138,7 @@ pub fn build_candidate<F>(
     output: &Path,
     catalog: &Catalog,
     full_crc: bool,
+    link_duplicates: bool,
     mut on_progress: F,
 ) -> Result<CandidateReport>
 where
@@ -128,8 +162,20 @@ where
             bail!("removal plan contains a protected or non-attachment path: {path}");
         }
     }
+    let duplicate_symlinks = if link_duplicates {
+        plan_duplicate_symlinks(catalog, &marked)?
+    } else {
+        DuplicateSymlinkPlan::default()
+    };
     let cleanup_plan = catalog.database_cleanup_plan()?;
     let rewrites = prepare_database_rewrites(&source, catalog, &cleanup_plan)?;
+    let build_plan = CandidateBuildPlan {
+        catalog,
+        marked: &marked,
+        rewrites: &rewrites,
+        duplicate_symlinks: &duplicate_symlinks,
+        full_crc,
+    };
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -143,24 +189,12 @@ where
     }
 
     let build_result = match report.kind {
-        SourceKind::Directory => build_from_directory(
-            &source,
-            &temporary,
-            catalog,
-            &marked,
-            &rewrites,
-            full_crc,
-            &mut on_progress,
-        ),
-        SourceKind::ImazingArchive => build_from_archive(
-            &source,
-            &temporary,
-            catalog,
-            &marked,
-            &rewrites,
-            full_crc,
-            &mut on_progress,
-        ),
+        SourceKind::Directory => {
+            build_from_directory(&source, &temporary, build_plan, &mut on_progress)
+        }
+        SourceKind::ImazingArchive => {
+            build_from_archive(&source, &temporary, build_plan, &mut on_progress)
+        }
         SourceKind::Sqlite => unreachable!(),
     };
     match build_result {
@@ -182,6 +216,62 @@ where
             Err(error)
         }
     }
+}
+
+fn plan_duplicate_symlinks(
+    catalog: &Catalog,
+    marked: &HashSet<String>,
+) -> Result<DuplicateSymlinkPlan> {
+    let mut plan = DuplicateSymlinkPlan::default();
+    for members in catalog.duplicate_link_groups(marked)? {
+        let Some(canonical) = members.first() else {
+            continue;
+        };
+        for member in members.iter().skip(1) {
+            let relative_target = relative_symlink_target(&member.path, &canonical.path)?;
+            plan.links.insert(
+                member.path.clone(),
+                DuplicateSymlink {
+                    canonical_path: canonical.path.clone(),
+                    relative_target,
+                    replaced_bytes: member.bytes,
+                },
+            );
+        }
+    }
+    Ok(plan)
+}
+
+fn relative_symlink_target(link_path: &str, target_path: &str) -> Result<String> {
+    let link_components = safe_archive_components(link_path)?;
+    let target_components = safe_archive_components(target_path)?;
+    let link_parent = &link_components[..link_components.len().saturating_sub(1)];
+    let common = link_parent
+        .iter()
+        .zip(&target_components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = Vec::new();
+    relative.extend(std::iter::repeat_n("..", link_parent.len() - common));
+    relative.extend(target_components[common..].iter().copied());
+    if relative.is_empty() {
+        bail!("duplicate symlink target resolves to its own path: {link_path}");
+    }
+    Ok(relative.join("/"))
+}
+
+fn safe_archive_components(path: &str) -> Result<Vec<&str>> {
+    let components = path.split('/').collect::<Vec<_>>();
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.contains('\\')
+        || components
+            .iter()
+            .any(|component| component.is_empty() || matches!(*component, "." | ".."))
+    {
+        bail!("unsafe attachment path cannot be used for duplicate linking: {path}");
+    }
+    Ok(components)
 }
 
 fn prepare_database_rewrites(
@@ -397,21 +487,25 @@ fn sibling_entry_name(database_name: &str, filename: &str) -> String {
 fn build_from_archive<F>(
     source: &Path,
     temporary: &Path,
-    catalog: &Catalog,
-    marked: &HashSet<String>,
-    rewrites: &DatabaseRewrites,
-    full_crc: bool,
+    plan: CandidateBuildPlan<'_>,
     on_progress: &mut F,
 ) -> Result<CandidateReport>
 where
     F: FnMut(CandidateProgress) -> Result<()>,
 {
+    let CandidateBuildPlan {
+        catalog,
+        marked,
+        rewrites,
+        duplicate_symlinks,
+        full_crc,
+    } = plan;
     let before_fingerprint = file_fingerprint(source)?;
     let build_info = inspect_archive_for_build(source)?;
     let input_entries = build_info.entries;
     let total_bytes = build_info.compressed_bytes;
     let protected_before = build_info.protected_hashes;
-    let warnings = build_info.warnings;
+    let mut warnings = build_info.warnings;
     if !protected_before
         .keys()
         .any(|path| path.ends_with("/Messages/Line.sqlite"))
@@ -480,6 +574,24 @@ where
             })?;
             continue;
         }
+        if let Some(link) = duplicate_symlinks.links.get(&name) {
+            let expected_digest = catalog
+                .content_digest_for_path(&name)?
+                .with_context(|| format!("catalog is missing a source content digest: {name}"))?;
+            let digest = hash_reader(&mut entry)?;
+            if digest != expected_digest {
+                bail!("source archive entry changed while duplicate linking: {name}");
+            }
+            writer.add_symlink(&name, &link.relative_target, SimpleFileOptions::default())?;
+            output_entries += 1;
+            on_progress(CandidateProgress {
+                processed_bytes,
+                total_bytes,
+                processed_entries: (index + 1) as u64,
+                total_entries: input_entries,
+            })?;
+            continue;
+        }
         let expected_digest = catalog
             .content_digest_for_path(&name)?
             .with_context(|| format!("catalog is missing a source content digest: {name}"))?;
@@ -510,15 +622,7 @@ where
     if !catalog.source_matches_current(source, SourceKind::ImazingArchive)? {
         bail!("source .imazingapp content changed while candidate was being written");
     }
-    verify_candidate(
-        temporary,
-        marked,
-        &protected_before,
-        &rewrites.hashes(),
-        &rewrites.skipped_sidecars,
-        full_crc,
-        output_entries,
-    )?;
+    verify_candidate(temporary, plan, &protected_before, output_entries)?;
     let output_bytes = fs::metadata(temporary)?.len();
     let mut protected_entries_verified: Vec<String> = protected_before
         .keys()
@@ -528,6 +632,12 @@ where
         .cloned()
         .collect();
     protected_entries_verified.sort();
+    if duplicate_symlinks.linked_entries() > 0 {
+        warnings.push(
+            "duplicate attachments use relative symbolic links; verify iMazing restore compatibility before relying on this candidate"
+                .to_string(),
+        );
+    }
     Ok(CandidateReport {
         source_path: String::new(),
         output_path: String::new(),
@@ -536,6 +646,8 @@ where
         removed_entries: removed_found.len() as u64 + skipped_sidecars_found,
         removed_chats: rewrites.removed_chats(),
         removed_messages: rewrites.removed_messages(),
+        linked_duplicate_entries: duplicate_symlinks.linked_entries(),
+        linked_duplicate_bytes: duplicate_symlinks.linked_bytes(),
         rewritten_databases: rewrites.rewritten_names(),
         output_bytes,
         used_zip64: output_bytes >= ZIP64_BYTES_THR || output_entries >= u16::MAX as u64,
@@ -548,15 +660,19 @@ where
 fn build_from_directory<F>(
     source: &Path,
     temporary: &Path,
-    catalog: &Catalog,
-    marked: &HashSet<String>,
-    rewrites: &DatabaseRewrites,
-    full_crc: bool,
+    plan: CandidateBuildPlan<'_>,
     on_progress: &mut F,
 ) -> Result<CandidateReport>
 where
     F: FnMut(CandidateProgress) -> Result<()>,
 {
+    let CandidateBuildPlan {
+        catalog,
+        marked,
+        rewrites,
+        duplicate_symlinks,
+        full_crc,
+    } = plan;
     let protected_before = hash_directory_protected(source)?;
     if !protected_before
         .keys()
@@ -617,6 +733,36 @@ where
             })?;
             continue;
         }
+        if let Some(link) = duplicate_symlinks.links.get(&relative) {
+            let before = file_fingerprint(entry.path())?;
+            let expected_digest =
+                catalog
+                    .content_digest_for_path(&relative)?
+                    .with_context(|| {
+                        format!("catalog is missing a source content digest: {relative}")
+                    })?;
+            let digest = hash_reader(BufReader::with_capacity(
+                HASH_BUFFER_BYTES,
+                File::open(entry.path())?,
+            ))?;
+            if digest != expected_digest || file_fingerprint(entry.path())? != before {
+                bail!("source file changed while duplicate linking: {relative}");
+            }
+            writer.add_symlink(
+                &relative,
+                &link.relative_target,
+                SimpleFileOptions::default(),
+            )?;
+            processed_bytes = processed_bytes.saturating_add(before.bytes);
+            output_entries += 1;
+            on_progress(CandidateProgress {
+                processed_bytes,
+                total_bytes: stats.1,
+                processed_entries,
+                total_entries: stats.0,
+            })?;
+            continue;
+        }
         let before = file_fingerprint(entry.path())?;
         let expected_digest = catalog
             .content_digest_for_path(&relative)?
@@ -655,15 +801,7 @@ where
     if !catalog.source_matches_current(source, SourceKind::Directory)? {
         bail!("source directory content changed while candidate was being written");
     }
-    verify_candidate(
-        temporary,
-        marked,
-        &protected_before,
-        &rewrites.hashes(),
-        &rewrites.skipped_sidecars,
-        full_crc,
-        output_entries,
-    )?;
+    verify_candidate(temporary, plan, &protected_before, output_entries)?;
     let output_bytes = fs::metadata(temporary)?.len();
     let mut protected_entries_verified: Vec<String> = protected_before
         .keys()
@@ -681,15 +819,26 @@ where
         removed_entries: removed_found.len() as u64 + skipped_sidecars_found,
         removed_chats: rewrites.removed_chats(),
         removed_messages: rewrites.removed_messages(),
+        linked_duplicate_entries: duplicate_symlinks.linked_entries(),
+        linked_duplicate_bytes: duplicate_symlinks.linked_bytes(),
         rewritten_databases: rewrites.rewritten_names(),
         output_bytes,
         used_zip64: output_bytes >= ZIP64_BYTES_THR || output_entries >= u16::MAX as u64,
         full_crc_verified: full_crc,
         protected_entries_verified,
-        warnings: vec![
-            "directory sources are stored without compression; ZIP metadata may differ from iMazing"
-                .to_string(),
-        ],
+        warnings: {
+            let mut warnings = vec![
+                "directory sources are stored without compression; ZIP metadata may differ from iMazing"
+                    .to_string(),
+            ];
+            if duplicate_symlinks.linked_entries() > 0 {
+                warnings.push(
+                    "duplicate attachments use relative symbolic links; verify iMazing restore compatibility before relying on this candidate"
+                        .to_string(),
+                );
+            }
+            warnings
+        },
     })
 }
 
@@ -808,13 +957,19 @@ fn ensure_stable_archive_name<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> Res
 
 fn verify_candidate(
     candidate: &Path,
-    marked: &HashSet<String>,
+    plan: CandidateBuildPlan<'_>,
     protected_before: &HashMap<String, String>,
-    rewritten_hashes: &HashMap<String, String>,
-    skipped_entries: &HashSet<String>,
-    full_crc: bool,
     expected_entries: u64,
 ) -> Result<()> {
+    let CandidateBuildPlan {
+        marked,
+        rewrites,
+        duplicate_symlinks,
+        full_crc,
+        ..
+    } = plan;
+    let rewritten_hashes = rewrites.hashes();
+    let skipped_entries = &rewrites.skipped_sidecars;
     let file = File::open(candidate)?;
     let mut archive = ZipArchive::new(file)?;
     if archive.len() as u64 != expected_entries {
@@ -824,6 +979,7 @@ fn verify_candidate(
         );
     }
     let mut names = HashSet::with_capacity(archive.len());
+    let mut regular_names = HashSet::with_capacity(archive.len());
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         ensure_stable_archive_name(&entry)?;
@@ -837,9 +993,40 @@ fn verify_candidate(
         if !names.insert(name.clone()) {
             bail!("candidate contains duplicate entry path: {name}");
         }
+        if let Some(link) = duplicate_symlinks.links.get(&name) {
+            if !entry.is_symlink() {
+                bail!("candidate duplicate link is not a symbolic link: {name}");
+            }
+            let mut target = String::new();
+            entry
+                .read_to_string(&mut target)
+                .with_context(|| format!("candidate duplicate link target is invalid: {name}"))?;
+            if target != link.relative_target {
+                bail!("candidate duplicate link target changed: {name}");
+            }
+        } else if !entry.is_dir() && !entry.is_symlink() {
+            regular_names.insert(name.clone());
+        }
         if full_crc && !entry.is_dir() {
             std::io::copy(&mut entry, &mut std::io::sink())
                 .with_context(|| format!("CRC validation failed for {name}"))?;
+        }
+    }
+    for (name, link) in &duplicate_symlinks.links {
+        if !names.contains(name) {
+            bail!("candidate is missing duplicate link entry: {name}");
+        }
+        if !regular_names.contains(&link.canonical_path) {
+            bail!(
+                "candidate duplicate link target is missing or not a regular file: {}",
+                link.canonical_path
+            );
+        }
+        if marked.contains(&link.canonical_path) {
+            bail!(
+                "candidate duplicate link targets a marked removal: {}",
+                link.canonical_path
+            );
         }
     }
     for (name, expected_hash) in protected_before {
@@ -851,7 +1038,7 @@ fn verify_candidate(
             bail!("protected entry hash changed in candidate: {name}");
         }
     }
-    for (name, expected_hash) in rewritten_hashes {
+    for (name, expected_hash) in &rewritten_hashes {
         let actual = hash_archive_entry(candidate, name)?;
         if &actual != expected_hash {
             bail!("rewritten SQLite entry hash changed in candidate: {name}");

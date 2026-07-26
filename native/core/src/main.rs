@@ -105,6 +105,8 @@ enum Command {
         output: PathBuf,
         #[arg(long)]
         full_crc: bool,
+        #[arg(long)]
+        link_duplicates: bool,
     },
     HashDuplicates {
         #[arg(long)]
@@ -286,22 +288,30 @@ fn main() -> Result<()> {
             catalog,
             output,
             full_crc,
+            link_duplicates,
         } => {
             let catalog = Catalog::open(&catalog)?;
-            let report = build_candidate(&source, &output, &catalog, full_crc, |progress| {
-                if progress.processed_entries % 64 == 0
-                    || progress.processed_entries == progress.total_entries
-                {
-                    eprintln!(
-                        "processed {}/{} entries, {}/{} bytes",
-                        progress.processed_entries,
-                        progress.total_entries,
-                        progress.processed_bytes,
-                        progress.total_bytes
-                    );
-                }
-                Ok(())
-            })?;
+            let report = build_candidate(
+                &source,
+                &output,
+                &catalog,
+                full_crc,
+                link_duplicates,
+                |progress| {
+                    if progress.processed_entries % 64 == 0
+                        || progress.processed_entries == progress.total_entries
+                    {
+                        eprintln!(
+                            "processed {}/{} entries, {}/{} bytes",
+                            progress.processed_entries,
+                            progress.total_entries,
+                            progress.processed_bytes,
+                            progress.total_bytes
+                        );
+                    }
+                    Ok(())
+                },
+            )?;
             print_json(&report)?;
         }
         Command::HashDuplicates { source, catalog } => {

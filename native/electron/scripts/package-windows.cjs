@@ -56,6 +56,7 @@ const requiredPackageFiles = [
   path.join("resources", "app", "native", "electron", "preload.cjs"),
   path.join("resources", "app", "native", "electron", "renderer.html"),
   path.join("resources", "app", "native", "electron", "renderer.js"),
+  path.join("resources", "app", "native", "electron", "session-cache.cjs"),
   path.join("resources", "app", "native", "electron", "sidecar-client.cjs"),
   path.join("resources", "app", "native", "electron", "styles.css"),
   path.join("resources", "app", "native", "electron", "assets", "icon.ico"),
@@ -221,6 +222,7 @@ for (const filename of [
   "preload.cjs",
   "renderer.html",
   "renderer.js",
+  "session-cache.cjs",
   "sidecar-client.cjs",
   "styles.css"
 ]) {
