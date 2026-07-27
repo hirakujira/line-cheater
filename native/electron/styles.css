@@ -602,12 +602,10 @@ progress { width: 100%; height: 8px; }
 .cleanup-warning strong { white-space: nowrap; }
 .cleanup-preflight, .cleanup-plan-previews { margin-bottom: 8px; padding: 8px 10px; border: 1px solid #bfdbfe; border-radius: 9px; color: #1e3a8a; background: #eff6ff; font-size: 0.72rem; }
 .cleanup-preflight.has-blockers { border-color: #fecaca; color: #991b1b; background: #fef2f2; }
-.cleanup-preflight.has-warnings { border-color: #fde68a; color: #92400e; background: #fffbeb; }
 .cleanup-preflight-heading, .cleanup-plan-previews-heading { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 10px; }
 .cleanup-preflight-heading > div, .cleanup-plan-previews-heading > div { display: flex; min-width: 0; gap: 8px; align-items: baseline; }
 .cleanup-preflight-heading span, .cleanup-plan-previews-heading span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
 .cleanup-preflight-heading button { padding: 5px 8px; font-size: 0.68rem; }
-.cleanup-preflight-actions { display: flex; flex: 0 0 auto; gap: 5px; }
 .cleanup-preflight-risks { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; }
 .cleanup-preflight-risk { display: grid; max-width: 100%; gap: 2px; padding: 5px 7px; border-radius: 7px; color: #475569; background: rgba(255, 255, 255, 0.72); }
 .cleanup-preflight-risk strong { color: #334155; font-size: 0.68rem; }
@@ -630,20 +628,6 @@ progress { width: 100%; height: 8px; }
 .cleanup-plan-card p { min-height: 2.7em; margin: 0; color: var(--muted); line-height: 1.35; }
 .cleanup-plan-metrics { display: grid; gap: 2px; color: #475569; font-size: 0.65rem; font-variant-numeric: tabular-nums; }
 .cleanup-plan-preview-warnings { display: grid; gap: 2px; color: #92400e; font-size: 0.63rem; line-height: 1.3; }
-.cleanup-audit { margin-bottom: 8px; padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 9px; color: #334155; background: #f8fafc; font-size: 0.7rem; }
-.cleanup-audit.has-events { border-color: #94a3b8; }
-.cleanup-audit-heading { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 10px; }
-.cleanup-audit-heading > div:first-child { display: flex; min-width: 0; gap: 8px; align-items: baseline; }
-.cleanup-audit-heading span { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; }
-.cleanup-audit-actions { display: flex; flex: 0 0 auto; gap: 5px; }
-.cleanup-audit-actions button { padding: 5px 8px; font-size: 0.68rem; }
-.cleanup-audit-plan { display: flex; min-width: 0; flex-wrap: wrap; gap: 5px 8px; align-items: center; margin-top: 6px; color: var(--muted); font-size: 0.65rem; }
-.cleanup-audit-plan code { max-width: 260px; overflow: hidden; color: #475569; text-overflow: ellipsis; white-space: nowrap; }
-.cleanup-audit-events { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; margin-top: 6px; }
-.cleanup-audit-event { display: grid; min-width: 0; gap: 2px; padding: 5px 7px; border-radius: 7px; background: white; }
-.cleanup-audit-event strong, .cleanup-audit-event span, .cleanup-audit-event small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cleanup-audit-event strong { color: #475569; font-size: 0.65rem; }
-.cleanup-audit-event span, .cleanup-audit-event small { color: var(--muted); font-size: 0.61rem; }
 .cleanup-plan-bar { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; padding: 8px 10px; border: 1px solid #99f6e4; border-radius: 9px; color: #115e59; background: #f0fdfa; font-size: 0.74rem; }
 .cleanup-plan-bar > div:first-child { display: flex; min-width: 0; gap: 8px; align-items: baseline; }
 .cleanup-plan-bar > div:first-child span { overflow: hidden; color: #0f766e; text-overflow: ellipsis; white-space: nowrap; }
@@ -847,7 +831,6 @@ progress { width: 100%; height: 8px; }
   .cleanup-plan-bar > div:first-child span { white-space: normal; }
   .cleanup-plan-cards { grid-template-columns: 1fr; }
   .cleanup-plan-card p { min-height: 0; }
-  .cleanup-audit-events { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .advanced-issue-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
@@ -873,13 +856,8 @@ progress { width: 100%; height: 8px; }
   .cleanup-plan-actions button { flex: 1 1 auto; }
   .cleanup-preflight-heading, .cleanup-plan-previews-heading { align-items: flex-start; flex-direction: column; }
   .cleanup-preflight-heading > div, .cleanup-plan-previews-heading > div { align-items: flex-start; flex-direction: column; gap: 2px; }
-  .cleanup-preflight-actions { align-self: flex-end; flex-direction: row !important; }
   .cleanup-preflight-heading span, .cleanup-plan-previews-heading span { white-space: normal; }
   .cleanup-preflight-heading button { align-self: flex-end; }
-  .cleanup-audit-heading { align-items: flex-start; flex-direction: column; }
-  .cleanup-audit-heading > div:first-child { align-items: flex-start; flex-direction: column; gap: 2px; }
-  .cleanup-audit-heading span { white-space: normal; }
-  .cleanup-audit-actions { align-self: flex-end; }
   .cleanup-group-row { grid-template-columns: 1fr; }
   .cleanup-group-open-button { padding: 5px 9px 2px; }
   .cleanup-group-actions { justify-content: flex-end; padding: 0 9px 5px; }

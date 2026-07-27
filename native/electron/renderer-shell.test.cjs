@@ -357,10 +357,10 @@ test("surfaces cleanup blindspot scans, plan previews, and candidate verificatio
   assert.match(renderer, /function selectCleanupPlan\(profile\)/);
   assert.match(renderer, /cleanupPlanPreviewsCollapsed = true/);
   assert.match(renderer, /function toggleCleanupPlanPreviews\(\)/);
-  assert.match(renderer, /function toggleCleanupPreflightRisks\(\)/);
+  assert.match(renderer, /const visible = blockers > 0/);
+  assert.match(renderer, /classList\.toggle\("hidden", !visible\)/);
   assert.match(html, /role="radiogroup" aria-label="清理方案"/);
   assert.match(html, /id="toggle-cleanup-plan-previews"/);
-  assert.match(html, /id="toggle-cleanup-preflight-risks"/);
   assert.match(styles, /\.cleanup-plan-previews\.is-collapsed \.cleanup-plan-cards/);
   assert.match(renderer, /function renderCandidateReport\(report\)/);
   assert.match(renderer, /Number\(cleanupPreflight\.blockerCount\)/);
@@ -378,26 +378,18 @@ test("keeps long-running searches and image loading responsive", () => {
   assert.match(renderer, /cleanupPreviewObserver\.disconnect\(\)/);
 });
 
-test("copies cleanup summaries through trusted Electron clipboard IPC", () => {
-  assert.match(renderer, /await bridge\.copyText\(summary\)/);
-  assert.doesNotMatch(renderer, /navigator\.clipboard\.writeText/);
-  assert.match(preload, /copyText\(value\)/);
-  assert.match(preload, /line-native:copy-text/);
-  assert.match(main, /ipcMain\.handle\("line-native:copy-text"/);
-  assert.match(main, /assertTrustedSender\(event\)/);
-  assert.match(main, /clipboard\.writeText\(value\)/);
-  assert.match(main, /MAX_CLIPBOARD_BYTES/);
+test("keeps audit details out of the primary cleanup workflow", () => {
+  assert.doesNotMatch(html, /id="cleanup-audit"/);
+  assert.doesNotMatch(renderer, /provider\.cleanupAudit\(20\)/);
+  assert.doesNotMatch(renderer, /function renderCleanupAudit\(\)/);
+  assert.doesNotMatch(renderer, /function copyCleanupPlanSummary\(\)/);
+  assert.match(main, /"cleanupAudit"/);
 });
 
-test("surfaces cleanup audit history and restore checklist", () => {
-  assert.match(html, /id="cleanup-audit"/);
-  assert.match(html, /id="copy-cleanup-plan"/);
+test("surfaces the restore checklist before candidate creation", () => {
   assert.match(html, /id="restore-checklist-modal"/);
   assert.match(html, /id="restore-check-original"/);
   assert.match(html, /id="restore-check-confirm"/);
-  assert.match(renderer, /provider\.cleanupAudit\(20\)/);
-  assert.match(renderer, /function renderCleanupAudit\(\)/);
-  assert.match(renderer, /function copyCleanupPlanSummary\(\)/);
   assert.match(renderer, /function requestRestoreChecklist\(\)/);
   assert.match(renderer, /if \(!await requestRestoreChecklist\(\)\) return;/);
   assert.match(main, /"cleanupAudit"/);

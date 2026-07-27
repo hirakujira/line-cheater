@@ -239,14 +239,9 @@
                       <strong id="cleanup-preflight-title">清理前盲點掃描</strong>
                       <span id="cleanup-preflight-summary">正在檢查來源、索引與不確定檔案…</span>
                     </div>
-                    <div class="cleanup-preflight-actions">
-                      <button id="toggle-cleanup-preflight-risks" class="secondary-button" type="button" hidden>
-                        查看提醒
-                      </button>
-                      <button id="refresh-cleanup-preflight" class="secondary-button" type="button" disabled>
-                        重新檢查
-                      </button>
-                    </div>
+                    <button id="refresh-cleanup-preflight" class="secondary-button" type="button" disabled>
+                      重新檢查
+                    </button>
                   </div>
                   <div id="cleanup-preflight-risks" class="cleanup-preflight-risks"></div>
                 </section>
@@ -263,24 +258,6 @@
                     </button>
                   </div>
                   <div id="cleanup-plan-cards" class="cleanup-plan-cards" role="radiogroup" aria-label="清理方案"></div>
-                </section>
-                <section id="cleanup-audit" class="cleanup-audit" aria-labelledby="cleanup-audit-title">
-                  <div class="cleanup-audit-heading">
-                    <div>
-                      <strong id="cleanup-audit-title">操作紀錄與可重現計畫</strong>
-                      <span id="cleanup-audit-summary">正在整理最近操作與計畫指紋…</span>
-                    </div>
-                    <div class="cleanup-audit-actions">
-                      <button id="refresh-cleanup-audit" class="secondary-button" type="button" disabled>
-                        重新整理
-                      </button>
-                      <button id="copy-cleanup-plan" class="secondary-button" type="button" disabled>
-                        複製計畫摘要
-                      </button>
-                    </div>
-                  </div>
-                  <div id="cleanup-audit-plan" class="cleanup-audit-plan"></div>
-                  <div id="cleanup-audit-events" class="cleanup-audit-events"></div>
                 </section>
                 <div class="cleanup-plan-bar" aria-live="polite">
                   <div>

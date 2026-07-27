@@ -91,16 +91,16 @@ grouped below rather than treated as separate feature changes.
 - The desktop cleanup preview now has an explicit plan selector: choosing a
   profile switches the bounded review filter and collapses the comparison cards
   until the user asks to change the plan. Non-blocking preflight warnings stay
-  on one compact row with their details behind a toggle. Cleanup and chat image
-  previews hydrate only near the visible viewport, with at most four concurrent
-  native preview requests; the renderer shows FTS5 build progress and the
-  verified sidecar session avoids repeating full source-content verification on
-  every subsequent search.
-- Cleanup actions now retain a bounded recent activity history and produce a
+  out of the primary workspace; only blockers expand the safety panel. Cleanup
+  and chat image previews hydrate only near the visible viewport, with at most
+  four concurrent native preview requests; the renderer shows FTS5 build
+  progress and the verified sidecar session avoids repeating full source-content
+  verification on every subsequent search.
+- Cleanup actions retain a bounded recent activity history and produce a
   reproducible plan fingerprint from the source fingerprint, removal reasons,
-  selected paths, chat-removal plan, and orphan-message plan. The desktop shows
-  recent actions and can copy a plan summary without serializing the full file
-  list.
+  selected paths, chat-removal plan, and orphan-message plan. This audit data
+  remains a native-core compatibility/provenance surface, while the primary
+  desktop cleanup workspace keeps the audit panel out of the main flow.
 - Candidate creation now opens a restore checklist asking the user to retain
   the original backup, test in a safe environment, and verify chats/images/
   SQLite after restore before the candidate writer starts.

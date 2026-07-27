@@ -3,7 +3,6 @@
 const {
   app,
   BrowserWindow,
-  clipboard,
   dialog,
   ipcMain,
   net,
@@ -82,7 +81,6 @@ const outputTokens = new Map();
 const previewTokens = new Map();
 const MAX_PREVIEW_TOKENS = 128;
 const MAX_PREVIEW_BYTES = 16 * 1024 * 1024;
-const MAX_CLIPBOARD_BYTES = 256 * 1024;
 
 async function checkForUpdates() {
   if (updateCheckStarted || !app.isPackaged) return;
@@ -343,15 +341,6 @@ async function registerIpc() {
       bytes: preview.bytes
     });
     return `${APP_ORIGIN}/preview/${token}`;
-  });
-
-  ipcMain.handle("line-native:copy-text", async (event, value) => {
-    assertTrustedSender(event);
-    if (typeof value !== "string" || Buffer.byteLength(value, "utf8") > MAX_CLIPBOARD_BYTES) {
-      throw new TypeError("Invalid clipboard text.");
-    }
-    clipboard.writeText(value);
-    return true;
   });
 
   ipcMain.handle("line-native:open-external", async (event, value) => {
