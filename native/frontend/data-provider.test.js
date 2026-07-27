@@ -198,15 +198,53 @@ test("forwards cleanup detail and group actions without exposing arbitrary metho
   });
   await provider.listCleanupReviews("chat:u1");
   await provider.applyCleanupGroupAction("chat:u1", "keep_thumbnail");
+  await provider.planSafeAttachmentCleanup();
+  await provider.clearManualAttachmentPlan();
   assert.equal(calls[0].params.groupKey, "chat:u1");
   assert.deepEqual(calls[1], {
     method: "applyCleanupGroupAction",
     params: { groupKey: "chat:u1", action: "keep_thumbnail" }
   });
+  assert.deepEqual(calls.slice(2), [
+    { method: "planSafeAttachmentCleanup", params: {} },
+    { method: "clearManualAttachmentPlan", params: {} }
+  ]);
   assert.throws(
     () => provider.applyCleanupGroupAction("chat:u1", "delete_now"),
     TypeError
   );
+});
+
+test("forwards cleanup preflight and plan preview reports", async () => {
+  const calls = [];
+  const provider = new NativeDataProvider({
+    request: async (method, params) => {
+      calls.push({ method, params });
+      return method === "cleanupPlanPreviews" ? [] : { blockerCount: 0 };
+    }
+  });
+  await provider.cleanupPreflight();
+  await provider.cleanupPlanPreviews();
+  assert.deepEqual(calls, [
+    { method: "cleanupPreflight", params: {} },
+    { method: "cleanupPlanPreviews", params: {} }
+  ]);
+});
+
+test("bounds cleanup audit history requests", async () => {
+  const calls = [];
+  const provider = new NativeDataProvider({
+    request: async (method, params) => {
+      calls.push({ method, params });
+      return { plan: {}, events: [] };
+    }
+  });
+  await provider.cleanupAudit(40);
+  assert.deepEqual(calls[0], {
+    method: "cleanupAudit",
+    params: { limit: 40 }
+  });
+  assert.throws(() => provider.cleanupAudit(1001), RangeError);
 });
 
 test("validates and forwards advanced SQLite cleanup operations", async () => {

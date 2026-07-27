@@ -12,10 +12,11 @@ use crate::database::{
 };
 use crate::model::{
     AdvancedCleanupReport, AttachmentCursor, AttachmentKind, Chat, ChatCursor, ChatPage,
-    CleanupGroupPage, DEFAULT_PAGE_SIZE, DuplicateGroupCursor, MessageCursor, MessagePage,
+    CleanupGroupPage, CleanupPreflightReport, CleanupRisk, DEFAULT_PAGE_SIZE, DuplicateGroupCursor,
+    MessageCursor, MessagePage,
 };
 use crate::performance::system_performance_profile;
-use crate::source::{PreparedSource, prepare_source_reporting};
+use crate::source::{PreparedSource, SourceKind, prepare_source_reporting};
 
 pub const SIDECAR_PROTOCOL_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -249,6 +250,13 @@ struct AttachmentPageParams {
 struct MarkParams {
     path: String,
     marked: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupAuditParams {
+    #[serde(default = "default_cleanup_audit_limit")]
+    limit: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -713,6 +721,9 @@ fn handle_request<W: Write>(
             session.catalog.set_marked(&params.path, params.marked)?;
             Ok(serde_json::to_value(session.catalog.stats()?)?)
         }
+        "clearManualAttachmentPlan" => Ok(serde_json::to_value(
+            session.catalog.clear_manual_attachment_plan()?,
+        )?),
         "stageAttachmentPreview" => {
             let params: PreviewParams = parse_params(request)?;
             Ok(serde_json::to_value(
@@ -725,6 +736,16 @@ fn handle_request<W: Write>(
         }
         "catalogStats" => Ok(serde_json::to_value(session.catalog.stats()?)?),
         "cleanupOverview" => Ok(serde_json::to_value(session.catalog.cleanup_overview()?)?),
+        "cleanupPreflight" => Ok(serde_json::to_value(cleanup_preflight(session)?)?),
+        "cleanupPlanPreviews" => Ok(serde_json::to_value(
+            session.catalog.cleanup_plan_previews()?,
+        )?),
+        "cleanupAudit" => {
+            let params: CleanupAuditParams = parse_params(request)?;
+            Ok(serde_json::to_value(
+                session.catalog.cleanup_audit(params.limit)?,
+            )?)
+        }
         "listCleanupGroups" => {
             let params: CleanupPageParams = parse_params(request)?;
             let page = if params.category == "no_attachments" {
@@ -763,6 +784,9 @@ fn handle_request<W: Write>(
                     .apply_cleanup_group_action(&params.group_key, &params.action)?,
             )?)
         }
+        "planSafeAttachmentCleanup" => Ok(serde_json::to_value(
+            session.catalog.plan_safe_attachment_cleanup()?,
+        )?),
         "advancedCleanupReport" => Ok(serde_json::to_value(advanced_cleanup_report(session)?)?),
         "setChatRemovalPlanned" => {
             let params: ChatRemovalParams = parse_params(request)?;
@@ -940,6 +964,193 @@ fn advanced_cleanup_report(session: &NativeSession) -> Result<AdvancedCleanupRep
     report_from_analysis(session, &analysis)
 }
 
+fn cleanup_preflight(session: &mut NativeSession) -> Result<CleanupPreflightReport> {
+    let quick_check = session.quick_check()?;
+    let source_read_only = session.database.is_read_only()?;
+    let catalog_source_current = session.catalog.source_matches_current(
+        &session.prepared.original_path,
+        session.prepared.report.kind,
+    )?;
+    session.catalog_source_verified = catalog_source_current;
+    let stats = session.catalog.stats()?;
+    let overview = session.catalog.cleanup_overview()?;
+    let active_job = session
+        .catalog
+        .active_job()?
+        .map(|(kind, job_id)| format!("{kind}:{job_id}"));
+    let source_kind = match session.prepared.report.kind {
+        SourceKind::Directory => "directory",
+        SourceKind::Sqlite => "sqlite",
+        SourceKind::ImazingArchive => "imazing_archive",
+    };
+    let unreferenced = overview
+        .categories
+        .iter()
+        .find(|total| total.category == "unreferenced")
+        .cloned()
+        .unwrap_or_else(|| crate::model::CleanupCategoryTotal {
+            category: "unreferenced".to_string(),
+            file_count: 0,
+            bytes: 0,
+        });
+    let unconfirmed = overview
+        .categories
+        .iter()
+        .find(|total| total.category == "unconfirmed")
+        .cloned()
+        .unwrap_or_else(|| crate::model::CleanupCategoryTotal {
+            category: "unconfirmed".to_string(),
+            file_count: 0,
+            bytes: 0,
+        });
+    let mut risks = Vec::new();
+    let mut add_risk =
+        |code: &str, severity: &str, title: &str, detail: String, file_count: u64, bytes: u64| {
+            risks.push(CleanupRisk {
+                code: code.to_string(),
+                severity: severity.to_string(),
+                title: title.to_string(),
+                detail,
+                file_count,
+                bytes,
+            });
+        };
+
+    if !source_read_only {
+        add_risk(
+            "source-writable",
+            "blocker",
+            "來源資料庫不是唯讀",
+            "為避免清理流程改寫原始備份，請先關閉可能正在使用來源資料庫的程式。".to_string(),
+            0,
+            0,
+        );
+    }
+    if !quick_check.eq_ignore_ascii_case("ok") {
+        add_risk(
+            "sqlite-check",
+            "blocker",
+            "SQLite 完整性檢查未通過",
+            format!("quick_check 回報：{quick_check}。建立候選檔前請先保留來源並修復資料庫。"),
+            0,
+            0,
+        );
+    }
+    if !catalog_source_current {
+        add_risk(
+            "catalog-stale",
+            "blocker",
+            "附件索引與目前來源不一致",
+            "來源檔案可能在掃描後變更；請重新掃描附件，完成後再建立候選檔。".to_string(),
+            0,
+            0,
+        );
+    }
+    if stats.scan_status != "complete" {
+        add_risk(
+            "scan-incomplete",
+            "blocker",
+            "附件掃描尚未完成",
+            format!(
+                "目前掃描狀態為 {}，尚未取得完整檔案清單。",
+                stats.scan_status
+            ),
+            0,
+            0,
+        );
+    }
+    if overview.context_status != "complete" {
+        add_risk(
+            "context-incomplete",
+            "blocker",
+            "訊息與附件的交叉確認尚未完成",
+            format!(
+                "目前脈絡索引狀態為 {}；未完成前不會把不明檔案視為安全候選。",
+                overview.context_status
+            ),
+            0,
+            0,
+        );
+    }
+    if session.prepared.report.wal_present || session.prepared.report.shm_present {
+        add_risk(
+            "sqlite-companion",
+            "warning",
+            "來源旁仍有 SQLite 暫存檔",
+            "來源旁存在 -wal 或 -shm；請確認 LINE 與備份工具已停止寫入，再依目前快照清理。"
+                .to_string(),
+            0,
+            0,
+        );
+    }
+    if unreferenced.file_count > 0 {
+        add_risk(
+            "unreferenced-files",
+            "warning",
+            "有 SQLite 未引用附件",
+            "這些檔案可能是索引遺漏，也可能是可清理殘留；只能列入人工複核，不會由安全自動規則處理。".to_string(),
+            unreferenced.file_count,
+            unreferenced.bytes,
+        );
+    }
+    if unconfirmed.file_count > 0 {
+        add_risk(
+            "unconfirmed-files",
+            "warning",
+            "有無法確認來源的附件",
+            "無法把這些檔案安全對應到訊息；建立候選檔前請逐項查看路徑與內容。".to_string(),
+            unconfirmed.file_count,
+            unconfirmed.bytes,
+        );
+    }
+    if let Some(active_job) = active_job.as_deref() {
+        add_risk(
+            "active-job",
+            "warning",
+            "仍有原生工作正在執行",
+            format!("目前工作：{active_job}。請等待完成後再建立候選檔。"),
+            0,
+            0,
+        );
+    }
+    if overview.marked_count == 0 {
+        add_risk(
+            "nothing-marked",
+            "info",
+            "目前沒有已標記的清理項目",
+            "可以先查看清理方案預演，或從聊天室逐項選取附件。".to_string(),
+            0,
+            0,
+        );
+    }
+
+    let blocker_count = risks
+        .iter()
+        .filter(|risk| risk.severity == "blocker")
+        .count() as u64;
+    let warning_count = risks
+        .iter()
+        .filter(|risk| risk.severity == "warning")
+        .count() as u64;
+    Ok(CleanupPreflightReport {
+        source_kind: source_kind.to_string(),
+        source_read_only,
+        sqlite_quick_check: quick_check,
+        catalog_source_current,
+        scan_status: stats.scan_status,
+        context_status: overview.context_status,
+        active_job,
+        risk_count: risks.len() as u64,
+        blocker_count,
+        warning_count,
+        safe_candidate_count: overview.automatic_candidate_count,
+        safe_candidate_bytes: overview.automatic_candidate_bytes,
+        marked_count: overview.marked_count,
+        marked_bytes: overview.marked_bytes,
+        risks,
+    })
+}
+
 fn list_empty_attachment_chats(
     session: &NativeSession,
     params: &CleanupPageParams,
@@ -978,6 +1189,10 @@ fn default_message_source() -> String {
 
 fn default_message_limit() -> u32 {
     DEFAULT_PAGE_SIZE
+}
+
+fn default_cleanup_audit_limit() -> u32 {
+    20
 }
 
 fn default_attachment_limit() -> u32 {

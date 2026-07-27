@@ -166,12 +166,30 @@
     });
   };
 
+  NativeDataProvider.prototype.clearManualAttachmentPlan = function () {
+    return this.bridge.request("clearManualAttachmentPlan", {});
+  };
+
   NativeDataProvider.prototype.catalogStats = function () {
     return this.bridge.request("catalogStats", {});
   };
 
   NativeDataProvider.prototype.cleanupOverview = function () {
     return this.bridge.request("cleanupOverview", {});
+  };
+
+  NativeDataProvider.prototype.cleanupPreflight = function () {
+    return this.bridge.request("cleanupPreflight", {});
+  };
+
+  NativeDataProvider.prototype.cleanupPlanPreviews = function () {
+    return this.bridge.request("cleanupPlanPreviews", {});
+  };
+
+  NativeDataProvider.prototype.cleanupAudit = function (limit) {
+    return this.bridge.request("cleanupAudit", {
+      limit: boundedLimit(limit, 20)
+    });
   };
 
   NativeDataProvider.prototype.listCleanupGroups = async function (options) {
@@ -198,6 +216,10 @@
       groupKey: groupKey,
       action: action
     });
+  };
+
+  NativeDataProvider.prototype.planSafeAttachmentCleanup = function () {
+    return this.bridge.request("planSafeAttachmentCleanup", {});
   };
 
   NativeDataProvider.prototype.advancedCleanupReport = function () {

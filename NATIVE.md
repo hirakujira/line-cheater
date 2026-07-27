@@ -1,6 +1,6 @@
 # Native Core Architecture and Handoff
 
-Last updated: 2026-07-26
+Last updated: 2026-07-27
 
 This document is the durable handoff record for the bounded-memory desktop version
 of LINE Cheater. Keep it updated whenever the native implementation,
@@ -73,6 +73,29 @@ grouped below rather than treated as separate feature changes.
   the Windows x64 download alongside them.
 - The cleanup chat list now supports direct page-number jumps and preserves the
   overview page when entering a chat detail and returning to the list.
+- `0192de2` (`v0.1.19`) is the current baseline after a fast-forward pull from
+  `origin/main`.
+- Attachment cleanup plans now record `manual`, `automatic`, or `chat` evidence.
+  Safe automatic attachment cleanup only marks referenced image originals with
+  a matching non-empty thumbnail; it never marks PDFs, videos, missing-thumbnail
+  originals, or unconfirmed files. Manual marks and safe automatic marks can be
+  cleared independently before building the candidate.
+- `cleanupPreflight` now performs a bounded, read-only blindspot scan before
+  cleanup or candidate creation: SQLite `quick_check`, source/catalog freshness,
+  scan/context completion, WAL/SHM presence, unreferenced files, unconfirmed
+  files, active jobs, and the current marked/safe-candidate totals are surfaced
+  with blocker, warning, or informational severity. `cleanupPlanPreviews` adds
+  conservative, balanced, and aggressive previews; only the conservative safe
+  image rule is directly auto-applicable, while the other scopes remain
+  review-only.
+- Cleanup actions now retain a bounded recent activity history and produce a
+  reproducible plan fingerprint from the source fingerprint, removal reasons,
+  selected paths, chat-removal plan, and orphan-message plan. The desktop shows
+  recent actions and can copy a plan summary without serializing the full file
+  list.
+- Candidate creation now opens a restore checklist asking the user to retain
+  the original backup, test in a safe environment, and verify chats/images/
+  SQLite after restore before the candidate writer starts.
 
 ## Goal
 
@@ -253,6 +276,16 @@ Verified implementation:
   each Rust sidecar and Electron runtime is built natively.
 - [x] Port exact duplicate review into the desktop UI; cleanup-plan exports and
   the remaining analysis UX are still pending.
+- [x] Add separate manual and safe-automatic attachment cleanup controls,
+  persisted removal reasons, independent manual-plan clearing, and bounded
+  cleanup evidence in the renderer.
+- [x] Add cleanup-before-action blindspot scanning, conservative/balanced/
+  aggressive plan previews, blocker-gated candidate creation, and a candidate
+  verification report showing CRC, protected-file, SQLite-rewrite, output, and
+  warning results.
+- [x] Add bounded cleanup activity history, reproducible plan fingerprints,
+  copyable plan summaries, and a three-step restore checklist before candidate
+  creation.
 - [x] Gate exact-duplicate scanning and cleanup behind desktop Advanced mode,
   add catalog-authorized group previews, and let the candidate writer replace
   retained duplicate members with verified relative ZIP symbolic links.
@@ -266,12 +299,13 @@ Verified implementation:
 
 ### Latest verification record
 
-2026-07-26:
+2026-07-27:
 
 - Rust: 1.96.0.
-- Native tests: 32 passed; renderer provider tests: 10 passed; Electron
-  shell/cache tests: 38 passed (48 passed in the combined `npm test` command);
-  existing Python CLI tests: 19 passed.
+- Native tests: 33 passed; the combined Electron/provider test command: 60
+  passed. The sidecar fixture covers the new preflight and three plan-preview
+  responses plus cleanup audit history; the renderer shell checks the new
+  blindspot, audit, candidate-report, and restore-checklist controls.
 - Electron: 43.2.0 pinned; `npm audit` reported 0 vulnerabilities.
 - Ignored real fixture: 1.1 GB, 13,512 files, 11,239 classified attachments.
 - Catalog scan: approximately 0.36 seconds on the current machine.
@@ -338,6 +372,10 @@ Verified implementation:
 - The Electron directory picker, two-screen welcome/Next flow, persistent
   sidebar, mutually exclusive Browse/Cleanup views, cleanup group list, category
   summaries, pagination, review cards, and real image pixels were GUI-tested.
+- Safe automatic cleanup fixture coverage confirmed that only the referenced
+  image original with a matching non-empty thumbnail is selected, that manual
+  clearing leaves automatic plans independently controllable, and that the
+  source remains untouched.
   No removal checkbox or candidate build was triggered during this read-only
   visual pass. Manually regress native pickers and image rendering on every
   release target.
@@ -514,9 +552,14 @@ Supported methods:
 - `stageAttachmentPreview`
 - `catalogStats`
 - `cleanupOverview`
+- `cleanupPreflight`
+- `cleanupPlanPreviews`
+- `cleanupAudit`
+- `clearManualAttachmentPlan`
 - `listCleanupGroups`
 - `listCleanupReviews`
 - `applyCleanupGroupAction`
+- `planSafeAttachmentCleanup`
 - `advancedCleanupReport`
 - `setChatRemovalPlanned`
 - `planAutomaticCleanup`
@@ -603,6 +646,11 @@ It contains:
   database references and files whose path identifies the selected chat.
 - `orphan_message_removal_plan`: exact `LineSquare.ZMESSAGE.Z_PK` rows confirmed
   to have no matching `ZCHAT`.
+- `cleanup_activity`: the most recent 500 cleanup actions, including operation
+  scope, bounded counts/bytes, and timestamps. `cleanupAudit` returns this
+  bounded history together with a SHA-256 plan fingerprint; the fingerprint is
+  recomputed from the current source and plan rather than treated as an
+  authorization token.
 
 A catalog is bound to one canonical source path. Reusing it for another source
 is rejected. Directory sources store a deterministic recursive metadata manifest
@@ -685,6 +733,14 @@ generated fixture tests:
   thumbnail for the same message ID and path chat. PDFs, videos, missing or
   empty thumbnails, and unconfirmed media remain untouched. Matching thumbnail
   marks are cleared; invoking it again restores those image originals.
+- Manual attachment marks persist with `reason = manual`; safe automatic marks
+  persist with `reason = automatic`; chat-removal-derived marks remain
+  `reason = chat`. The overview and renderer expose these sources separately,
+  and clearing manual marks cannot remove automatic or chat plans.
+- Before candidate creation, the preflight treats an unhealthy SQLite check,
+  stale catalog, incomplete scan, incomplete context index, or writable source
+  as a blocker. Unreferenced and unconfirmed attachments are warnings and are
+  shown in balanced/aggressive previews as review-only items.
 
 The UI filters `all/original/thumbnail/marked`, categories
 `all/individual/group/community/unreferenced/unconfirmed`, sorting

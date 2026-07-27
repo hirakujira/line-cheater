@@ -26,6 +26,7 @@ let sourceGeneration = 0;
 let messageRenderGeneration = 0;
 let packageInProgress = false;
 let cancelInProgress = false;
+let restoreChecklistResolve = null;
 let duplicateLoading = false;
 let duplicateScanComplete = false;
 let duplicatePage = null;
@@ -39,6 +40,10 @@ const duplicateMembers = new Map();
 let imageModalTrigger = null;
 let cleanupPage = null;
 let cleanupOverview = null;
+let cleanupPreflight = null;
+let cleanupPlanPreviews = null;
+let cleanupAudit = null;
+let cleanupPreflightLoading = false;
 let cleanupLoading = false;
 let cleanupReloadPending = false;
 let cleanupSearchTimer = null;
@@ -123,6 +128,23 @@ const elements = {
   cleanupSort: document.querySelector("#cleanup-sort"),
   markedCount: document.querySelector("#marked-count"),
   markedSize: document.querySelector("#marked-size"),
+  cleanupAutomationSummary: document.querySelector("#cleanup-automation-summary"),
+  cleanupPreflight: document.querySelector("#cleanup-preflight"),
+  cleanupPreflightTitle: document.querySelector("#cleanup-preflight-title"),
+  cleanupPreflightSummary: document.querySelector("#cleanup-preflight-summary"),
+  cleanupPreflightRisks: document.querySelector("#cleanup-preflight-risks"),
+  refreshCleanupPreflight: document.querySelector("#refresh-cleanup-preflight"),
+  cleanupPlanPreviews: document.querySelector("#cleanup-plan-previews"),
+  cleanupPlanPreviewsSummary: document.querySelector("#cleanup-plan-previews-summary"),
+  cleanupPlanCards: document.querySelector("#cleanup-plan-cards"),
+  cleanupAudit: document.querySelector("#cleanup-audit"),
+  cleanupAuditSummary: document.querySelector("#cleanup-audit-summary"),
+  refreshCleanupAudit: document.querySelector("#refresh-cleanup-audit"),
+  copyCleanupPlan: document.querySelector("#copy-cleanup-plan"),
+  cleanupAuditPlan: document.querySelector("#cleanup-audit-plan"),
+  cleanupAuditEvents: document.querySelector("#cleanup-audit-events"),
+  planSafeAttachmentCleanup: document.querySelector("#plan-safe-attachment-cleanup"),
+  clearManualAttachmentPlan: document.querySelector("#clear-manual-attachment-plan"),
   categorySummary: document.querySelector("#category-summary"),
   cleanupResultInfo: document.querySelector("#cleanup-result-info"),
   cleanupList: document.querySelector("#cleanup-list"),
@@ -150,10 +172,18 @@ const elements = {
   packageModalCard: document.querySelector("#package-modal .package-modal-card"),
   packageModalTitle: document.querySelector("#package-modal-title"),
   packageModalMessage: document.querySelector("#package-modal-message"),
+  packageModalReport: document.querySelector("#package-modal-report"),
   packageModalProgress: document.querySelector("#package-modal-progress"),
   packageModalProgressLabel: document.querySelector("#package-modal-progress-label"),
   packageModalCancel: document.querySelector("#package-modal-cancel"),
   packageModalClose: document.querySelector("#package-modal-close"),
+  restoreChecklistModal: document.querySelector("#restore-checklist-modal"),
+  restoreChecklistCard: document.querySelector("#restore-checklist-modal .restore-checklist-card"),
+  restoreCheckOriginal: document.querySelector("#restore-check-original"),
+  restoreCheckTest: document.querySelector("#restore-check-test"),
+  restoreCheckVerify: document.querySelector("#restore-check-verify"),
+  restoreCheckCancel: document.querySelector("#restore-check-cancel"),
+  restoreCheckConfirm: document.querySelector("#restore-check-confirm"),
   imageModal: document.querySelector("#image-modal"),
   imageModalCard: document.querySelector("#image-modal .image-modal-card"),
   imageModalImage: document.querySelector("#image-modal-image"),
@@ -278,6 +308,12 @@ function returnToWelcome() {
   elements.enterWorkspace.focus();
 }
 
+function invalidateCleanupInsights() {
+  cleanupPreflight = null;
+  cleanupPlanPreviews = null;
+  cleanupAudit = null;
+}
+
 function resetAfterCandidateBuild() {
   sourceGeneration += 1;
   chatRequestGeneration += 1;
@@ -299,6 +335,7 @@ function resetAfterCandidateBuild() {
   duplicateMembers.clear();
   cleanupPage = null;
   cleanupOverview = null;
+  invalidateCleanupInsights();
   cleanupReloadPending = false;
   disposeCleanupAlbum();
   setAdvancedMode(false);
@@ -366,6 +403,7 @@ function showPackageModal(message) {
   elements.packageModalCancel.disabled = false;
   elements.packageModalCancel.textContent = "取消建立";
   elements.packageModalClose.classList.add("hidden");
+  renderCandidateReport(null);
   updatePackageModalProgress(0, message);
   setModalBusy(true, "package-modal-open");
   window.requestAnimationFrame(() => elements.packageModalCard.focus());
@@ -377,6 +415,52 @@ function updatePackageModalProgress(percent, message) {
   elements.packageModalProgress.setAttribute("aria-valuenow", String(progress));
   elements.packageModalProgressLabel.textContent = `${progress}%`;
   if (message) elements.packageModalMessage.textContent = message;
+}
+
+function renderCandidateReport(report) {
+  if (!report) {
+    elements.packageModalReport.classList.add("hidden");
+    elements.packageModalReport.replaceChildren();
+    return;
+  }
+  const checks = [
+    ["完整 CRC", report.fullCrcVerified ? "通過" : "未執行", report.fullCrcVerified],
+    ["保留檔驗證", `${(report.protectedEntriesVerified || []).length.toLocaleString()} 筆`, true],
+    ["SQLite 重寫", `${(report.rewrittenDatabases || []).length.toLocaleString()} 個`, true],
+    ["警告", `${(report.warnings || []).length.toLocaleString()} 則`, !(report.warnings || []).length]
+  ];
+  const fragment = document.createDocumentFragment();
+  const heading = document.createElement("strong");
+  heading.textContent = "候選檔驗證報告";
+  const metrics = document.createElement("div");
+  metrics.className = "package-report-metrics";
+  for (const [label, value, passed] of checks) {
+    const item = document.createElement("span");
+    item.className = passed ? "passed" : "attention";
+    item.textContent = `${label}：${value}`;
+    metrics.append(item);
+  }
+  const counts = document.createElement("p");
+  counts.className = "package-report-counts";
+  counts.textContent =
+    `輸出 ${Number(report.outputEntries || 0).toLocaleString()} 筆 · ` +
+    `移除 ${Number(report.removedEntries || 0).toLocaleString()} 個檔案 · ` +
+    `釋出 ${formatBytes(report.outputBytes || 0)} · ` +
+    `移除 ${Number(report.removedChats || 0).toLocaleString()} 個聊天室、` +
+    `${Number(report.removedMessages || 0).toLocaleString()} 則訊息`;
+  fragment.append(heading, metrics, counts);
+  if ((report.warnings || []).length) {
+    const warnings = document.createElement("ul");
+    warnings.className = "package-report-warnings";
+    for (const warning of report.warnings) {
+      const item = document.createElement("li");
+      item.textContent = warning;
+      warnings.append(item);
+    }
+    fragment.append(warnings);
+  }
+  elements.packageModalReport.replaceChildren(fragment);
+  elements.packageModalReport.classList.remove("hidden");
 }
 
 function completePackageModal(error, title, message) {
@@ -396,6 +480,39 @@ function closePackageModal() {
   elements.packageModal.classList.add("hidden");
   elements.packageModal.setAttribute("aria-hidden", "true");
   setModalBusy(false, "package-modal-open");
+}
+
+function closeRestoreChecklist(confirmed) {
+  if (!restoreChecklistResolve) return;
+  const resolve = restoreChecklistResolve;
+  restoreChecklistResolve = null;
+  elements.restoreChecklistModal.classList.add("hidden");
+  elements.restoreChecklistModal.setAttribute("aria-hidden", "true");
+  setModalBusy(false, "restore-checklist-open");
+  resolve(Boolean(confirmed));
+}
+
+function requestRestoreChecklist() {
+  if (restoreChecklistResolve) return Promise.resolve(false);
+  elements.restoreCheckOriginal.checked = false;
+  elements.restoreCheckTest.checked = false;
+  elements.restoreCheckVerify.checked = false;
+  elements.restoreCheckConfirm.disabled = true;
+  elements.restoreChecklistModal.classList.remove("hidden");
+  elements.restoreChecklistModal.setAttribute("aria-hidden", "false");
+  setModalBusy(true, "restore-checklist-open");
+  window.requestAnimationFrame(() => elements.restoreChecklistCard.focus());
+  return new Promise((resolve) => {
+    restoreChecklistResolve = resolve;
+  });
+}
+
+function updateRestoreChecklistState() {
+  elements.restoreCheckConfirm.disabled = !(
+    elements.restoreCheckOriginal.checked &&
+    elements.restoreCheckTest.checked &&
+    elements.restoreCheckVerify.checked
+  );
 }
 
 function isOperationCancelled(error) {
@@ -623,6 +740,7 @@ async function openSource(kind) {
     disposeCleanupAlbum();
     cleanupReloadPending = false;
     cleanupPage = cleanupOverview = null;
+    invalidateCleanupInsights();
     Object.assign(cleanupState, {
       page: 1,
       search: "",
@@ -637,6 +755,21 @@ async function openSource(kind) {
     elements.cleanupCategory.value = "all";
     elements.cleanupSort.value = "size";
     elements.cleanupList.replaceChildren(emptyState("請先掃描附件。"));
+    elements.cleanupAutomationSummary.textContent =
+      "安全自動清理只會標記已確認的圖片原檔，並保留非空縮圖。";
+    elements.cleanupPreflight.classList.remove("has-blockers", "has-warnings");
+    elements.cleanupPreflightTitle.textContent = "清理前盲點掃描";
+    elements.cleanupPreflightSummary.textContent = "正在檢查來源、索引與不確定檔案…";
+    elements.cleanupPreflightRisks.replaceChildren();
+    elements.cleanupPlanCards.replaceChildren();
+    elements.cleanupAudit.classList.remove("has-events");
+    elements.cleanupAuditSummary.textContent = "正在整理最近操作與計畫指紋…";
+    elements.cleanupAuditPlan.replaceChildren();
+    elements.cleanupAuditEvents.replaceChildren();
+    elements.refreshCleanupAudit.disabled = true;
+    elements.copyCleanupPlan.disabled = true;
+    elements.planSafeAttachmentCleanup.disabled = true;
+    elements.clearManualAttachmentPlan.disabled = true;
     elements.duplicateGroups.replaceChildren(emptyState("先掃描附件，找出完全相同的檔案。"));
     elements.duplicateSummary.classList.add("hidden");
     setDuplicateAutoMerge(false);
@@ -664,6 +797,8 @@ async function openSource(kind) {
     const sourceSize = Number(info.source.sourceBytes) || Number(info.source.databaseBytes) || 0;
     updateLoadModalProgress(20, "正在整理聊天室名稱與附件索引…");
     elements.scanCatalog.disabled = false;
+    elements.planSafeAttachmentCleanup.disabled = true;
+    elements.clearManualAttachmentPlan.disabled = true;
     elements.hashDuplicates.disabled = info.source.kind === "sqlite" ||
       info.catalog.scanStatus !== "complete";
     elements.searchButton.disabled = true;
@@ -1527,6 +1662,7 @@ async function changeDuplicateMark(checkbox) {
     const member = members.find((item) => item.path === path);
     if (member) member.markedForRemoval = checkbox.checked;
     cleanupOverview = null;
+    invalidateCleanupInsights();
     await loadDuplicateGroups(duplicatePageNumber);
     setStatus(checkbox.checked ? "已標記重複副本。" : "已取消標記重複副本。", false);
   } catch (error) {
@@ -1548,6 +1684,8 @@ async function scanCatalog(options) {
   try {
     setStatus("正在建立磁碟附件索引…");
     elements.scanCatalog.disabled = true;
+    elements.planSafeAttachmentCleanup.disabled = true;
+    elements.clearManualAttachmentPlan.disabled = true;
     setCandidateBuildDisabled(true);
     const stats = await provider.scanCatalog();
     elements.progress.max = 1;
@@ -1573,6 +1711,7 @@ async function scanCatalog(options) {
     cleanupState.page = 1;
     cleanupState.groupKey = null;
     cleanupPage = cleanupOverview = null;
+    invalidateCleanupInsights();
     await loadCleanupPage();
     setCandidateBuildDisabled(false);
     setStatus("附件索引與聊天室關聯完成。");
@@ -1591,6 +1730,7 @@ async function scanCatalog(options) {
     return null;
   } finally {
     elements.scanCatalog.disabled = !provider;
+    if (cleanupOverview) renderCleanupOverview();
     if (ownsModal && !options.keepLoadModal) closeLoadModal();
   }
 }
@@ -1633,8 +1773,19 @@ async function loadCleanupPage() {
       cleanupOverview = overview;
       page = loadedPage;
     }
+    const [preflight, previews, audit] = await Promise.all([
+      cleanupPreflight || provider.cleanupPreflight(),
+      cleanupPlanPreviews || provider.cleanupPlanPreviews(),
+      cleanupAudit || provider.cleanupAudit(20)
+    ]);
+    cleanupPreflight = preflight;
+    cleanupPlanPreviews = previews;
+    cleanupAudit = audit;
     cleanupPage = page;
     renderCleanupOverview();
+    renderCleanupPreflight();
+    renderCleanupPlanPreviews();
+    renderCleanupAudit();
     renderCleanupPage();
   } catch (error) {
     setStatus(error.message, true);
@@ -1649,10 +1800,209 @@ async function loadCleanupPage() {
   }
 }
 
+function renderCleanupPreflight() {
+  if (!cleanupPreflight) return;
+  const blockers = Number(cleanupPreflight.blockerCount) || 0;
+  const warnings = Number(cleanupPreflight.warningCount) || 0;
+  const safeCandidates = Number(cleanupPreflight.safeCandidateCount) || 0;
+  elements.cleanupPreflight.classList.toggle("has-blockers", blockers > 0);
+  elements.cleanupPreflight.classList.toggle("has-warnings", blockers === 0 && warnings > 0);
+  elements.cleanupPreflightTitle.textContent = blockers
+    ? `清理前盲點掃描：暫停（${blockers} 個阻擋項）`
+    : warnings
+      ? `清理前盲點掃描：可繼續，但有 ${warnings} 個提醒`
+      : "清理前盲點掃描：可以繼續";
+  elements.cleanupPreflightSummary.textContent =
+    `SQLite ${cleanupPreflight.sqliteQuickCheck} · ` +
+    `索引 ${cleanupPreflight.scanStatus} · ` +
+    `安全候選 ${safeCandidates.toLocaleString()} 個 · ` +
+    `已標記 ${Number(cleanupPreflight.markedCount || 0).toLocaleString()} 個`;
+  const fragment = document.createDocumentFragment();
+  for (const risk of cleanupPreflight.risks || []) {
+    const item = document.createElement("div");
+    item.className = `cleanup-preflight-risk ${risk.severity || "info"}`;
+    const heading = document.createElement("strong");
+    heading.textContent = risk.title;
+    const detail = document.createElement("span");
+    detail.textContent = risk.detail;
+    item.append(heading, detail);
+    if (Number(risk.fileCount) > 0) {
+      const amount = document.createElement("small");
+      amount.textContent = `${Number(risk.fileCount).toLocaleString()} 個 · ${formatBytes(risk.bytes)}`;
+      item.append(amount);
+    }
+    fragment.append(item);
+  }
+  elements.cleanupPreflightRisks.replaceChildren(fragment);
+  elements.refreshCleanupPreflight.disabled = !provider;
+}
+
+function renderCleanupPlanPreviews() {
+  if (!cleanupPlanPreviews) return;
+  const fragment = document.createDocumentFragment();
+  for (const preview of cleanupPlanPreviews) {
+    const card = document.createElement("article");
+    card.className = `cleanup-plan-card ${preview.profile || ""}`;
+    const title = document.createElement("strong");
+    title.textContent = preview.title;
+    const description = document.createElement("p");
+    description.textContent = preview.description;
+    const metrics = document.createElement("div");
+    metrics.className = "cleanup-plan-metrics";
+    const automatic = document.createElement("span");
+    automatic.textContent = `可自動 ${Number(preview.automaticFileCount || 0).toLocaleString()} 個 · ${formatBytes(preview.automaticBytes)}`;
+    const review = document.createElement("span");
+    review.textContent = `待複核 ${Number(preview.reviewFileCount || 0).toLocaleString()} 個 · ${formatBytes(preview.reviewBytes)}`;
+    const database = document.createElement("span");
+    database.textContent = `聊天室計畫 ${Number(preview.plannedChatCount || 0).toLocaleString()} 個 · ${Number(preview.plannedMessageCount || 0).toLocaleString()} 則訊息`;
+    metrics.append(automatic, review, database);
+    const warnings = document.createElement("div");
+    warnings.className = "cleanup-plan-preview-warnings";
+    for (const warning of preview.warnings || []) {
+      const note = document.createElement("span");
+      note.textContent = warning;
+      warnings.append(note);
+    }
+    card.append(title, description, metrics, warnings);
+    fragment.append(card);
+  }
+  elements.cleanupPlanCards.replaceChildren(fragment);
+  elements.cleanupPlanPreviewsSummary.textContent =
+    "保守方案可由上方按鈕套用；平衡與積極方案只列出人工複核範圍。";
+}
+
+const cleanupActionLabels = {
+  mark_attachment: "手動標記附件",
+  unmark_attachment: "取消附件標記",
+  clear_manual_plan: "清除手動計畫",
+  plan_safe_automatic: "套用安全自動計畫",
+  clear_safe_automatic_plan: "取消安全自動計畫",
+  plan_chat_removal: "加入聊天室清理",
+  clear_chat_removal: "取消聊天室清理",
+  plan_automatic_advanced: "套用進階自動計畫",
+  clear_automatic_advanced_plan: "取消進階自動計畫",
+  clear_advanced_plan: "清除進階計畫",
+  toggle_all: "切換整組附件",
+  keep_thumbnail: "套用保留縮圖"
+};
+
+function renderCleanupAudit() {
+  if (!cleanupAudit || !cleanupAudit.plan) return;
+  const plan = cleanupAudit.plan;
+  const fingerprint = String(plan.planFingerprint || "");
+  const sourceFingerprint = String(plan.sourceFingerprint || "");
+  elements.cleanupAudit.classList.toggle("has-events", (cleanupAudit.events || []).length > 0);
+  elements.cleanupAuditSummary.textContent =
+    `計畫 SHA-256 ${fingerprint.slice(0, 16) || "尚未建立"} · ` +
+    `最近 ${(cleanupAudit.events || []).length.toLocaleString()} 筆操作`;
+  const planFragment = document.createDocumentFragment();
+  const fingerprintNode = document.createElement("code");
+  fingerprintNode.textContent = fingerprint || "尚未建立計畫";
+  fingerprintNode.title = "清理計畫指紋；來源或標記內容改變後會改變。";
+  const sourceNode = document.createElement("span");
+  sourceNode.textContent = sourceFingerprint
+    ? `來源指紋 ${sourceFingerprint.slice(0, 16)} · `
+    : "來源指紋未建立 · ";
+  const counts = document.createElement("span");
+  counts.textContent =
+    `已標記 ${Number(plan.markedCount || 0).toLocaleString()} 個 · ` +
+    `手動 ${Number(plan.manualMarkedCount || 0).toLocaleString()} · ` +
+    `自動 ${Number(plan.automaticMarkedCount || 0).toLocaleString()} · ` +
+    `聊天室 ${Number(plan.chatMarkedCount || 0).toLocaleString()} · ` +
+    `資料庫 ${Number(plan.plannedChatCount || 0).toLocaleString()} 個聊天室 / ` +
+    `${Number(plan.plannedMessageCount || 0).toLocaleString()} 則訊息`;
+  planFragment.append(sourceNode, fingerprintNode, counts);
+  elements.cleanupAuditPlan.replaceChildren(planFragment);
+
+  const eventsFragment = document.createDocumentFragment();
+  for (const event of cleanupAudit.events || []) {
+    const item = document.createElement("div");
+    item.className = "cleanup-audit-event";
+    const action = document.createElement("strong");
+    action.textContent = cleanupActionLabels[event.action] || event.action;
+    const detail = document.createElement("span");
+    detail.textContent = `${event.scope || ""} · ${event.detail || ""}`;
+    const time = document.createElement("small");
+    const timestamp = Number(event.createdAt) * 1000;
+    const date = Number.isFinite(timestamp) && timestamp > 0
+      ? new Date(timestamp).toLocaleString()
+      : "時間未知";
+    time.textContent = `${date} · ${Number(event.fileCount || 0).toLocaleString()} 個 · ${formatBytes(event.bytes || 0)}`;
+    item.append(action, detail, time);
+    eventsFragment.append(item);
+  }
+  elements.cleanupAuditEvents.replaceChildren(eventsFragment);
+  elements.refreshCleanupAudit.disabled = !provider;
+  elements.copyCleanupPlan.disabled = !fingerprint;
+}
+
+async function copyCleanupPlanSummary() {
+  if (!cleanupAudit || !cleanupAudit.plan) return;
+  const plan = cleanupAudit.plan;
+  const summary = [
+    "LINE Cheater 清理計畫摘要",
+    `來源：${plan.sourcePath || "未知"}`,
+    `來源指紋：${plan.sourceFingerprint || "未建立"}`,
+    `計畫指紋：${plan.planFingerprint || "未建立"}`,
+    `已標記：${Number(plan.markedCount || 0).toLocaleString()} 個 / ${formatBytes(plan.markedBytes || 0)}`,
+    `手動：${Number(plan.manualMarkedCount || 0).toLocaleString()} 個 / ${formatBytes(plan.manualMarkedBytes || 0)}`,
+    `自動：${Number(plan.automaticMarkedCount || 0).toLocaleString()} 個 / ${formatBytes(plan.automaticMarkedBytes || 0)}`,
+    `聊天室：${Number(plan.chatMarkedCount || 0).toLocaleString()} 個 / ${formatBytes(plan.chatMarkedBytes || 0)}`,
+    `資料庫：${Number(plan.plannedChatCount || 0).toLocaleString()} 個聊天室 / ${Number(plan.plannedMessageCount || 0).toLocaleString()} 則訊息`
+  ].join("\n");
+  try {
+    await navigator.clipboard.writeText(summary);
+    setStatus("已複製可重現清理計畫摘要。", false);
+  } catch (error) {
+    setStatus(`無法複製計畫摘要：${error.message}`, true);
+  }
+}
+
+async function refreshCleanupPreflight() {
+  if (!provider || cleanupPreflightLoading) return;
+  cleanupPreflightLoading = true;
+  elements.refreshCleanupPreflight.disabled = true;
+  try {
+    const [preflight, previews, audit] = await Promise.all([
+      provider.cleanupPreflight(),
+      provider.cleanupPlanPreviews(),
+      provider.cleanupAudit(20)
+    ]);
+    cleanupPreflight = preflight;
+    cleanupPlanPreviews = previews;
+    cleanupAudit = audit;
+    renderCleanupPreflight();
+    renderCleanupPlanPreviews();
+    renderCleanupAudit();
+    setCandidateBuildDisabled(false);
+    setStatus("已完成清理前盲點掃描。", false);
+  } catch (error) {
+    setStatus(`清理前檢查失敗：${error.message}`, true);
+  } finally {
+    cleanupPreflightLoading = false;
+    elements.refreshCleanupPreflight.disabled = !provider;
+  }
+}
+
 function renderCleanupOverview() {
   if (!cleanupOverview) return;
   elements.markedCount.textContent = cleanupOverview.markedCount.toLocaleString();
   elements.markedSize.textContent = formatBytes(cleanupOverview.markedBytes);
+  const automaticCandidates = Number(cleanupOverview.automaticCandidateCount) || 0;
+  const automaticCandidateBytes = Number(cleanupOverview.automaticCandidateBytes) || 0;
+  const automaticMarked = Number(cleanupOverview.automaticMarkedCount) || 0;
+  const automaticMarkedBytes = Number(cleanupOverview.automaticMarkedBytes) || 0;
+  const manualMarked = Number(cleanupOverview.manualMarkedCount) || 0;
+  elements.cleanupAutomationSummary.textContent = automaticCandidates
+    ? `安全候選 ${automaticCandidates.toLocaleString()} 個 · ${formatBytes(automaticCandidateBytes)}；` +
+      `自動已標記 ${automaticMarked.toLocaleString()} 個 · ${formatBytes(automaticMarkedBytes)}；` +
+      "不會碰觸 PDF、影片、無縮圖或無法確認的附件。"
+    : "目前沒有符合安全規則的圖片原檔；PDF、影片、無縮圖或無法確認的附件會保留。";
+  elements.planSafeAttachmentCleanup.disabled = !provider || !automaticCandidates;
+  elements.planSafeAttachmentCleanup.textContent = automaticMarked
+    ? "取消自動標記"
+    : "自動標記安全瘦身";
+  elements.clearManualAttachmentPlan.disabled = !provider || !manualMarked;
   const fragment = document.createDocumentFragment();
   for (const total of cleanupOverview.categories) {
     const button = document.createElement("button");
@@ -2337,6 +2687,23 @@ function renderFileChoice(file) {
   kind.className = `cleanup-kind-badge ${file.kind}`;
   kind.textContent = file.kind === "thumbnail" ? "縮圖" : "原始附件";
   title.append(name, kind);
+  if (file.removalReason === "automatic") {
+    const automatic = document.createElement("span");
+    automatic.className = "cleanup-plan-badge automatic";
+    automatic.textContent = "自動";
+    automatic.title = "由安全自動清理規則標記；取消勾選後會改為保留。";
+    title.append(automatic);
+  } else if (file.removalReason === "manual") {
+    const manual = document.createElement("span");
+    manual.className = "cleanup-plan-badge manual";
+    manual.textContent = "手動";
+    title.append(manual);
+  } else if (file.removalReason === "chat") {
+    const chat = document.createElement("span");
+    chat.className = "cleanup-plan-badge chat";
+    chat.textContent = "聊天室";
+    title.append(chat);
+  }
   const size = document.createElement("small");
   size.textContent = `${file.kind === "thumbnail" ? "縮圖" : "原始附件"} · ${formatBytes(file.bytes)}`;
   const impact = document.createElement("span");
@@ -2362,6 +2729,7 @@ async function changeAttachmentMark(checkbox) {
   checkbox.disabled = true;
   try {
     await provider.setAttachmentMarked(path, checkbox.checked);
+    invalidateCleanupInsights();
     if (cleanupState.kind === "marked") {
       cleanupOverview = null;
       await loadCleanupPage();
@@ -2382,12 +2750,55 @@ async function applyGroupAction(groupKey, action, button) {
   button.disabled = true;
   try {
     cleanupOverview = await provider.applyCleanupGroupAction(groupKey, action);
+    invalidateCleanupInsights();
     await loadCleanupPage();
     await refreshAdvancedPlanSummary();
   } catch (error) {
     setStatus(error.message, true);
   } finally {
     button.disabled = false;
+  }
+}
+
+async function toggleSafeAttachmentCleanup() {
+  if (!provider || !cleanupOverview) return;
+  const automaticMarked = Number(cleanupOverview.automaticMarkedCount) || 0;
+  const automaticCandidates = Number(cleanupOverview.automaticCandidateCount) || 0;
+  const prompt = automaticMarked
+    ? "要取消安全自動清理的標記嗎？手動標記與聊天室清理計畫會保留。"
+    : `要標記 ${automaticCandidates.toLocaleString()} 個安全候選附件嗎？\n\n` +
+      "只會移除已確認的圖片原檔，並保留同一訊息的非空縮圖；原始備份不會被修改。";
+  if (!window.confirm(prompt)) return;
+  elements.planSafeAttachmentCleanup.disabled = true;
+  try {
+    cleanupOverview = await provider.planSafeAttachmentCleanup();
+    invalidateCleanupInsights();
+    await loadCleanupPage();
+    await refreshAdvancedPlanSummary();
+    setStatus(automaticMarked ? "已取消安全自動清理標記。" : "已套用安全自動清理標記。", false);
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    if (cleanupOverview) renderCleanupOverview();
+  }
+}
+
+async function clearManualAttachmentPlan() {
+  if (!provider || !cleanupOverview || !cleanupOverview.manualMarkedCount) return;
+  if (!window.confirm(
+    `要清除 ${Number(cleanupOverview.manualMarkedCount).toLocaleString()} 個手動標記嗎？\n\n` +
+    "安全自動清理與聊天室清理計畫會保留。"
+  )) return;
+  elements.clearManualAttachmentPlan.disabled = true;
+  try {
+    cleanupOverview = await provider.clearManualAttachmentPlan();
+    invalidateCleanupInsights();
+    await loadCleanupPage();
+    setStatus("已清除手動附件標記；自動與聊天室計畫仍保留。", false);
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    if (cleanupOverview) renderCleanupOverview();
   }
 }
 
@@ -2406,6 +2817,7 @@ function setAdvancedMode(enabled) {
     cleanupState.category = "all";
     cleanupState.page = 1;
     cleanupOverview = null;
+    invalidateCleanupInsights();
     elements.cleanupCategory.value = "all";
   }
   elements.cleanupKind.disabled = cleanupState.category === "no_attachments";
@@ -2492,6 +2904,7 @@ async function setChatRemoval(source, chatPk, title, planned) {
     }
     renderAdvancedReport(report);
     cleanupPage = cleanupOverview = null;
+    invalidateCleanupInsights();
     await Promise.all([
       loadChats(null),
       loadCleanupPage()
@@ -2527,6 +2940,7 @@ async function toggleAutomaticCleanup() {
   try {
     renderAdvancedReport(await provider.planAutomaticCleanup());
     cleanupPage = cleanupOverview = null;
+    invalidateCleanupInsights();
     await Promise.all([loadChats(null), loadCleanupPage()]);
     setStatus(planned ? "已取消所有自動偵測項目。" : "已將所有偵測項目加入清理計畫。");
   } catch (error) {
@@ -2537,13 +2951,17 @@ async function toggleAutomaticCleanup() {
 }
 
 function setCandidateBuildDisabled(disabled) {
-  elements.buildCandidate.disabled = disabled;
-  elements.advancedBuildCandidate.disabled = disabled;
+  const blockedByPreflight = Boolean(
+    cleanupPreflight && Number(cleanupPreflight.blockerCount) > 0
+  );
+  elements.buildCandidate.disabled = disabled || blockedByPreflight;
+  elements.advancedBuildCandidate.disabled = disabled || blockedByPreflight;
 }
 
 async function buildCandidate() {
   let modalShown = false;
   try {
+    if (!await requestRestoreChecklist()) return;
     const output = await bridge.chooseCandidateOutput();
     if (!output) return;
     const initialMessage = `正在建立 ${output.displayName}，請勿關閉此視窗。`;
@@ -2558,6 +2976,7 @@ async function buildCandidate() {
       fullCrc: true,
       linkDuplicates
     });
+    renderCandidateReport(report);
     let successMessage =
       `候選檔完成：保留 ${report.outputEntries.toLocaleString()} 筆、` +
       `移除 ${report.removedEntries.toLocaleString()} 個檔案項目、` +
@@ -2651,6 +3070,9 @@ elements.advancedMode.addEventListener("change", () => {
 elements.refreshAdvancedReport.addEventListener("click", () => void loadAdvancedReport());
 elements.planAutomaticCleanup.addEventListener("click", () => void toggleAutomaticCleanup());
 elements.scanCatalog.addEventListener("click", () => void scanCatalog());
+elements.refreshCleanupPreflight.addEventListener("click", () => void refreshCleanupPreflight());
+elements.refreshCleanupAudit.addEventListener("click", () => void refreshCleanupPreflight());
+elements.copyCleanupPlan.addEventListener("click", () => void copyCleanupPlanSummary());
 elements.hashDuplicates.addEventListener("click", () => void hashDuplicates());
 elements.duplicateAutoMerge.addEventListener("click", toggleDuplicateAutoMerge);
 elements.cancelDuplicateScan.addEventListener("click", () => void cancelCurrentOperation("duplicate"));
@@ -2659,6 +3081,11 @@ elements.advancedBuildCandidate.addEventListener("click", () => void buildCandid
 elements.loadModalCancel.addEventListener("click", () => void cancelCurrentOperation("load"));
 elements.packageModalCancel.addEventListener("click", () => void cancelCurrentOperation("package"));
 elements.packageModalClose.addEventListener("click", closePackageModal);
+elements.restoreCheckOriginal.addEventListener("change", updateRestoreChecklistState);
+elements.restoreCheckTest.addEventListener("change", updateRestoreChecklistState);
+elements.restoreCheckVerify.addEventListener("change", updateRestoreChecklistState);
+elements.restoreCheckCancel.addEventListener("click", () => closeRestoreChecklist(false));
+elements.restoreCheckConfirm.addEventListener("click", () => closeRestoreChecklist(true));
 elements.imageModalClose.addEventListener("click", closeImageModal);
 elements.imageModal.addEventListener("click", (event) => {
   if (event.target === elements.imageModal ||
@@ -2667,7 +3094,9 @@ elements.imageModal.addEventListener("click", (event) => {
   }
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeImageModal();
+  if (event.key !== "Escape") return;
+  closeImageModal();
+  closeRestoreChecklist(false);
 });
 elements.searchForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -2692,6 +3121,8 @@ elements.clearSearch.addEventListener("click", () => {
 elements.cleanupKind.addEventListener("change", updateCleanupFilter);
 elements.cleanupCategory.addEventListener("change", updateCleanupFilter);
 elements.cleanupSort.addEventListener("change", updateCleanupFilter);
+elements.planSafeAttachmentCleanup.addEventListener("click", () => void toggleSafeAttachmentCleanup());
+elements.clearManualAttachmentPlan.addEventListener("click", () => void clearManualAttachmentPlan());
 elements.cleanupSearch.addEventListener("input", () => {
   clearTimeout(cleanupSearchTimer);
   cleanupSearchTimer = setTimeout(() => {
