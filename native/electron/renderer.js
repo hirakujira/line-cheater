@@ -44,6 +44,7 @@ let cleanupPreflight = null;
 let cleanupPlanPreviews = null;
 let cleanupAudit = null;
 let cleanupPreflightLoading = false;
+let cleanupPlanPreviewsCollapsed = false;
 let cleanupLoading = false;
 let cleanupReloadPending = false;
 let cleanupSearchTimer = null;
@@ -61,7 +62,8 @@ const cleanupState = {
   kind: "all",
   category: "all",
   sort: "size",
-  groupKey: null
+  groupKey: null,
+  planProfile: null
 };
 
 const elements = {
@@ -133,10 +135,12 @@ const elements = {
   cleanupPreflightTitle: document.querySelector("#cleanup-preflight-title"),
   cleanupPreflightSummary: document.querySelector("#cleanup-preflight-summary"),
   cleanupPreflightRisks: document.querySelector("#cleanup-preflight-risks"),
+  toggleCleanupPreflightRisks: document.querySelector("#toggle-cleanup-preflight-risks"),
   refreshCleanupPreflight: document.querySelector("#refresh-cleanup-preflight"),
   cleanupPlanPreviews: document.querySelector("#cleanup-plan-previews"),
   cleanupPlanPreviewsSummary: document.querySelector("#cleanup-plan-previews-summary"),
   cleanupPlanCards: document.querySelector("#cleanup-plan-cards"),
+  toggleCleanupPlanPreviews: document.querySelector("#toggle-cleanup-plan-previews"),
   cleanupAudit: document.querySelector("#cleanup-audit"),
   cleanupAuditSummary: document.querySelector("#cleanup-audit-summary"),
   refreshCleanupAudit: document.querySelector("#refresh-cleanup-audit"),
@@ -199,6 +203,24 @@ const categoryLabels = {
   unreferenced: "SQLite 未引用",
   unconfirmed: "無法確認",
   no_attachments: "沒有附件的對話"
+};
+
+const cleanupPlanProfiles = {
+  conservative: {
+    label: "保守方案",
+    category: "all",
+    selectionSummary: "顯示全部清單；下方按鈕可套用已確認的安全自動標記。"
+  },
+  balanced: {
+    label: "平衡方案",
+    category: "unreferenced",
+    selectionSummary: "切換到 SQLite 未引用清單，請逐一人工確認；不會自動標記。"
+  },
+  aggressive: {
+    label: "積極方案",
+    category: "unconfirmed",
+    selectionSummary: "切換到無法確認清單，請先檢查來源內容；不會自動標記。"
+  }
 };
 
 function setStatus(message, error) {
@@ -747,8 +769,10 @@ async function openSource(kind) {
       kind: "all",
       category: "all",
       sort: "size",
-      groupKey: null
+      groupKey: null,
+      planProfile: null
     });
+    cleanupPlanPreviewsCollapsed = false;
     setAdvancedMode(false);
     elements.cleanupSearch.value = "";
     elements.cleanupKind.value = "all";
@@ -761,7 +785,13 @@ async function openSource(kind) {
     elements.cleanupPreflightTitle.textContent = "清理前盲點掃描";
     elements.cleanupPreflightSummary.textContent = "正在檢查來源、索引與不確定檔案…";
     elements.cleanupPreflightRisks.replaceChildren();
+    elements.cleanupPreflightRisks.hidden = false;
+    elements.toggleCleanupPreflightRisks.hidden = true;
+    elements.toggleCleanupPreflightRisks.setAttribute("aria-expanded", "false");
     elements.cleanupPlanCards.replaceChildren();
+    elements.cleanupPlanPreviews.classList.remove("is-collapsed");
+    elements.toggleCleanupPlanPreviews.disabled = true;
+    elements.toggleCleanupPlanPreviews.textContent = "選擇方案";
     elements.cleanupAudit.classList.remove("has-events");
     elements.cleanupAuditSummary.textContent = "正在整理最近操作與計畫指紋…";
     elements.cleanupAuditPlan.replaceChildren();
@@ -1266,48 +1296,85 @@ function renderMessage(message) {
   return row;
 }
 
-async function hydrateMessagePreviews(container, renderGeneration) {
+function hydrateMessagePreview(media, renderGeneration) {
+  if (!Array.isArray(media.previewPaths) || !media.previewPaths.length ||
+      media.dataset.previewState) return Promise.resolve();
+  media.dataset.previewState = "loading";
+  return (async () => {
+    let url = null;
+    let caption = media.previewCaption;
+    for (const path of media.previewPaths) {
+      try {
+        url = await bridge.attachmentPreviewUrl(path);
+        caption = fileName(path);
+        if (url) break;
+      } catch (_error) {
+        // Unsupported originals fall back to the matching thumbnail.
+      }
+    }
+    if (!url || renderGeneration !== messageRenderGeneration || !media.isConnected) {
+      media.dataset.previewState = "failed";
+      return;
+    }
+    const figure = document.createElement("figure");
+    figure.className = "message-image";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "message-image-button";
+    button.setAttribute("aria-label", `放大預覽：${caption}`);
+    const image = document.createElement("img");
+    image.alt = caption;
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.addEventListener("error", () => {
+      figure.classList.add("preview-error");
+      media.dataset.previewState = "failed";
+    }, { once: true });
+    button.addEventListener("click", () => showImageModal(url, caption, button));
+    button.append(image);
+    const note = document.createElement("figcaption");
+    note.textContent = "開啟圖片預覽";
+    figure.append(button, note);
+    media.dataset.previewState = "loaded";
+    media.replaceChildren(figure);
+    image.src = url;
+  })();
+}
+
+function hydrateMessagePreviews(container, renderGeneration) {
+  if (container.messagePreviewObserver) container.messagePreviewObserver.disconnect();
   const mediaItems = Array.from(container.querySelectorAll(".message-media"))
     .filter((media) => Array.isArray(media.previewPaths) && media.previewPaths.length);
-  let next = 0;
-  async function worker() {
-    while (next < mediaItems.length) {
-      const media = mediaItems[next++];
-      let url = null;
-      let caption = media.previewCaption;
-      for (const path of media.previewPaths) {
-        try {
-          url = await bridge.attachmentPreviewUrl(path);
-          caption = fileName(path);
-          if (url) break;
-        } catch (_error) {
-          // Unsupported originals fall back to the matching thumbnail.
-        }
-      }
-      if (!url || renderGeneration !== messageRenderGeneration || !media.isConnected) {
-        continue;
-      }
-      const figure = document.createElement("figure");
-      figure.className = "message-image";
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "message-image-button";
-      button.setAttribute("aria-label", `放大預覽：${caption}`);
-      const image = document.createElement("img");
-      image.alt = caption;
-      image.loading = "eager";
-      image.decoding = "async";
-      image.addEventListener("error", () => figure.classList.add("preview-error"), { once: true });
-      button.addEventListener("click", () => showImageModal(url, caption, button));
-      button.append(image);
-      const note = document.createElement("figcaption");
-      note.textContent = "開啟圖片預覽";
-      figure.append(button, note);
-      media.replaceChildren(figure);
-      image.src = url;
+  const queue = [];
+  let active = 0;
+  const pump = () => {
+    while (active < 4 && queue.length) {
+      const media = queue.shift();
+      active += 1;
+      void hydrateMessagePreview(media, renderGeneration).finally(() => {
+        active -= 1;
+        pump();
+      });
     }
+  };
+  const enqueue = (media) => {
+    if (!media || media.dataset.previewState) return;
+    queue.push(media);
+    pump();
+  };
+  if (typeof IntersectionObserver !== "function") {
+    for (const media of mediaItems) enqueue(media);
+    return;
   }
-  await Promise.all(Array.from({ length: Math.min(4, mediaItems.length) }, () => worker()));
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      observer.unobserve(entry.target);
+      enqueue(entry.target);
+    }
+  }, { root: elements.messages, rootMargin: "480px 0px" });
+  container.messagePreviewObserver = observer;
+  for (const media of mediaItems) observer.observe(media);
 }
 
 function isSystemMessage(message) {
@@ -1808,6 +1875,7 @@ function renderCleanupPreflight() {
   const blockers = Number(cleanupPreflight.blockerCount) || 0;
   const warnings = Number(cleanupPreflight.warningCount) || 0;
   const safeCandidates = Number(cleanupPreflight.safeCandidateCount) || 0;
+  const compactWarnings = blockers === 0 && warnings > 0;
   elements.cleanupPreflight.classList.toggle("has-blockers", blockers > 0);
   elements.cleanupPreflight.classList.toggle("has-warnings", blockers === 0 && warnings > 0);
   elements.cleanupPreflightTitle.textContent = blockers
@@ -1816,10 +1884,12 @@ function renderCleanupPreflight() {
       ? `清理前盲點掃描：可繼續，但有 ${warnings} 個提醒`
       : "清理前盲點掃描：可以繼續";
   elements.cleanupPreflightSummary.textContent =
-    `SQLite ${cleanupPreflight.sqliteQuickCheck} · ` +
-    `索引 ${cleanupPreflight.scanStatus} · ` +
-    `安全候選 ${safeCandidates.toLocaleString()} 個 · ` +
-    `已標記 ${Number(cleanupPreflight.markedCount || 0).toLocaleString()} 個`;
+    compactWarnings
+      ? "可繼續清理；建議先查看提醒。"
+      : `SQLite ${cleanupPreflight.sqliteQuickCheck} · ` +
+        `索引 ${cleanupPreflight.scanStatus} · ` +
+        `安全候選 ${safeCandidates.toLocaleString()} 個 · ` +
+        `已標記 ${Number(cleanupPreflight.markedCount || 0).toLocaleString()} 個`;
   const fragment = document.createDocumentFragment();
   for (const risk of cleanupPreflight.risks || []) {
     const item = document.createElement("div");
@@ -1837,6 +1907,12 @@ function renderCleanupPreflight() {
     fragment.append(item);
   }
   elements.cleanupPreflightRisks.replaceChildren(fragment);
+  elements.cleanupPreflightRisks.hidden = compactWarnings;
+  elements.toggleCleanupPreflightRisks.hidden = !compactWarnings;
+  elements.toggleCleanupPreflightRisks.setAttribute("aria-expanded", "false");
+  elements.toggleCleanupPreflightRisks.textContent = compactWarnings
+    ? `查看提醒（${warnings}）`
+    : "查看提醒";
   elements.refreshCleanupPreflight.disabled = !provider;
 }
 
@@ -1845,9 +1921,23 @@ function renderCleanupPlanPreviews() {
   const fragment = document.createDocumentFragment();
   for (const preview of cleanupPlanPreviews) {
     const card = document.createElement("article");
+    const selected = cleanupState.planProfile === preview.profile;
     card.className = `cleanup-plan-card ${preview.profile || ""}`;
+    card.classList.toggle("selected", selected);
+    card.setAttribute("role", "radio");
+    card.setAttribute("aria-checked", String(selected));
+    card.dataset.planProfile = preview.profile || "";
+    const heading = document.createElement("div");
+    heading.className = "cleanup-plan-card-heading";
     const title = document.createElement("strong");
     title.textContent = preview.title;
+    const select = document.createElement("button");
+    select.type = "button";
+    select.className = "cleanup-plan-select";
+    select.dataset.planProfile = preview.profile || "";
+    select.setAttribute("aria-pressed", String(selected));
+    select.textContent = selected ? "目前方案" : "選擇方案";
+    heading.append(title, select);
     const description = document.createElement("p");
     description.textContent = preview.description;
     const metrics = document.createElement("div");
@@ -1866,12 +1956,55 @@ function renderCleanupPlanPreviews() {
       note.textContent = warning;
       warnings.append(note);
     }
-    card.append(title, description, metrics, warnings);
+    card.append(heading, description, metrics, warnings);
     fragment.append(card);
   }
   elements.cleanupPlanCards.replaceChildren(fragment);
-  elements.cleanupPlanPreviewsSummary.textContent =
-    "此區為唯讀比較；保守方案可由下方按鈕套用，平衡與積極方案只列出人工複核範圍。";
+  const selectedProfile = cleanupPlanProfiles[cleanupState.planProfile];
+  elements.cleanupPlanPreviews.classList.toggle("is-collapsed", cleanupPlanPreviewsCollapsed);
+  elements.cleanupPlanPreviewsSummary.textContent = selectedProfile
+    ? `目前選擇：${selectedProfile.label}。${selectedProfile.selectionSummary}`
+    : "請選擇方案；選取只會切換檢視範圍，不會立即標記或刪除檔案。";
+  elements.toggleCleanupPlanPreviews.disabled = !cleanupPlanPreviews.length;
+  elements.toggleCleanupPlanPreviews.textContent = cleanupPlanPreviewsCollapsed
+    ? "變更方案"
+    : selectedProfile
+      ? "收起方案"
+      : "選擇方案";
+}
+
+function selectCleanupPlan(profile) {
+  const selectedProfile = cleanupPlanProfiles[profile];
+  if (!selectedProfile) return;
+  cleanupState.planProfile = profile;
+  cleanupPlanPreviewsCollapsed = true;
+  cleanupState.category = selectedProfile.category;
+  cleanupState.kind = "all";
+  cleanupState.page = 1;
+  cleanupState.groupKey = null;
+  elements.cleanupCategory.value = selectedProfile.category;
+  elements.cleanupKind.value = "all";
+  elements.cleanupKind.disabled = false;
+  renderCleanupPlanPreviews();
+  if (cleanupOverview) renderCleanupOverview();
+  if (provider) void loadCleanupPage({ verifySource: false });
+  setStatus(`已選擇${selectedProfile.label}；清單已切換為${categoryLabels[selectedProfile.category]}。`, false);
+}
+
+function toggleCleanupPlanPreviews() {
+  if (!cleanupPlanPreviews || !cleanupPlanPreviews.length) return;
+  cleanupPlanPreviewsCollapsed = !cleanupPlanPreviewsCollapsed;
+  renderCleanupPlanPreviews();
+}
+
+function toggleCleanupPreflightRisks() {
+  const expanded = elements.cleanupPreflightRisks.hidden;
+  elements.cleanupPreflightRisks.hidden = !expanded;
+  elements.toggleCleanupPreflightRisks.setAttribute("aria-expanded", String(expanded));
+  const warnings = Number(cleanupPreflight?.warningCount) || 0;
+  elements.toggleCleanupPreflightRisks.textContent = expanded
+    ? "收起提醒"
+    : `查看提醒（${warnings}）`;
 }
 
 const cleanupActionLabels = {
@@ -2003,8 +2136,8 @@ function renderCleanupOverview() {
     : "目前沒有符合安全規則的圖片原檔；PDF、影片、無縮圖或無法確認的附件會保留。";
   elements.planSafeAttachmentCleanup.disabled = !provider || !automaticCandidates;
   elements.planSafeAttachmentCleanup.textContent = automaticMarked
-    ? "取消自動標記"
-    : "自動標記安全瘦身";
+    ? cleanupState.planProfile === "conservative" ? "取消保守方案標記" : "取消安全自動標記"
+    : cleanupState.planProfile === "conservative" ? "套用保守方案" : "套用安全自動標記";
   elements.clearManualAttachmentPlan.disabled = !provider || !manualMarked;
   const fragment = document.createDocumentFragment();
   for (const total of cleanupOverview.categories) {
@@ -2190,6 +2323,9 @@ function disposeCleanupAlbum() {
   if (!cleanupAlbumSession) return;
   cleanupAlbumSession.disposed = true;
   if (cleanupAlbumSession.resizeObserver) cleanupAlbumSession.resizeObserver.disconnect();
+  for (const { node } of cleanupAlbumSession.pages.values()) {
+    if (node.cleanupPreviewObserver) node.cleanupPreviewObserver.disconnect();
+  }
   cleanupAlbumSession = null;
 }
 
@@ -2368,6 +2504,7 @@ function trimCleanupAlbumPages(session, direction) {
     const entry = session.pages.get(pageNumber);
     if (!entry) break;
     measureCleanupAlbumPage(session, pageNumber, entry.node);
+    if (entry.node.cleanupPreviewObserver) entry.node.cleanupPreviewObserver.disconnect();
     if (session.resizeObserver) session.resizeObserver.unobserve(entry.node);
     entry.node.remove();
     session.pages.delete(pageNumber);
@@ -2599,49 +2736,84 @@ function renderCleanupReview(review) {
   return card;
 }
 
-async function hydrateCleanupPreviews(section, renderGeneration) {
+function hydrateCleanupPreview(preview, renderGeneration) {
+  if (!Array.isArray(preview.previewPaths) || !preview.previewPaths.length ||
+      preview.dataset.previewState) return Promise.resolve();
+  preview.dataset.previewState = "loading";
+  return (async () => {
+    let url = null;
+    let caption = "附件預覽";
+    for (const path of preview.previewPaths) {
+      try {
+        url = await bridge.attachmentPreviewUrl(path);
+        caption = fileName(path);
+        if (url) break;
+      } catch (_error) {
+        // Try the thumbnail fallback before leaving the bounded placeholder.
+      }
+    }
+    if (!url || renderGeneration !== cleanupRenderGeneration || !preview.isConnected) {
+      preview.dataset.previewState = "failed";
+      return;
+    }
+    const image = document.createElement("img");
+    image.alt = caption;
+    image.loading = "lazy";
+    image.decoding = "async";
+    const open = document.createElement("span");
+    open.className = "cleanup-preview-open";
+    open.textContent = "點擊放大";
+    image.addEventListener("error", () => {
+      image.remove();
+      open.remove();
+      preview.disabled = true;
+      preview.dataset.previewState = "failed";
+    }, { once: true });
+    preview.disabled = false;
+    preview.dataset.previewState = "loaded";
+    preview.setAttribute("aria-label", `放大預覽：${caption}`);
+    preview.addEventListener("click", () => showImageModal(url, caption, preview), { once: true });
+    preview.prepend(image);
+    preview.append(open);
+    image.src = url;
+    const note = preview.querySelector("small");
+    if (note) note.remove();
+  })();
+}
+
+function hydrateCleanupPreviews(section, renderGeneration) {
   const previews = Array.from(section.querySelectorAll(".cleanup-preview"))
     .filter((preview) => Array.isArray(preview.previewPaths) && preview.previewPaths.length);
-  let next = 0;
-  async function worker() {
-    while (next < previews.length) {
-      const preview = previews[next];
-      next += 1;
-      let url = null;
-      let caption = "附件預覽";
-      for (const path of preview.previewPaths) {
-        try {
-          url = await bridge.attachmentPreviewUrl(path);
-          caption = fileName(path);
-          if (url) break;
-        } catch (_error) {
-          // Try the thumbnail fallback before leaving the bounded placeholder.
-        }
-      }
-      if (!url || renderGeneration !== cleanupRenderGeneration || !preview.isConnected) continue;
-      const image = document.createElement("img");
-      image.alt = caption;
-      image.loading = "lazy";
-      image.decoding = "async";
-      const open = document.createElement("span");
-      open.className = "cleanup-preview-open";
-      open.textContent = "點擊放大";
-      image.addEventListener("error", () => {
-        image.remove();
-        open.remove();
-        preview.disabled = true;
-      }, { once: true });
-      preview.disabled = false;
-      preview.setAttribute("aria-label", `放大預覽：${caption}`);
-      preview.addEventListener("click", () => showImageModal(url, caption, preview));
-      preview.prepend(image);
-      preview.append(open);
-      image.src = url;
-      const note = preview.querySelector("small");
-      if (note) note.remove();
+  const queue = [];
+  let active = 0;
+  const pump = () => {
+    while (active < 4 && queue.length) {
+      const preview = queue.shift();
+      active += 1;
+      void hydrateCleanupPreview(preview, renderGeneration).finally(() => {
+        active -= 1;
+        pump();
+      });
     }
+  };
+  const enqueue = (preview) => {
+    if (!preview || preview.dataset.previewState) return;
+    queue.push(preview);
+    pump();
+  };
+  if (typeof IntersectionObserver !== "function") {
+    for (const preview of previews) enqueue(preview);
+    return;
   }
-  await Promise.all(Array.from({ length: Math.min(4, previews.length) }, () => worker()));
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      observer.unobserve(entry.target);
+      enqueue(entry.target);
+    }
+  }, { root: elements.cleanupList, rootMargin: "480px 0px" });
+  section.cleanupPreviewObserver = observer;
+  for (const preview of previews) observer.observe(preview);
 }
 
 function renderEvidence(review) {
@@ -3140,6 +3312,12 @@ elements.clearSearch.addEventListener("click", () => {
 elements.cleanupKind.addEventListener("change", updateCleanupFilter);
 elements.cleanupCategory.addEventListener("change", updateCleanupFilter);
 elements.cleanupSort.addEventListener("change", updateCleanupFilter);
+elements.toggleCleanupPreflightRisks.addEventListener("click", toggleCleanupPreflightRisks);
+elements.toggleCleanupPlanPreviews.addEventListener("click", toggleCleanupPlanPreviews);
+elements.cleanupPlanCards.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-plan-profile]");
+  if (button) selectCleanupPlan(button.dataset.planProfile);
+});
 elements.planSafeAttachmentCleanup.addEventListener("click", () => void toggleSafeAttachmentCleanup());
 elements.clearManualAttachmentPlan.addEventListener("click", () => void clearManualAttachmentPlan());
 elements.cleanupSearch.addEventListener("input", () => {
@@ -3279,6 +3457,13 @@ bridge.on("catalogContextProgress", (event) => {
       `正在比對 SQLite…（${event.processedFiles.toLocaleString()} / ${event.totalFiles.toLocaleString()}）`
     );
   }
+});
+bridge.on("searchIndexProgress", (event) => {
+  if (!messageLoading || !activeSearch) return;
+  const processed = Number(event.processedMessages) || 0;
+  elements.messageStatus.textContent = processed
+    ? `首次搜尋正在建立 FTS5 索引…已整理 ${processed.toLocaleString()} 則訊息`
+    : "首次搜尋正在建立 FTS5 索引…";
 });
 bridge.on("candidateProgress", (event) => {
   elements.progress.max = Math.max(event.totalBytes, 1);

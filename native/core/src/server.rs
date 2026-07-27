@@ -113,11 +113,14 @@ impl NativeSession {
         let Some(source_key) = self.catalog.source_fingerprint()? else {
             return Ok(None);
         };
-        if !self
-            .catalog
-            .source_matches_current(&self.prepared.original_path, self.prepared.report.kind)?
-        {
-            return Ok(None);
+        if !self.catalog_source_verified {
+            if !self
+                .catalog
+                .source_matches_current(&self.prepared.original_path, self.prepared.report.kind)?
+            {
+                return Ok(None);
+            }
+            self.catalog_source_verified = true;
         }
         let Some(index) = self.fts5_index.as_mut() else {
             return Ok(None);

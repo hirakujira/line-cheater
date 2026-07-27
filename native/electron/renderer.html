@@ -239,9 +239,14 @@
                       <strong id="cleanup-preflight-title">清理前盲點掃描</strong>
                       <span id="cleanup-preflight-summary">正在檢查來源、索引與不確定檔案…</span>
                     </div>
-                    <button id="refresh-cleanup-preflight" class="secondary-button" type="button" disabled>
-                      重新檢查
-                    </button>
+                    <div class="cleanup-preflight-actions">
+                      <button id="toggle-cleanup-preflight-risks" class="secondary-button" type="button" hidden>
+                        查看提醒
+                      </button>
+                      <button id="refresh-cleanup-preflight" class="secondary-button" type="button" disabled>
+                        重新檢查
+                      </button>
+                    </div>
                   </div>
                   <div id="cleanup-preflight-risks" class="cleanup-preflight-risks"></div>
                 </section>
@@ -250,11 +255,14 @@
                     <div>
                       <strong id="cleanup-plan-previews-title">清理方案預演</strong>
                       <span id="cleanup-plan-previews-summary">
-                        此區為唯讀比較；只有保守方案的安全候選可自動套用，其他項目需在清單人工複核。
+                        請選擇方案；選取只會切換檢視範圍，不會立即標記或刪除檔案。
                       </span>
                     </div>
+                    <button id="toggle-cleanup-plan-previews" class="secondary-button" type="button" disabled>
+                      選擇方案
+                    </button>
                   </div>
-                  <div id="cleanup-plan-cards" class="cleanup-plan-cards"></div>
+                  <div id="cleanup-plan-cards" class="cleanup-plan-cards" role="radiogroup" aria-label="清理方案"></div>
                 </section>
                 <section id="cleanup-audit" class="cleanup-audit" aria-labelledby="cleanup-audit-title">
                   <div class="cleanup-audit-heading">

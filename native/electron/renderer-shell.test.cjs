@@ -348,16 +348,34 @@ test("surfaces cleanup blindspot scans, plan previews, and candidate verificatio
   assert.match(html, /id="cleanup-preflight"/);
   assert.match(html, /id="refresh-cleanup-preflight"/);
   assert.match(html, /id="cleanup-plan-cards"/);
-  assert.match(html, /此區為唯讀比較/);
+  assert.match(html, /請選擇方案；選取只會切換檢視範圍/);
   assert.match(html, /id="package-modal-report"/);
   assert.match(renderer, /provider\.cleanupPreflight\(\)/);
   assert.match(renderer, /provider\.cleanupPlanPreviews\(\)/);
   assert.match(renderer, /function renderCleanupPreflight\(\)/);
   assert.match(renderer, /function renderCleanupPlanPreviews\(\)/);
+  assert.match(renderer, /function selectCleanupPlan\(profile\)/);
+  assert.match(renderer, /cleanupPlanPreviewsCollapsed = true/);
+  assert.match(renderer, /function toggleCleanupPlanPreviews\(\)/);
+  assert.match(renderer, /function toggleCleanupPreflightRisks\(\)/);
+  assert.match(html, /role="radiogroup" aria-label="清理方案"/);
+  assert.match(html, /id="toggle-cleanup-plan-previews"/);
+  assert.match(html, /id="toggle-cleanup-preflight-risks"/);
+  assert.match(styles, /\.cleanup-plan-previews\.is-collapsed \.cleanup-plan-cards/);
   assert.match(renderer, /function renderCandidateReport\(report\)/);
   assert.match(renderer, /Number\(cleanupPreflight\.blockerCount\)/);
   assert.match(main, /"cleanupPreflight"/);
   assert.match(main, /"cleanupPlanPreviews"/);
+});
+
+test("keeps long-running searches and image loading responsive", () => {
+  assert.match(renderer, /bridge\.on\("searchIndexProgress"/);
+  assert.match(renderer, /首次搜尋正在建立 FTS5 索引/);
+  assert.match(renderer, /new IntersectionObserver/);
+  assert.match(renderer, /rootMargin: "480px 0px"/);
+  assert.match(renderer, /preview\.dataset\.previewState = "loading"/);
+  assert.match(renderer, /active < 4/);
+  assert.match(renderer, /cleanupPreviewObserver\.disconnect\(\)/);
 });
 
 test("copies cleanup summaries through trusted Electron clipboard IPC", () => {
