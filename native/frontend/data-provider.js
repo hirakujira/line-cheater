@@ -170,6 +170,10 @@
     return this.bridge.request("clearManualAttachmentPlan", {});
   };
 
+  NativeDataProvider.prototype.clearAllRemovalPlans = function () {
+    return this.bridge.request("clearAllRemovalPlans", {});
+  };
+
   NativeDataProvider.prototype.catalogStats = function () {
     return this.bridge.request("catalogStats", {});
   };

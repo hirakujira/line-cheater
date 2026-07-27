@@ -1237,6 +1237,10 @@ fn keep_thumbnail_only_marks_images_with_nonempty_matching_thumbnails() {
             .flat_map(|review| &review.files)
             .all(|file| { file.kind != AttachmentKind::Thumbnail || !file.marked_for_removal })
     );
+
+    let overview = catalog.clear_all_user_removal_plans().unwrap();
+    assert_eq!(overview.marked_count, 0);
+    assert!(catalog.marked_paths().unwrap().is_empty());
 }
 
 #[test]

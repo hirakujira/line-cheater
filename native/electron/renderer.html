@@ -563,6 +563,20 @@
     </section>
   </div>
 
+  <div id="confirmation-modal" class="confirmation-modal hidden" role="dialog" aria-modal="true"
+       aria-labelledby="confirmation-modal-title" aria-describedby="confirmation-modal-message"
+       aria-hidden="true">
+    <div class="confirmation-modal-backdrop" aria-hidden="true"></div>
+    <section class="confirmation-modal-card" role="document" tabindex="-1">
+      <h2 id="confirmation-modal-title">確認操作</h2>
+      <p id="confirmation-modal-message"></p>
+      <div class="confirmation-modal-actions">
+        <button id="confirmation-modal-cancel" class="secondary-button" type="button">取消</button>
+        <button id="confirmation-modal-confirm" class="primary-button" type="button">確認</button>
+      </div>
+    </section>
+  </div>
+
   <script src="/data-provider.js"></script>
   <script src="/renderer.js"></script>
 </body>

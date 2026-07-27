@@ -200,6 +200,7 @@ test("forwards cleanup detail and group actions without exposing arbitrary metho
   await provider.applyCleanupGroupAction("chat:u1", "keep_thumbnail");
   await provider.planSafeAttachmentCleanup();
   await provider.clearManualAttachmentPlan();
+  await provider.clearAllRemovalPlans();
   assert.equal(calls[0].params.groupKey, "chat:u1");
   assert.deepEqual(calls[1], {
     method: "applyCleanupGroupAction",
@@ -207,7 +208,8 @@ test("forwards cleanup detail and group actions without exposing arbitrary metho
   });
   assert.deepEqual(calls.slice(2), [
     { method: "planSafeAttachmentCleanup", params: {} },
-    { method: "clearManualAttachmentPlan", params: {} }
+    { method: "clearManualAttachmentPlan", params: {} },
+    { method: "clearAllRemovalPlans", params: {} }
   ]);
   assert.throws(
     () => provider.applyCleanupGroupAction("chat:u1", "delete_now"),

@@ -16,8 +16,8 @@
 * { box-sizing: border-box; }
 html, body { height: 100%; }
 body { min-width: 720px; margin: 0; overflow: hidden; }
-body.load-modal-open, body.package-modal-open, body.image-modal-open { overflow: hidden; }
-body.restore-checklist-open { overflow: hidden; }
+body.load-modal-open, body.package-modal-open, body.image-modal-open,
+body.confirmation-modal-open, body.restore-checklist-open { overflow: hidden; }
 h2 { margin: 0; font-size: 1rem; }
 h3 { margin: 0; font-size: 1rem; }
 .eyebrow, .section-kicker { margin: 0; color: #087a41; font-weight: 800; letter-spacing: 0.14em; font-size: 0.72rem; }
@@ -585,6 +585,30 @@ progress { width: 100%; height: 8px; }
 .image-modal-card img { display: block; max-width: 100%; max-height: calc(100vh - 130px); object-fit: contain; }
 .image-modal-close { position: absolute; z-index: 1; top: 12px; right: 12px; border: 0; color: white; background: rgba(15, 23, 42, 0.78); }
 .image-modal-caption { max-width: 100%; margin: 0; overflow: hidden; color: #cbd5e1; font-size: 0.78rem; text-align: center; text-overflow: ellipsis; white-space: nowrap; }
+
+.confirmation-modal {
+  position: fixed;
+  z-index: 1200;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+.confirmation-modal-backdrop { position: absolute; inset: 0; background: rgba(15, 23, 42, 0.48); }
+.confirmation-modal-card {
+  position: relative;
+  width: min(100%, 460px);
+  padding: 24px;
+  border: 1px solid #cbd5e1;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.2);
+}
+.confirmation-modal-card:focus { outline: none; }
+.confirmation-modal-card h2 { color: #1e293b; font-size: 1rem; }
+.confirmation-modal-card p { margin: 8px 0 0; color: var(--muted); font-size: 0.84rem; line-height: 1.55; white-space: pre-line; }
+.confirmation-modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+.confirmation-modal-actions button { min-width: 96px; }
 
 @keyframes package-modal-spin {
   to { transform: rotate(360deg); }

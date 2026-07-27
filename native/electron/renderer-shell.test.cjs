@@ -331,6 +331,29 @@ test("exposes separate safe-automatic and manual cleanup controls", () => {
   assert.match(main, /"clearManualAttachmentPlan"/);
 });
 
+test("uses an accessible shared modal for every confirmation", () => {
+  assert.match(html, /id="confirmation-modal" class="confirmation-modal hidden" role="dialog" aria-modal="true"/);
+  assert.match(html, /id="confirmation-modal-cancel"/);
+  assert.match(html, /id="confirmation-modal-confirm"/);
+  assert.match(renderer, /function requestConfirmation\(options\)/);
+  assert.match(renderer, /function closeConfirmationModal\(confirmed\)/);
+  assert.match(renderer, /function trapModalFocus\(event, modal\)/);
+  assert.match(renderer, /confirmationModalConfirm\.addEventListener\("click", \(\) => closeConfirmationModal\(true\)\)/);
+  assert.doesNotMatch(renderer, /window\.confirm/);
+  assert.match(styles, /\.confirmation-modal-card\s*\{/);
+  assert.match(styles, /body\.confirmation-modal-open/);
+});
+
+test("asks how to handle a restored iMazing cleanup plan", () => {
+  assert.match(renderer, /function resolveRestoredCleanupPlan\(overview\)/);
+  assert.match(renderer, /info\.source\.kind === "imazing_archive"/);
+  assert.match(renderer, /發現先前的清理計畫/);
+  assert.match(renderer, /cancelLabel: "繼續使用舊計畫"/);
+  assert.match(renderer, /provider\.clearAllRemovalPlans\(\)/);
+  assert.match(renderer, /function syncModalBusy\(\)/);
+  assert.match(main, /"clearAllRemovalPlans"/);
+});
+
 test("restarts the cleanup overview after global attachment-plan changes", () => {
   assert.match(
     renderer,

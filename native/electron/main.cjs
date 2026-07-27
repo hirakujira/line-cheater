@@ -35,6 +35,7 @@ const allowedMethods = new Set([
   "listAttachments",
   "setAttachmentMarked",
   "clearManualAttachmentPlan",
+  "clearAllRemovalPlans",
   "catalogStats",
   "cleanupOverview",
   "cleanupPreflight",

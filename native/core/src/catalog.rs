@@ -1617,6 +1617,12 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn clear_all_user_removal_plans(&self) -> Result<CleanupOverview> {
+        self.clear_all_removal_plans()?;
+        self.record_cleanup_activity("clear_all_plans", "cleanup_plan", "user_reset", 0, 0)?;
+        self.cleanup_overview()
+    }
+
     pub fn database_cleanup_plan(&self) -> Result<DatabaseCleanupPlan> {
         let mut chat_statement = self.connection.prepare(
             "SELECT source, chat_pk, message_count
