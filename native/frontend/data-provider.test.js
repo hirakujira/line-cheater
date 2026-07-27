@@ -231,6 +231,22 @@ test("forwards cleanup preflight and plan preview reports", async () => {
   ]);
 });
 
+test("bounds cleanup audit history requests", async () => {
+  const calls = [];
+  const provider = new NativeDataProvider({
+    request: async (method, params) => {
+      calls.push({ method, params });
+      return { plan: {}, events: [] };
+    }
+  });
+  await provider.cleanupAudit(40);
+  assert.deepEqual(calls[0], {
+    method: "cleanupAudit",
+    params: { limit: 40 }
+  });
+  assert.throws(() => provider.cleanupAudit(1001), RangeError);
+});
+
 test("validates and forwards advanced SQLite cleanup operations", async () => {
   const calls = [];
   const provider = new NativeDataProvider({

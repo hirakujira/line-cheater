@@ -88,6 +88,14 @@ grouped below rather than treated as separate feature changes.
   conservative, balanced, and aggressive previews; only the conservative safe
   image rule is directly auto-applicable, while the other scopes remain
   review-only.
+- Cleanup actions now retain a bounded recent activity history and produce a
+  reproducible plan fingerprint from the source fingerprint, removal reasons,
+  selected paths, chat-removal plan, and orphan-message plan. The desktop shows
+  recent actions and can copy a plan summary without serializing the full file
+  list.
+- Candidate creation now opens a restore checklist asking the user to retain
+  the original backup, test in a safe environment, and verify chats/images/
+  SQLite after restore before the candidate writer starts.
 
 ## Goal
 
@@ -275,6 +283,9 @@ Verified implementation:
   aggressive plan previews, blocker-gated candidate creation, and a candidate
   verification report showing CRC, protected-file, SQLite-rewrite, output, and
   warning results.
+- [x] Add bounded cleanup activity history, reproducible plan fingerprints,
+  copyable plan summaries, and a three-step restore checklist before candidate
+  creation.
 - [x] Gate exact-duplicate scanning and cleanup behind desktop Advanced mode,
   add catalog-authorized group previews, and let the candidate writer replace
   retained duplicate members with verified relative ZIP symbolic links.
@@ -291,10 +302,10 @@ Verified implementation:
 2026-07-27:
 
 - Rust: 1.96.0.
-- Native tests: 33 passed; the combined Electron/provider test command: 58
+- Native tests: 33 passed; the combined Electron/provider test command: 60
   passed. The sidecar fixture covers the new preflight and three plan-preview
-  responses; the renderer shell checks the new blindspot and candidate-report
-  controls.
+  responses plus cleanup audit history; the renderer shell checks the new
+  blindspot, audit, candidate-report, and restore-checklist controls.
 - Electron: 43.2.0 pinned; `npm audit` reported 0 vulnerabilities.
 - Ignored real fixture: 1.1 GB, 13,512 files, 11,239 classified attachments.
 - Catalog scan: approximately 0.36 seconds on the current machine.
@@ -543,6 +554,7 @@ Supported methods:
 - `cleanupOverview`
 - `cleanupPreflight`
 - `cleanupPlanPreviews`
+- `cleanupAudit`
 - `clearManualAttachmentPlan`
 - `listCleanupGroups`
 - `listCleanupReviews`
@@ -634,6 +646,11 @@ It contains:
   database references and files whose path identifies the selected chat.
 - `orphan_message_removal_plan`: exact `LineSquare.ZMESSAGE.Z_PK` rows confirmed
   to have no matching `ZCHAT`.
+- `cleanup_activity`: the most recent 500 cleanup actions, including operation
+  scope, bounded counts/bytes, and timestamps. `cleanupAudit` returns this
+  bounded history together with a SHA-256 plan fingerprint; the fingerprint is
+  recomputed from the current source and plan rather than treated as an
+  authorization token.
 
 A catalog is bound to one canonical source path. Reusing it for another source
 is rejected. Directory sources store a deterministic recursive metadata manifest

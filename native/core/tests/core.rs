@@ -1511,6 +1511,7 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
         "{\"id\":\"21\",\"method\":\"searchMessages\",\"params\":{\"query\":\"photo\",\"limit\":10}}\n",
         "{\"id\":\"22\",\"method\":\"cleanupPreflight\"}\n",
         "{\"id\":\"23\",\"method\":\"cleanupPlanPreviews\"}\n",
+        "{\"id\":\"24\",\"method\":\"cleanupAudit\",\"params\":{\"limit\":20}}\n",
         "{\"id\":\"8\",\"method\":\"shutdown\"}\n"
     );
     let mut input = std::io::BufReader::new(requests.as_bytes());
@@ -1611,6 +1612,20 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
     assert_eq!(response("23")["result"].as_array().unwrap().len(), 3);
     assert_eq!(response("23")["result"][0]["profile"], "conservative");
     assert_eq!(response("23")["result"][1]["reviewFileCount"], 0);
+    assert_eq!(response("24")["result"]["plan"]["plannedChatCount"], 1);
+    assert_eq!(
+        response("24")["result"]["plan"]["planFingerprint"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(
+        !response("24")["result"]["events"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let indexed_messages: i64 = Connection::open(work.join("search.sqlite"))
         .unwrap()
         .query_row("SELECT COUNT(*) FROM messages_fts", [], |row| row.get(0))

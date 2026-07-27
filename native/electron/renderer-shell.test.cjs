@@ -342,6 +342,21 @@ test("surfaces cleanup blindspot scans, plan previews, and candidate verificatio
   assert.match(main, /"cleanupPlanPreviews"/);
 });
 
+test("surfaces cleanup audit history and restore checklist", () => {
+  assert.match(html, /id="cleanup-audit"/);
+  assert.match(html, /id="copy-cleanup-plan"/);
+  assert.match(html, /id="restore-checklist-modal"/);
+  assert.match(html, /id="restore-check-original"/);
+  assert.match(html, /id="restore-check-confirm"/);
+  assert.match(renderer, /provider\.cleanupAudit\(20\)/);
+  assert.match(renderer, /function renderCleanupAudit\(\)/);
+  assert.match(renderer, /function copyCleanupPlanSummary\(\)/);
+  assert.match(renderer, /function requestRestoreChecklist\(\)/);
+  assert.match(renderer, /if \(!await requestRestoreChecklist\(\)\) return;/);
+  assert.match(main, /"cleanupAudit"/);
+  assert.match(styles, /\.restore-checklist-modal\s*\{/);
+});
+
 test("supports cleanup page jumps and restores the overview page after chat detail", () => {
   assert.match(html, /id="cleanup-page-input"/);
   assert.match(html, /id="cleanup-page-total"/);

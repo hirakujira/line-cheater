@@ -254,6 +254,13 @@ struct MarkParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CleanupAuditParams {
+    #[serde(default = "default_cleanup_audit_limit")]
+    limit: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PreviewParams {
     path: String,
 }
@@ -733,6 +740,12 @@ fn handle_request<W: Write>(
         "cleanupPlanPreviews" => Ok(serde_json::to_value(
             session.catalog.cleanup_plan_previews()?,
         )?),
+        "cleanupAudit" => {
+            let params: CleanupAuditParams = parse_params(request)?;
+            Ok(serde_json::to_value(
+                session.catalog.cleanup_audit(params.limit)?,
+            )?)
+        }
         "listCleanupGroups" => {
             let params: CleanupPageParams = parse_params(request)?;
             let page = if params.category == "no_attachments" {
@@ -1176,6 +1189,10 @@ fn default_message_source() -> String {
 
 fn default_message_limit() -> u32 {
     DEFAULT_PAGE_SIZE
+}
+
+fn default_cleanup_audit_limit() -> u32 {
+    20
 }
 
 fn default_attachment_limit() -> u32 {

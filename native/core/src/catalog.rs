@@ -17,10 +17,11 @@ use zip::ZipArchive;
 use crate::database::{LineDatabase, LineSquareDatabase, OrphanMessage, UnifiedGroupDatabase};
 use crate::model::{
     AdvancedCleanupReport, AttachmentContext, AttachmentCursor, AttachmentItem, AttachmentKind,
-    AttachmentPage, AttachmentPreview, CatalogStats, Chat, CleanupCategoryTotal, CleanupGroup,
-    CleanupGroupPage, CleanupOverview, CleanupPlanPreview, CleanupReview, CleanupReviewPage,
-    DuplicateGroup, DuplicateGroupCursor, DuplicateGroupPage, DuplicateHashProgress,
-    DuplicateMemberPage, Message, MessageAttachment, checked_page_size,
+    AttachmentPage, AttachmentPreview, CatalogStats, Chat, CleanupActivity, CleanupAuditReport,
+    CleanupCategoryTotal, CleanupGroup, CleanupGroupPage, CleanupOverview, CleanupPlanPreview,
+    CleanupPlanSnapshot, CleanupReview, CleanupReviewPage, DuplicateGroup, DuplicateGroupCursor,
+    DuplicateGroupPage, DuplicateHashProgress, DuplicateMemberPage, Message, MessageAttachment,
+    checked_page_size,
 };
 use crate::performance::system_performance_profile;
 use crate::source::SourceKind;
@@ -227,6 +228,17 @@ impl Catalog {
                 marked_at INTEGER NOT NULL,
                 PRIMARY KEY(source, message_pk)
             );
+            CREATE TABLE IF NOT EXISTS cleanup_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                file_count INTEGER NOT NULL DEFAULT 0,
+                bytes INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS cleanup_activity_recent
+                ON cleanup_activity(created_at DESC, id DESC);
             CREATE TABLE IF NOT EXISTS chats (
                 source TEXT NOT NULL CHECK(source IN ('line', 'square')),
                 chat_pk INTEGER NOT NULL,
@@ -742,6 +754,11 @@ impl Catalog {
         if !exists {
             bail!("attachment path is not present in this catalog");
         }
+        let bytes: i64 = self.connection.query_row(
+            "SELECT bytes FROM files WHERE path = ?1",
+            [path],
+            |row| row.get(0),
+        )?;
         if marked {
             self.connection.execute(
                 "INSERT INTO removal_plan(path, marked_at, reason) VALUES (?1, ?2, 'manual')
@@ -754,12 +771,37 @@ impl Catalog {
             self.connection
                 .execute("DELETE FROM removal_plan WHERE path = ?1", [path])?;
         }
+        self.record_cleanup_activity(
+            if marked {
+                "mark_attachment"
+            } else {
+                "unmark_attachment"
+            },
+            "attachment",
+            path,
+            1,
+            bytes.max(0) as u64,
+        )?;
         Ok(())
     }
 
     pub fn clear_manual_attachment_plan(&self) -> Result<CleanupOverview> {
+        let (file_count, bytes): (i64, i64) = self.connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(f.bytes), 0)
+             FROM removal_plan p JOIN files f ON f.path = p.path
+             WHERE p.reason = 'manual'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         self.connection
             .execute("DELETE FROM removal_plan WHERE reason = 'manual'", [])?;
+        self.record_cleanup_activity(
+            "clear_manual_plan",
+            "attachment_plan",
+            "manual",
+            file_count.max(0) as u64,
+            bytes.max(0) as u64,
+        )?;
         self.cleanup_overview()
     }
 
@@ -784,7 +826,51 @@ impl Catalog {
             );
             self.connection.execute(&sql, [unix_seconds()])?;
         }
-        self.cleanup_overview()
+        let overview = self.cleanup_overview()?;
+        self.record_cleanup_activity(
+            if already_planned {
+                "clear_safe_automatic_plan"
+            } else {
+                "plan_safe_automatic"
+            },
+            "attachment_plan",
+            "thumbnail_backed_images",
+            overview.automatic_marked_count,
+            overview.automatic_marked_bytes,
+        )?;
+        Ok(overview)
+    }
+
+    fn record_cleanup_activity(
+        &self,
+        action: &str,
+        scope: &str,
+        detail: &str,
+        file_count: u64,
+        bytes: u64,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO cleanup_activity(
+                action, scope, detail, file_count, bytes, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                action,
+                scope,
+                detail,
+                i64::try_from(file_count).unwrap_or(i64::MAX),
+                i64::try_from(bytes).unwrap_or(i64::MAX),
+                unix_seconds(),
+            ],
+        )?;
+        self.connection.execute(
+            "DELETE FROM cleanup_activity
+             WHERE id < COALESCE(
+                 (SELECT id FROM cleanup_activity ORDER BY id DESC LIMIT 1 OFFSET 499),
+                 0
+             )",
+            [],
+        )?;
+        Ok(())
     }
 
     pub fn enrich_messages_with_attachments(&self, messages: &mut [Message]) -> Result<()> {
@@ -1402,6 +1488,17 @@ impl Catalog {
             )?;
         }
         transaction.commit()?;
+        self.record_cleanup_activity(
+            if planned {
+                "plan_chat_removal"
+            } else {
+                "clear_chat_removal"
+            },
+            "chat",
+            &format!("{}:{}", chat.source, chat.pk),
+            0,
+            0,
+        )?;
         Ok(())
     }
 
@@ -1411,7 +1508,15 @@ impl Catalog {
         orphan_messages: &[OrphanMessage],
     ) -> Result<()> {
         if self.automatic_cleanup_planned()? {
-            return self.clear_automatic_cleanup_plan();
+            self.clear_automatic_cleanup_plan()?;
+            self.record_cleanup_activity(
+                "clear_automatic_advanced_plan",
+                "database_plan",
+                "automatic",
+                0,
+                0,
+            )?;
+            return Ok(());
         }
         for chat in chats {
             let reason = if chat.message_count == 0 {
@@ -1444,6 +1549,13 @@ impl Catalog {
             }
         }
         transaction.commit()?;
+        self.record_cleanup_activity(
+            "plan_automatic_advanced",
+            "database_plan",
+            "automatic",
+            (chats.len() + orphan_messages.len()) as u64,
+            0,
+        )?;
         Ok(())
     }
 
@@ -1491,6 +1603,7 @@ impl Catalog {
         transaction.execute("DELETE FROM chat_removal_plan", [])?;
         transaction.execute("DELETE FROM orphan_message_removal_plan", [])?;
         transaction.commit()?;
+        self.record_cleanup_activity("clear_advanced_plan", "database_plan", "all", 0, 0)?;
         Ok(())
     }
 
@@ -1828,6 +1941,134 @@ impl Catalog {
                 ],
             },
         ])
+    }
+
+    pub fn cleanup_audit(&self, limit: u32) -> Result<CleanupAuditReport> {
+        let limit = limit.clamp(1, 100);
+        let plan = self.cleanup_plan_snapshot()?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, action, scope, detail, file_count, bytes, created_at
+             FROM cleanup_activity
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let events = statement
+            .query_map([i64::from(limit)], |row| {
+                Ok(CleanupActivity {
+                    id: u64::try_from(row.get::<_, i64>(0)?.max(0)).unwrap_or(0),
+                    action: row.get(1)?,
+                    scope: row.get(2)?,
+                    detail: row.get(3)?,
+                    file_count: u64::try_from(row.get::<_, i64>(4)?.max(0)).unwrap_or(0),
+                    bytes: u64::try_from(row.get::<_, i64>(5)?.max(0)).unwrap_or(0),
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(CleanupAuditReport { plan, events })
+    }
+
+    fn cleanup_plan_snapshot(&self) -> Result<CleanupPlanSnapshot> {
+        let overview = self.cleanup_overview()?;
+        let (chat_marked_count, chat_marked_bytes): (i64, i64) = self.connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(f.bytes), 0)
+             FROM all_removal_plan p JOIN files f ON f.path = p.path
+             WHERE p.reason = 'chat'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (planned_chat_count, planned_chat_messages): (i64, i64) = self.connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(message_count), 0)
+             FROM chat_removal_plan",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let planned_orphan_messages: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM orphan_message_removal_plan",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut digest = Sha256::new();
+        let mut statement = self.connection.prepare(
+            "SELECT p.path, p.reason, f.bytes
+             FROM all_removal_plan p JOIN files f ON f.path = p.path
+             ORDER BY p.path, p.reason",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (path, reason, bytes) = row?;
+            digest.update(path.as_bytes());
+            digest.update([0]);
+            digest.update(reason.as_bytes());
+            digest.update([0]);
+            digest.update(bytes.max(0).to_le_bytes());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT source, chat_pk, reason, message_count
+             FROM chat_removal_plan ORDER BY source, chat_pk",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (source, chat_pk, reason, message_count) = row?;
+            digest.update(source.as_bytes());
+            digest.update(chat_pk.to_le_bytes());
+            digest.update(reason.as_bytes());
+            digest.update(message_count.max(0).to_le_bytes());
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT source, message_pk, message_id, COALESCE(chat_pk, 0)
+             FROM orphan_message_removal_plan ORDER BY source, message_pk",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (source, message_pk, message_id, chat_pk) = row?;
+            digest.update(source.as_bytes());
+            digest.update(message_pk.to_le_bytes());
+            digest.update(message_id.as_bytes());
+            digest.update(chat_pk.to_le_bytes());
+        }
+        let plan_fingerprint = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(CleanupPlanSnapshot {
+            source_path: self.meta("source_path")?.unwrap_or_default(),
+            source_fingerprint: self.meta("source_fingerprint")?,
+            plan_fingerprint,
+            generated_at: unix_seconds(),
+            marked_count: overview.marked_count,
+            marked_bytes: overview.marked_bytes,
+            manual_marked_count: overview.manual_marked_count,
+            manual_marked_bytes: overview.manual_marked_bytes,
+            automatic_marked_count: overview.automatic_marked_count,
+            automatic_marked_bytes: overview.automatic_marked_bytes,
+            chat_marked_count: chat_marked_count.max(0) as u64,
+            chat_marked_bytes: chat_marked_bytes.max(0) as u64,
+            planned_chat_count: planned_chat_count.max(0) as u64,
+            planned_message_count: planned_chat_messages
+                .saturating_add(planned_orphan_messages)
+                .max(0) as u64,
+        })
     }
 
     pub fn indexed_attachment_chats(&self) -> Result<HashSet<(String, i64)>> {
@@ -2351,7 +2592,9 @@ impl Catalog {
                 )?;
             }
         }
-        self.cleanup_overview()
+        let overview = self.cleanup_overview()?;
+        self.record_cleanup_activity(action, "cleanup_group", group_key, 0, 0)?;
+        Ok(overview)
     }
 
     pub fn hash_duplicate_candidates<F>(

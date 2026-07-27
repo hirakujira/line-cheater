@@ -30,6 +30,7 @@ const allowedMethods = new Set([
   "cleanupOverview",
   "cleanupPreflight",
   "cleanupPlanPreviews",
+  "cleanupAudit",
   "listCleanupGroups",
   "listCleanupReviews",
   "applyCleanupGroupAction",

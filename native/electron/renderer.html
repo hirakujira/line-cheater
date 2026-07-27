@@ -254,6 +254,24 @@
                   </div>
                   <div id="cleanup-plan-cards" class="cleanup-plan-cards"></div>
                 </section>
+                <section id="cleanup-audit" class="cleanup-audit" aria-labelledby="cleanup-audit-title">
+                  <div class="cleanup-audit-heading">
+                    <div>
+                      <strong id="cleanup-audit-title">操作紀錄與可重現計畫</strong>
+                      <span id="cleanup-audit-summary">正在整理最近操作與計畫指紋…</span>
+                    </div>
+                    <div class="cleanup-audit-actions">
+                      <button id="refresh-cleanup-audit" class="secondary-button" type="button" disabled>
+                        重新整理
+                      </button>
+                      <button id="copy-cleanup-plan" class="secondary-button" type="button" disabled>
+                        複製計畫摘要
+                      </button>
+                    </div>
+                  </div>
+                  <div id="cleanup-audit-plan" class="cleanup-audit-plan"></div>
+                  <div id="cleanup-audit-events" class="cleanup-audit-events"></div>
+                </section>
                 <div class="cleanup-plan-bar" aria-live="polite">
                   <div>
                     <strong>清理模式</strong>
@@ -511,6 +529,39 @@
         取消建立
       </button>
       <button id="package-modal-close" class="package-modal-close hidden" type="button">完成</button>
+    </section>
+  </div>
+
+  <div id="restore-checklist-modal" class="restore-checklist-modal hidden"
+       role="dialog" aria-modal="true" aria-labelledby="restore-checklist-title"
+       aria-describedby="restore-checklist-description" aria-hidden="true">
+    <div class="package-modal-backdrop" aria-hidden="true"></div>
+    <section class="restore-checklist-card" role="document" tabindex="-1">
+      <p class="section-kicker">還原前檢查</p>
+      <h2 id="restore-checklist-title">先確認候選檔還原計畫</h2>
+      <p id="restore-checklist-description" class="restore-checklist-description">
+        建立候選檔不會修改原始備份；請完成三項確認，讓之後的還原測試可追溯。
+      </p>
+      <div class="restore-checklist-questions">
+        <label>
+          <input id="restore-check-original" type="checkbox">
+          <span>我已保留原始備份，候選檔不會取代它。</span>
+        </label>
+        <label>
+          <input id="restore-check-test" type="checkbox">
+          <span>我會先在不影響日常資料的環境測試還原候選檔。</span>
+        </label>
+        <label>
+          <input id="restore-check-verify" type="checkbox">
+          <span>還原後我會驗證聊天室、圖片與 SQLite 資料是否可讀。</span>
+        </label>
+      </div>
+      <div class="restore-checklist-actions">
+        <button id="restore-check-cancel" class="secondary-button" type="button">取消</button>
+        <button id="restore-check-confirm" class="primary-button" type="button" disabled>
+          確認並建立候選檔
+        </button>
+      </div>
     </section>
   </div>
 

@@ -186,6 +186,12 @@
     return this.bridge.request("cleanupPlanPreviews", {});
   };
 
+  NativeDataProvider.prototype.cleanupAudit = function (limit) {
+    return this.bridge.request("cleanupAudit", {
+      limit: boundedLimit(limit, 20)
+    });
+  };
+
   NativeDataProvider.prototype.listCleanupGroups = async function (options) {
     var page = await this.bridge.request("listCleanupGroups", cleanupParams(options));
     return assertCleanupPage(page, "listCleanupGroups");

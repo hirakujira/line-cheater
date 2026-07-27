@@ -293,6 +293,44 @@ pub struct CleanupPlanPreview {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct CleanupActivity {
+    pub id: u64,
+    pub action: String,
+    pub scope: String,
+    pub detail: String,
+    pub file_count: u64,
+    pub bytes: u64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupPlanSnapshot {
+    pub source_path: String,
+    pub source_fingerprint: Option<String>,
+    pub plan_fingerprint: String,
+    pub generated_at: i64,
+    pub marked_count: u64,
+    pub marked_bytes: u64,
+    pub manual_marked_count: u64,
+    pub manual_marked_bytes: u64,
+    pub automatic_marked_count: u64,
+    pub automatic_marked_bytes: u64,
+    pub chat_marked_count: u64,
+    pub chat_marked_bytes: u64,
+    pub planned_chat_count: u64,
+    pub planned_message_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupAuditReport {
+    pub plan: CleanupPlanSnapshot,
+    pub events: Vec<CleanupActivity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct CleanupGroup {
     pub key: String,
     pub chat_source: String,
