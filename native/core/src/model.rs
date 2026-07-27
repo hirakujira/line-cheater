@@ -147,6 +147,7 @@ pub struct AttachmentItem {
     pub message_id: String,
     pub chat_hint: String,
     pub marked_for_removal: bool,
+    pub removal_reason: String,
     pub reference_status: String,
     pub context: Option<AttachmentContext>,
 }
@@ -235,7 +236,59 @@ pub struct CleanupOverview {
     pub categories: Vec<CleanupCategoryTotal>,
     pub marked_count: u64,
     pub marked_bytes: u64,
+    pub manual_marked_count: u64,
+    pub manual_marked_bytes: u64,
+    pub automatic_candidate_count: u64,
+    pub automatic_candidate_bytes: u64,
+    pub automatic_marked_count: u64,
+    pub automatic_marked_bytes: u64,
     pub context_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupRisk {
+    pub code: String,
+    pub severity: String,
+    pub title: String,
+    pub detail: String,
+    pub file_count: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupPreflightReport {
+    pub source_kind: String,
+    pub source_read_only: bool,
+    pub sqlite_quick_check: String,
+    pub catalog_source_current: bool,
+    pub scan_status: String,
+    pub context_status: String,
+    pub active_job: Option<String>,
+    pub risk_count: u64,
+    pub blocker_count: u64,
+    pub warning_count: u64,
+    pub safe_candidate_count: u64,
+    pub safe_candidate_bytes: u64,
+    pub marked_count: u64,
+    pub marked_bytes: u64,
+    pub risks: Vec<CleanupRisk>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CleanupPlanPreview {
+    pub profile: String,
+    pub title: String,
+    pub description: String,
+    pub automatic_file_count: u64,
+    pub automatic_bytes: u64,
+    pub review_file_count: u64,
+    pub review_bytes: u64,
+    pub planned_chat_count: u64,
+    pub planned_message_count: u64,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

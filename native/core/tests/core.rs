@@ -1168,6 +1168,33 @@ fn keep_thumbnail_only_marks_images_with_nonempty_matching_thumbnails() {
         .index_attachment_contexts(&database, None, None, |_| {})
         .unwrap();
 
+    let overview = catalog.cleanup_overview().unwrap();
+    assert_eq!(overview.automatic_candidate_count, 1);
+    assert_eq!(overview.automatic_marked_count, 0);
+    assert_eq!(overview.manual_marked_count, 0);
+    let overview = catalog.plan_safe_attachment_cleanup().unwrap();
+    assert_eq!(overview.marked_count, 1);
+    assert_eq!(overview.automatic_marked_count, 1);
+    let auto_file = catalog
+        .list_cleanup_reviews("chat:line:7", 1, 24, None, "all", "all", "recent")
+        .unwrap()
+        .items
+        .iter()
+        .flat_map(|review| &review.files)
+        .find(|file| file.message_id == "12345678" && file.kind == AttachmentKind::Original)
+        .unwrap()
+        .clone();
+    assert_eq!(auto_file.removal_reason, "automatic");
+    catalog.set_marked(&auto_file.path, false).unwrap();
+    catalog.set_marked(&auto_file.path, true).unwrap();
+    let overview = catalog.clear_manual_attachment_plan().unwrap();
+    assert_eq!(overview.marked_count, 0);
+    assert_eq!(overview.automatic_marked_count, 0);
+    let overview = catalog.plan_safe_attachment_cleanup().unwrap();
+    assert_eq!(overview.automatic_marked_count, 1);
+    let overview = catalog.plan_safe_attachment_cleanup().unwrap();
+    assert_eq!(overview.marked_count, 0);
+
     let group = catalog
         .list_cleanup_groups(1, 24, None, "all", "all", "recent")
         .unwrap()
@@ -1482,6 +1509,8 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
         "{\"id\":\"19\",\"method\":\"listChats\",\"params\":{\"limit\":1,\"beforeCursor\":{\"lastUpdated\":200,\"source\":\"line\",\"pk\":7}}}\n",
         "{\"id\":\"20\",\"method\":\"listChats\",\"params\":{\"limit\":1,\"cursor\":{\"lastUpdated\":410,\"source\":\"square\",\"pk\":8}}}\n",
         "{\"id\":\"21\",\"method\":\"searchMessages\",\"params\":{\"query\":\"photo\",\"limit\":10}}\n",
+        "{\"id\":\"22\",\"method\":\"cleanupPreflight\"}\n",
+        "{\"id\":\"23\",\"method\":\"cleanupPlanPreviews\"}\n",
         "{\"id\":\"8\",\"method\":\"shutdown\"}\n"
     );
     let mut input = std::io::BufReader::new(requests.as_bytes());
@@ -1575,6 +1604,13 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
     assert_eq!(response("19")["result"]["hasPrevious"], false);
     assert_eq!(response("20")["result"]["items"][0]["source"], "line");
     assert_eq!(response("21")["result"]["items"][0]["id"], "12345678");
+    assert_eq!(response("22")["result"]["blockerCount"], 0);
+    assert_eq!(response("22")["result"]["sqliteQuickCheck"], "ok");
+    assert_eq!(response("22")["result"]["scanStatus"], "complete");
+    assert_eq!(response("22")["result"]["safeCandidateCount"], 1);
+    assert_eq!(response("23")["result"].as_array().unwrap().len(), 3);
+    assert_eq!(response("23")["result"][0]["profile"], "conservative");
+    assert_eq!(response("23")["result"][1]["reviewFileCount"], 0);
     let indexed_messages: i64 = Connection::open(work.join("search.sqlite"))
         .unwrap()
         .query_row("SELECT COUNT(*) FROM messages_fts", [], |row| row.get(0))

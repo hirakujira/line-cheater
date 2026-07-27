@@ -18,9 +18,9 @@ use crate::database::{LineDatabase, LineSquareDatabase, OrphanMessage, UnifiedGr
 use crate::model::{
     AdvancedCleanupReport, AttachmentContext, AttachmentCursor, AttachmentItem, AttachmentKind,
     AttachmentPage, AttachmentPreview, CatalogStats, Chat, CleanupCategoryTotal, CleanupGroup,
-    CleanupGroupPage, CleanupOverview, CleanupReview, CleanupReviewPage, DuplicateGroup,
-    DuplicateGroupCursor, DuplicateGroupPage, DuplicateHashProgress, DuplicateMemberPage, Message,
-    MessageAttachment, checked_page_size,
+    CleanupGroupPage, CleanupOverview, CleanupPlanPreview, CleanupReview, CleanupReviewPage,
+    DuplicateGroup, DuplicateGroupCursor, DuplicateGroupPage, DuplicateHashProgress,
+    DuplicateMemberPage, Message, MessageAttachment, checked_page_size,
 };
 use crate::performance::system_performance_profile;
 use crate::source::SourceKind;
@@ -86,7 +86,7 @@ const IMAGE_THUMBNAIL_WITH_ORIGINAL_EXPR: &str = "
 ";
 const ATTACHMENT_COLUMNS: &str = "
     f.id, f.path, f.bytes, f.modified_ns, f.attachment_kind,
-    f.message_id, f.chat_hint, p.path IS NOT NULL, f.reference_status,
+    f.message_id, f.chat_hint, p.path IS NOT NULL, COALESCE(p.reason, ''), f.reference_status,
     f.message_pk, f.message_chat_pk, f.context_source, f.context_chat_id,
     f.context_chat_title, f.context_chat_kind, f.message_timestamp,
     f.message_sender_pk, f.message_sender_name, f.message_content_type, f.message_text
@@ -195,7 +195,8 @@ impl Catalog {
                 ON files(message_id) WHERE message_id <> '';
             CREATE TABLE IF NOT EXISTS removal_plan (
                 path TEXT PRIMARY KEY REFERENCES files(path) ON DELETE CASCADE,
-                marked_at INTEGER NOT NULL
+                marked_at INTEGER NOT NULL,
+                reason TEXT NOT NULL DEFAULT 'manual'
             );
             CREATE TABLE IF NOT EXISTS chat_removal_plan (
                 source TEXT NOT NULL CHECK(source IN ('line', 'square')),
@@ -267,6 +268,25 @@ impl Catalog {
             "files",
             "reference_status",
             "TEXT NOT NULL DEFAULT 'unconfirmed'",
+        )?;
+        ensure_column(
+            &connection,
+            "removal_plan",
+            "reason",
+            "TEXT NOT NULL DEFAULT 'manual'",
+        )?;
+        connection.execute_batch(
+            "
+            DROP VIEW IF EXISTS all_removal_plan;
+            CREATE VIEW all_removal_plan AS
+                SELECT path, reason FROM removal_plan
+                UNION ALL
+                SELECT chat_files.path, 'chat'
+                FROM (SELECT DISTINCT path FROM chat_removal_files) chat_files
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM removal_plan direct WHERE direct.path = chat_files.path
+                );
+            ",
         )?;
         connection.execute(
             "CREATE INDEX IF NOT EXISTS files_sha256 ON files(sha256, id) WHERE sha256 IS NOT NULL",
@@ -724,8 +744,10 @@ impl Catalog {
         }
         if marked {
             self.connection.execute(
-                "INSERT INTO removal_plan(path, marked_at) VALUES (?1, ?2)
-                 ON CONFLICT(path) DO UPDATE SET marked_at = excluded.marked_at",
+                "INSERT INTO removal_plan(path, marked_at, reason) VALUES (?1, ?2, 'manual')
+                 ON CONFLICT(path) DO UPDATE SET
+                    marked_at = excluded.marked_at,
+                    reason = 'manual'",
                 params![path, unix_seconds()],
             )?;
         } else {
@@ -733,6 +755,36 @@ impl Catalog {
                 .execute("DELETE FROM removal_plan WHERE path = ?1", [path])?;
         }
         Ok(())
+    }
+
+    pub fn clear_manual_attachment_plan(&self) -> Result<CleanupOverview> {
+        self.connection
+            .execute("DELETE FROM removal_plan WHERE reason = 'manual'", [])?;
+        self.cleanup_overview()
+    }
+
+    pub fn plan_safe_attachment_cleanup(&self) -> Result<CleanupOverview> {
+        let already_planned: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM removal_plan WHERE reason = 'automatic')",
+            [],
+            |row| row.get(0),
+        )?;
+        if already_planned {
+            self.connection
+                .execute("DELETE FROM removal_plan WHERE reason = 'automatic'", [])?;
+        } else {
+            let sql = format!(
+                "INSERT OR IGNORE INTO removal_plan(path, marked_at, reason)
+                 SELECT f.path, ?1, 'automatic'
+                 FROM files f
+                 WHERE {THUMBNAIL_BACKED_IMAGE_EXPR}
+                   AND NOT EXISTS (
+                       SELECT 1 FROM all_removal_plan planned WHERE planned.path = f.path
+                   )"
+            );
+            self.connection.execute(&sql, [unix_seconds()])?;
+        }
+        self.cleanup_overview()
     }
 
     pub fn enrich_messages_with_attachments(&self, messages: &mut [Message]) -> Result<()> {
@@ -1625,6 +1677,30 @@ impl Catalog {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+        let (manual_marked_count, manual_marked_bytes): (i64, i64) = self.connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(f.bytes), 0)
+             FROM removal_plan p JOIN files f ON f.path = p.path
+             WHERE p.reason = 'manual'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let automatic_candidate_sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(f.bytes), 0)
+             FROM files f WHERE {THUMBNAIL_BACKED_IMAGE_EXPR}"
+        );
+        let (automatic_candidate_count, automatic_candidate_bytes): (i64, i64) = self
+            .connection
+            .query_row(&automatic_candidate_sql, [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+        let (automatic_marked_count, automatic_marked_bytes): (i64, i64) =
+            self.connection.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(f.bytes), 0)
+             FROM removal_plan p JOIN files f ON f.path = p.path
+             WHERE p.reason = 'automatic'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
         let categories = [
             "all",
             "individual",
@@ -1640,6 +1716,12 @@ impl Catalog {
             categories,
             marked_count: marked_count.max(0) as u64,
             marked_bytes: marked_bytes.max(0) as u64,
+            manual_marked_count: manual_marked_count.max(0) as u64,
+            manual_marked_bytes: manual_marked_bytes.max(0) as u64,
+            automatic_candidate_count: automatic_candidate_count.max(0) as u64,
+            automatic_candidate_bytes: automatic_candidate_bytes.max(0) as u64,
+            automatic_marked_count: automatic_marked_count.max(0) as u64,
+            automatic_marked_bytes: automatic_marked_bytes.max(0) as u64,
             context_status: if self.meta("context_index_version")?.as_deref()
                 == Some(CONTEXT_INDEX_VERSION)
             {
@@ -1649,6 +1731,103 @@ impl Catalog {
                 "stale".to_string()
             },
         })
+    }
+
+    pub fn cleanup_plan_previews(&self) -> Result<Vec<CleanupPlanPreview>> {
+        let safe_sql = format!(
+            "SELECT COUNT(*), COALESCE(SUM(f.bytes), 0)
+             FROM files f WHERE {THUMBNAIL_BACKED_IMAGE_EXPR}"
+        );
+        let (automatic_file_count, automatic_bytes): (i64, i64) =
+            self.connection
+                .query_row(&safe_sql, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let (unreferenced_file_count, unreferenced_bytes): (i64, i64) = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(bytes), 0)
+                 FROM files WHERE attachment_kind IS NOT NULL AND reference_status = 'unreferenced'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+        let (unconfirmed_file_count, unconfirmed_bytes): (i64, i64) = self.connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(bytes), 0)
+                 FROM files WHERE attachment_kind IS NOT NULL
+                   AND reference_status NOT IN ('referenced', 'unreferenced')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let planned_chat_count: i64 =
+            self.connection
+                .query_row("SELECT COUNT(*) FROM chat_removal_plan", [], |row| {
+                    row.get(0)
+                })?;
+        let planned_chat_messages: i64 = self.connection.query_row(
+            "SELECT COALESCE(SUM(message_count), 0) FROM chat_removal_plan",
+            [],
+            |row| row.get(0),
+        )?;
+        let planned_orphan_messages: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM orphan_message_removal_plan",
+            [],
+            |row| row.get(0),
+        )?;
+        let planned_message_count = planned_chat_messages.saturating_add(planned_orphan_messages);
+        let automatic_file_count = automatic_file_count.max(0) as u64;
+        let automatic_bytes = automatic_bytes.max(0) as u64;
+        let unreferenced_file_count = unreferenced_file_count.max(0) as u64;
+        let unreferenced_bytes = unreferenced_bytes.max(0) as u64;
+        let unconfirmed_file_count = unconfirmed_file_count.max(0) as u64;
+        let unconfirmed_bytes = unconfirmed_bytes.max(0) as u64;
+        let planned_chat_count = planned_chat_count.max(0) as u64;
+        let planned_message_count = planned_message_count.max(0) as u64;
+
+        Ok(vec![
+            CleanupPlanPreview {
+                profile: "conservative".to_string(),
+                title: "保守：只套用安全規則".to_string(),
+                description: "只標記有 SQLite 內容與非空縮圖可交叉確認的圖片原檔。".to_string(),
+                automatic_file_count,
+                automatic_bytes,
+                review_file_count: 0,
+                review_bytes: 0,
+                planned_chat_count,
+                planned_message_count,
+                warnings: vec![
+                    "可直接套用；仍會在建立候選檔前再次驗證來源與保留檔案。".to_string(),
+                ],
+            },
+            CleanupPlanPreview {
+                profile: "balanced".to_string(),
+                title: "平衡：安全項目＋未引用複核".to_string(),
+                description: "保留安全自動標記，另外列出 SQLite 未引用附件供人工逐一確認。"
+                    .to_string(),
+                automatic_file_count,
+                automatic_bytes,
+                review_file_count: unreferenced_file_count,
+                review_bytes: unreferenced_bytes,
+                planned_chat_count,
+                planned_message_count,
+                warnings: vec![
+                    "SQLite 未引用不等於可刪除；未經人工確認不會自動加入清理計畫。".to_string(),
+                ],
+            },
+            CleanupPlanPreview {
+                profile: "aggressive".to_string(),
+                title: "積極：擴大人工複核範圍".to_string(),
+                description: "在平衡方案上，再把無法確認來源的附件列為高風險複核項目。".to_string(),
+                automatic_file_count,
+                automatic_bytes,
+                review_file_count: unreferenced_file_count.saturating_add(unconfirmed_file_count),
+                review_bytes: unreferenced_bytes.saturating_add(unconfirmed_bytes),
+                planned_chat_count,
+                planned_message_count,
+                warnings: vec![
+                    "無法確認的附件可能屬於備份中未被目前資料庫索引的內容，必須人工檢查。"
+                        .to_string(),
+                    "現有聊天室與孤兒訊息計畫會另行顯示，不會因預演自動加入。".to_string(),
+                ],
+            },
+        ])
     }
 
     pub fn indexed_attachment_chats(&self) -> Result<HashSet<(String, i64)>> {
@@ -2038,7 +2217,7 @@ impl Catalog {
                 );
             }
             let item = attachment_from_row(row)?;
-            let bundle_key: String = row.get(20)?;
+            let bundle_key: String = row.get(21)?;
             files_by_bundle.entry(bundle_key).or_default().push(item);
         }
         let items = bundle_keys
@@ -2128,8 +2307,8 @@ impl Catalog {
             } else {
                 self.connection.execute(
                     &format!(
-                        "INSERT OR REPLACE INTO removal_plan(path, marked_at)
-                         SELECT f.path, ?2 FROM files f WHERE {predicate}"
+                        "INSERT OR REPLACE INTO removal_plan(path, marked_at, reason)
+                         SELECT f.path, ?2, 'manual' FROM files f WHERE {predicate}"
                     ),
                     params![group_key, now],
                 )?;
@@ -2154,8 +2333,8 @@ impl Catalog {
             } else {
                 self.connection.execute(
                     &format!(
-                        "INSERT OR REPLACE INTO removal_plan(path, marked_at)
-                         SELECT f.path, ?2 FROM files f
+                        "INSERT OR REPLACE INTO removal_plan(path, marked_at, reason)
+                         SELECT f.path, ?2, 'manual' FROM files f
                          WHERE {predicate} AND ({THUMBNAIL_BACKED_IMAGE_EXPR})"
                     ),
                     params![group_key, now],
@@ -3230,20 +3409,21 @@ fn attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentIt
         "thumbnail" => AttachmentKind::Thumbnail,
         _ => unreachable!("catalog only stores known attachment kinds"),
     };
-    let reference_status: String = row.get(8)?;
+    let removal_reason: String = row.get(8)?;
+    let reference_status: String = row.get(9)?;
     let context = if reference_status == "referenced" {
         Some(AttachmentContext {
-            source: row.get::<_, Option<String>>(11)?.unwrap_or_default(),
-            message_pk: row.get(9)?,
-            chat_pk: row.get(10)?,
-            chat_id: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
-            chat_title: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
-            chat_kind: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
-            timestamp: row.get::<_, Option<i64>>(15)?.unwrap_or(0),
-            sender_pk: row.get(16)?,
-            sender_name: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
-            content_type: row.get(18)?,
-            text: row.get::<_, Option<String>>(19)?.unwrap_or_default(),
+            source: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+            message_pk: row.get(10)?,
+            chat_pk: row.get(11)?,
+            chat_id: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
+            chat_title: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
+            chat_kind: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
+            timestamp: row.get::<_, Option<i64>>(16)?.unwrap_or(0),
+            sender_pk: row.get(17)?,
+            sender_name: row.get::<_, Option<String>>(18)?.unwrap_or_default(),
+            content_type: row.get(19)?,
+            text: row.get::<_, Option<String>>(20)?.unwrap_or_default(),
         })
     } else {
         None
@@ -3257,6 +3437,7 @@ fn attachment_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentIt
         message_id: row.get(5)?,
         chat_hint: row.get(6)?,
         marked_for_removal: row.get(7)?,
+        removal_reason,
         reference_status,
         context,
     })

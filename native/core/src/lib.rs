@@ -12,10 +12,10 @@ pub use database::{LineDatabase, LineSquareDatabase, UnifiedGroupDatabase};
 pub use model::{
     AdvancedCleanupReport, AttachmentContext, AttachmentCursor, AttachmentItem, AttachmentKind,
     AttachmentPage, AttachmentPreview, CatalogStats, Chat, ChatCursor, ChatPage,
-    CleanupCategoryTotal, CleanupGroup, CleanupGroupPage, CleanupOverview, CleanupReview,
-    CleanupReviewPage, DuplicateGroup, DuplicateGroupCursor, DuplicateGroupPage,
-    DuplicateHashProgress, DuplicateMemberPage, Message, MessageAttachment, MessageCursor,
-    MessagePage,
+    CleanupCategoryTotal, CleanupGroup, CleanupGroupPage, CleanupOverview, CleanupPlanPreview,
+    CleanupPreflightReport, CleanupReview, CleanupReviewPage, CleanupRisk, DuplicateGroup,
+    DuplicateGroupCursor, DuplicateGroupPage, DuplicateHashProgress, DuplicateMemberPage, Message,
+    MessageAttachment, MessageCursor, MessagePage,
 };
 pub use performance::{PerformanceProfile, system_performance_profile};
 pub use server::{NativeSession, serve};

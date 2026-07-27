@@ -233,6 +233,43 @@
                   <strong>還原前請保留原始檔</strong>
                   <span>「SQLite 未引用」仍需人工確認；候選檔只會排除已標記附件，不會改動來源備份。</span>
                 </div>
+                <section id="cleanup-preflight" class="cleanup-preflight" aria-live="polite">
+                  <div class="cleanup-preflight-heading">
+                    <div>
+                      <strong id="cleanup-preflight-title">清理前盲點掃描</strong>
+                      <span id="cleanup-preflight-summary">正在檢查來源、索引與不確定檔案…</span>
+                    </div>
+                    <button id="refresh-cleanup-preflight" class="secondary-button" type="button" disabled>
+                      重新檢查
+                    </button>
+                  </div>
+                  <div id="cleanup-preflight-risks" class="cleanup-preflight-risks"></div>
+                </section>
+                <section id="cleanup-plan-previews" class="cleanup-plan-previews" aria-labelledby="cleanup-plan-previews-title">
+                  <div class="cleanup-plan-previews-heading">
+                    <div>
+                      <strong id="cleanup-plan-previews-title">清理方案預演</strong>
+                      <span id="cleanup-plan-previews-summary">預覽不同風險範圍；只有安全候選可自動套用。</span>
+                    </div>
+                  </div>
+                  <div id="cleanup-plan-cards" class="cleanup-plan-cards"></div>
+                </section>
+                <div class="cleanup-plan-bar" aria-live="polite">
+                  <div>
+                    <strong>清理模式</strong>
+                    <span id="cleanup-automation-summary">
+                      安全自動清理只會標記已確認的圖片原檔，並保留非空縮圖。
+                    </span>
+                  </div>
+                  <div class="cleanup-plan-actions">
+                    <button id="plan-safe-attachment-cleanup" class="secondary-button" type="button" disabled>
+                      自動標記安全瘦身
+                    </button>
+                    <button id="clear-manual-attachment-plan" class="secondary-button" type="button" disabled>
+                      清除手動標記
+                    </button>
+                  </div>
+                </div>
                 <div class="cleanup-toolbar">
                   <label class="cleanup-search">
                     <span class="sr-only">搜尋附件</span>
@@ -463,6 +500,7 @@
       <p id="package-modal-message" class="package-modal-message" role="status" aria-live="polite">
         正在整理保留的檔案，請勿關閉此視窗。
       </p>
+      <div id="package-modal-report" class="package-modal-report hidden" aria-live="polite"></div>
       <div class="package-modal-progress-track">
         <div id="package-modal-progress" class="package-modal-progress" role="progressbar"
              aria-label="封裝進度" aria-valuemin="0" aria-valuemax="100"

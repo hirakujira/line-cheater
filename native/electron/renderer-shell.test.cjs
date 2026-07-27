@@ -317,6 +317,31 @@ test("reuses cleanup overview while paging groups", () => {
   assert.match(renderer, /cleanupPage = cleanupOverview = null;/);
 });
 
+test("exposes separate safe-automatic and manual cleanup controls", () => {
+  assert.match(html, /id="plan-safe-attachment-cleanup"/);
+  assert.match(html, /id="clear-manual-attachment-plan"/);
+  assert.match(renderer, /provider\.planSafeAttachmentCleanup\(\)/);
+  assert.match(renderer, /provider\.clearManualAttachmentPlan\(\)/);
+  assert.match(renderer, /removalReason === "automatic"/);
+  assert.match(main, /"planSafeAttachmentCleanup"/);
+  assert.match(main, /"clearManualAttachmentPlan"/);
+});
+
+test("surfaces cleanup blindspot scans, plan previews, and candidate verification", () => {
+  assert.match(html, /id="cleanup-preflight"/);
+  assert.match(html, /id="refresh-cleanup-preflight"/);
+  assert.match(html, /id="cleanup-plan-cards"/);
+  assert.match(html, /id="package-modal-report"/);
+  assert.match(renderer, /provider\.cleanupPreflight\(\)/);
+  assert.match(renderer, /provider\.cleanupPlanPreviews\(\)/);
+  assert.match(renderer, /function renderCleanupPreflight\(\)/);
+  assert.match(renderer, /function renderCleanupPlanPreviews\(\)/);
+  assert.match(renderer, /function renderCandidateReport\(report\)/);
+  assert.match(renderer, /Number\(cleanupPreflight\.blockerCount\)/);
+  assert.match(main, /"cleanupPreflight"/);
+  assert.match(main, /"cleanupPlanPreviews"/);
+});
+
 test("supports cleanup page jumps and restores the overview page after chat detail", () => {
   assert.match(html, /id="cleanup-page-input"/);
   assert.match(html, /id="cleanup-page-total"/);
