@@ -296,8 +296,12 @@ test("keeps cleanup bounded while presenting a continuous month-sectioned album"
   assert.match(renderer, /classList\.add\("is-detail"\)/);
   assert.match(renderer, /choice\.setAttribute\("aria-description", impactText\)/);
   assert.match(styles, /\.workspace-content\s*\{[^}]*overflow: hidden/);
-  assert.match(styles, /\.cleanup-panel\s*\{[^}]*height: 100%[^}]*overflow: hidden/);
+  assert.match(styles, /\.cleanup-panel\s*\{[^}]*height: 100%[^}]*overflow-x: hidden[^}]*overflow-y: auto/);
+  assert.match(styles, /\.cleanup-panel\s*\{[^}]*overflow-x: hidden[^}]*overflow-y: auto/);
+  assert.match(styles, /\.cleanup-results\s*\{[^}]*min-height: 320px[^}]*flex: 0 0 320px/);
+  assert.match(styles, /\.cleanup-list\s*\{[^}]*overflow-x: hidden[^}]*overflow-y: auto/);
   assert.match(styles, /\.cleanup-group-list\s*\{[^}]*grid-template-rows: repeat\(4,/);
+  assert.match(styles, /\.cleanup-group-list\s*\{[^}]*min-height: 306px/);
   assert.match(styles, /\.cleanup-review-grid\s*\{[^}]*repeat\(auto-fill, minmax\(min\(180px,/);
   assert.match(styles, /\.cleanup-month-header\s*\{[^}]*position: sticky/);
   assert.match(styles, /\.cleanup-preview img\s*\{[^}]*object-fit: contain/);
@@ -327,10 +331,24 @@ test("exposes separate safe-automatic and manual cleanup controls", () => {
   assert.match(main, /"clearManualAttachmentPlan"/);
 });
 
+test("restarts the cleanup overview after global attachment-plan changes", () => {
+  assert.match(
+    renderer,
+    /await provider\.planSafeAttachmentCleanup\(\);\s+cleanupPage = null;\s+cleanupOverview = null;\s+cleanupState\.page = 1;\s+cleanupState\.groupKey = null;/
+  );
+  assert.match(
+    renderer,
+    /await provider\.clearManualAttachmentPlan\(\);\s+cleanupPage = null;\s+cleanupOverview = null;\s+cleanupState\.page = 1;\s+cleanupState\.groupKey = null;/
+  );
+  assert.match(renderer, /await loadCleanupPage\(\{ verifySource: false \}\)/);
+  assert.match(renderer, /void refreshAdvancedPlanSummary\(\)/);
+});
+
 test("surfaces cleanup blindspot scans, plan previews, and candidate verification", () => {
   assert.match(html, /id="cleanup-preflight"/);
   assert.match(html, /id="refresh-cleanup-preflight"/);
   assert.match(html, /id="cleanup-plan-cards"/);
+  assert.match(html, /此區為唯讀比較/);
   assert.match(html, /id="package-modal-report"/);
   assert.match(renderer, /provider\.cleanupPreflight\(\)/);
   assert.match(renderer, /provider\.cleanupPlanPreviews\(\)/);
@@ -340,6 +358,17 @@ test("surfaces cleanup blindspot scans, plan previews, and candidate verificatio
   assert.match(renderer, /Number\(cleanupPreflight\.blockerCount\)/);
   assert.match(main, /"cleanupPreflight"/);
   assert.match(main, /"cleanupPlanPreviews"/);
+});
+
+test("copies cleanup summaries through trusted Electron clipboard IPC", () => {
+  assert.match(renderer, /await bridge\.copyText\(summary\)/);
+  assert.doesNotMatch(renderer, /navigator\.clipboard\.writeText/);
+  assert.match(preload, /copyText\(value\)/);
+  assert.match(preload, /line-native:copy-text/);
+  assert.match(main, /ipcMain\.handle\("line-native:copy-text"/);
+  assert.match(main, /assertTrustedSender\(event\)/);
+  assert.match(main, /clipboard\.writeText\(value\)/);
+  assert.match(main, /MAX_CLIPBOARD_BYTES/);
 });
 
 test("surfaces cleanup audit history and restore checklist", () => {

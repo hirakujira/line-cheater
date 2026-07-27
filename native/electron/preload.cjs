@@ -30,6 +30,12 @@ contextBridge.exposeInMainWorld("lineNativeBridge", Object.freeze({
     }
     return ipcRenderer.invoke("line-native:attachment-preview", path);
   },
+  copyText(value) {
+    if (typeof value !== "string" || new TextEncoder().encode(value).length > 256 * 1024) {
+      return Promise.reject(new TypeError("Invalid clipboard text."));
+    }
+    return ipcRenderer.invoke("line-native:copy-text", value);
+  },
   openExternal(value) {
     if (typeof value !== "string" || new TextEncoder().encode(value).length > 4096) {
       return Promise.reject(new TypeError("Invalid external URL."));

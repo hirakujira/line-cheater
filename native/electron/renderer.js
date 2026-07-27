@@ -1747,7 +1747,8 @@ function cleanupOptions(overrides) {
   };
 }
 
-async function loadCleanupPage() {
+async function loadCleanupPage(options) {
+  options = options || {};
   if (!provider) return;
   if (cleanupLoading) {
     cleanupReloadPending = true;
@@ -1774,7 +1775,9 @@ async function loadCleanupPage() {
       page = loadedPage;
     }
     const [preflight, previews, audit] = await Promise.all([
-      cleanupPreflight || provider.cleanupPreflight(),
+      cleanupPreflight || provider.cleanupPreflight({
+        verifySource: options.verifySource !== false
+      }),
       cleanupPlanPreviews || provider.cleanupPlanPreviews(),
       cleanupAudit || provider.cleanupAudit(20)
     ]);
@@ -1868,7 +1871,7 @@ function renderCleanupPlanPreviews() {
   }
   elements.cleanupPlanCards.replaceChildren(fragment);
   elements.cleanupPlanPreviewsSummary.textContent =
-    "保守方案可由上方按鈕套用；平衡與積極方案只列出人工複核範圍。";
+    "此區為唯讀比較；保守方案可由下方按鈕套用，平衡與積極方案只列出人工複核範圍。";
 }
 
 const cleanupActionLabels = {
@@ -1951,7 +1954,7 @@ async function copyCleanupPlanSummary() {
     `資料庫：${Number(plan.plannedChatCount || 0).toLocaleString()} 個聊天室 / ${Number(plan.plannedMessageCount || 0).toLocaleString()} 則訊息`
   ].join("\n");
   try {
-    await navigator.clipboard.writeText(summary);
+    await bridge.copyText(summary);
     setStatus("已複製可重現清理計畫摘要。", false);
   } catch (error) {
     setStatus(`無法複製計畫摘要：${error.message}`, true);
@@ -2747,16 +2750,22 @@ async function changeAttachmentMark(checkbox) {
 }
 
 async function applyGroupAction(groupKey, action, button) {
+  const originalText = button.textContent;
   button.disabled = true;
+  button.textContent = "套用中…";
+  setStatus(action === "keep_thumbnail" ? "正在套用保留縮圖…" : "正在更新聊天室附件標記…", false);
   try {
     cleanupOverview = await provider.applyCleanupGroupAction(groupKey, action);
-    invalidateCleanupInsights();
-    await loadCleanupPage();
-    await refreshAdvancedPlanSummary();
+    cleanupPreflight = null;
+    cleanupAudit = null;
+    await loadCleanupPage({ verifySource: false });
+    void refreshAdvancedPlanSummary();
+    setStatus(action === "keep_thumbnail" ? "已套用保留縮圖。" : "已更新聊天室附件標記。", false);
   } catch (error) {
     setStatus(error.message, true);
   } finally {
     button.disabled = false;
+    button.textContent = originalText;
   }
 }
 
@@ -2771,10 +2780,15 @@ async function toggleSafeAttachmentCleanup() {
   if (!window.confirm(prompt)) return;
   elements.planSafeAttachmentCleanup.disabled = true;
   try {
-    cleanupOverview = await provider.planSafeAttachmentCleanup();
-    invalidateCleanupInsights();
-    await loadCleanupPage();
-    await refreshAdvancedPlanSummary();
+    await provider.planSafeAttachmentCleanup();
+    cleanupPage = null;
+    cleanupOverview = null;
+    cleanupState.page = 1;
+    cleanupState.groupKey = null;
+    cleanupPreflight = null;
+    cleanupAudit = null;
+    await loadCleanupPage({ verifySource: false });
+    void refreshAdvancedPlanSummary();
     setStatus(automaticMarked ? "已取消安全自動清理標記。" : "已套用安全自動清理標記。", false);
   } catch (error) {
     setStatus(error.message, true);
@@ -2791,9 +2805,14 @@ async function clearManualAttachmentPlan() {
   )) return;
   elements.clearManualAttachmentPlan.disabled = true;
   try {
-    cleanupOverview = await provider.clearManualAttachmentPlan();
-    invalidateCleanupInsights();
-    await loadCleanupPage();
+    await provider.clearManualAttachmentPlan();
+    cleanupPage = null;
+    cleanupOverview = null;
+    cleanupState.page = 1;
+    cleanupState.groupKey = null;
+    cleanupPreflight = null;
+    cleanupAudit = null;
+    await loadCleanupPage({ verifySource: false });
     setStatus("已清除手動附件標記；自動與聊天室計畫仍保留。", false);
   } catch (error) {
     setStatus(error.message, true);

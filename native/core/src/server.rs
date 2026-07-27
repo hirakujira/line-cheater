@@ -261,6 +261,13 @@ struct CleanupAuditParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct CleanupPreflightParams {
+    #[serde(default = "default_verify_source")]
+    verify_source: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PreviewParams {
     path: String,
 }
@@ -736,7 +743,19 @@ fn handle_request<W: Write>(
         }
         "catalogStats" => Ok(serde_json::to_value(session.catalog.stats()?)?),
         "cleanupOverview" => Ok(serde_json::to_value(session.catalog.cleanup_overview()?)?),
-        "cleanupPreflight" => Ok(serde_json::to_value(cleanup_preflight(session)?)?),
+        "cleanupPreflight" => {
+            let params = if request.params.is_null() {
+                CleanupPreflightParams {
+                    verify_source: default_verify_source(),
+                }
+            } else {
+                parse_params(request)?
+            };
+            Ok(serde_json::to_value(cleanup_preflight(
+                session,
+                params.verify_source,
+            )?)?)
+        }
         "cleanupPlanPreviews" => Ok(serde_json::to_value(
             session.catalog.cleanup_plan_previews()?,
         )?),
@@ -964,14 +983,22 @@ fn advanced_cleanup_report(session: &NativeSession) -> Result<AdvancedCleanupRep
     report_from_analysis(session, &analysis)
 }
 
-fn cleanup_preflight(session: &mut NativeSession) -> Result<CleanupPreflightReport> {
+fn cleanup_preflight(
+    session: &mut NativeSession,
+    verify_source: bool,
+) -> Result<CleanupPreflightReport> {
     let quick_check = session.quick_check()?;
     let source_read_only = session.database.is_read_only()?;
-    let catalog_source_current = session.catalog.source_matches_current(
-        &session.prepared.original_path,
-        session.prepared.report.kind,
-    )?;
-    session.catalog_source_verified = catalog_source_current;
+    let catalog_source_current = if verify_source {
+        let current = session.catalog.source_matches_current(
+            &session.prepared.original_path,
+            session.prepared.report.kind,
+        )?;
+        session.catalog_source_verified = current;
+        current
+    } else {
+        session.catalog_source_verified
+    };
     let stats = session.catalog.stats()?;
     let overview = session.catalog.cleanup_overview()?;
     let active_job = session
@@ -1193,6 +1220,10 @@ fn default_message_limit() -> u32 {
 
 fn default_cleanup_audit_limit() -> u32 {
     20
+}
+
+fn default_verify_source() -> bool {
+    true
 }
 
 fn default_attachment_limit() -> u32 {
