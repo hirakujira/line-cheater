@@ -410,7 +410,7 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     title: "LINE Cheater",
     width: 1180,
-    height: 820,
+    height: 960,
     minWidth: 840,
     minHeight: 620,
     icon: windowIcon,

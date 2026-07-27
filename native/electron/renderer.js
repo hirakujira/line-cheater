@@ -2066,7 +2066,7 @@ function renderCleanupPlanPreviews() {
   elements.cleanupPlanPreviews.classList.toggle("is-collapsed", cleanupPlanPreviewsCollapsed);
   elements.cleanupPlanPreviewsSummary.textContent = selectedProfile
     ? `目前選擇：${selectedProfile.label}。${selectedProfile.selectionSummary}`
-    : "請選擇方案；選取只會切換檢視範圍，不會立即標記或刪除檔案。";
+    : "請選擇方案；確認後只會套用安全標記，待複核項目不會自動刪除。";
   elements.toggleCleanupPlanPreviews.disabled = !cleanupPlanPreviews.length;
   elements.toggleCleanupPlanPreviews.textContent = cleanupPlanPreviewsCollapsed
     ? "變更方案"
@@ -2075,9 +2075,29 @@ function renderCleanupPlanPreviews() {
       : "選擇方案";
 }
 
-function selectCleanupPlan(profile) {
+async function selectCleanupPlan(profile) {
   const selectedProfile = cleanupPlanProfiles[profile];
   if (!selectedProfile) return;
+  const preview = (cleanupPlanPreviews || []).find((item) => item.profile === profile);
+  const automaticCandidates = Number(
+    preview?.automaticFileCount ?? cleanupOverview?.automaticCandidateCount
+  ) || 0;
+  const automaticMarked = Number(cleanupOverview?.automaticMarkedCount) || 0;
+  const reviewFiles = Number(preview?.reviewFileCount) || 0;
+  const planDetails = automaticCandidates
+    ? automaticMarked
+      ? "安全標記已套用，按鈕狀態會保留。"
+      : `會標記 ${automaticCandidates.toLocaleString()} 個可安全處理的圖片原檔，並保留非空縮圖。`
+    : "目前沒有可安全自動標記的圖片原檔。";
+  const reviewDetails = reviewFiles
+    ? `另有 ${reviewFiles.toLocaleString()} 個待複核附件，仍需人工決定，不會自動刪除。`
+    : "";
+  if (!await requestConfirmation({
+    title: `套用${selectedProfile.label}？`,
+    message: `${planDetails}${reviewDetails}`,
+    confirmLabel: "套用方案",
+    danger: automaticCandidates > 0 && !automaticMarked
+  })) return;
   cleanupState.planProfile = profile;
   cleanupPlanPreviewsCollapsed = true;
   cleanupState.category = selectedProfile.category;
@@ -2089,9 +2109,13 @@ function selectCleanupPlan(profile) {
   elements.cleanupKind.disabled = false;
   renderCleanupPlanPreviews();
   if (cleanupOverview) renderCleanupOverview();
+  if (provider && automaticCandidates > 0 && !automaticMarked) {
+    await applySafeAttachmentCleanup(`已套用${selectedProfile.label}的安全標記。`);
+    return;
+  }
   if (provider) void loadCleanupPage({ verifySource: false });
   const searchNote = cleanupState.search ? "；已保留目前搜尋條件" : "";
-  setStatus(`已選擇${selectedProfile.label}；分類範圍已回到全部檔案${searchNote}，可從分類卡聚焦複核範圍。`, false);
+  setStatus(`已套用${selectedProfile.label}${searchNote}；待複核項目不會自動刪除。`, false);
 }
 
 function toggleCleanupPlanPreviews() {
@@ -2943,6 +2967,26 @@ async function applyGroupAction(groupKey, action, button) {
   }
 }
 
+async function applySafeAttachmentCleanup(message) {
+  if (!provider) return;
+  elements.planSafeAttachmentCleanup.disabled = true;
+  try {
+    await provider.planSafeAttachmentCleanup();
+    cleanupPage = null;
+    cleanupOverview = null;
+    cleanupState.page = 1;
+    cleanupState.groupKey = null;
+    cleanupPreflight = null;
+    await loadCleanupPage({ verifySource: false });
+    void refreshAdvancedPlanSummary();
+    setStatus(message, false);
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    if (cleanupOverview) renderCleanupOverview();
+  }
+}
+
 async function toggleSafeAttachmentCleanup() {
   if (!provider || !cleanupOverview) return;
   const automaticMarked = Number(cleanupOverview.automaticMarkedCount) || 0;
@@ -2957,22 +3001,9 @@ async function toggleSafeAttachmentCleanup() {
     confirmLabel: automaticMarked ? "取消自動標記" : "套用安全標記",
     danger: !automaticMarked
   })) return;
-  elements.planSafeAttachmentCleanup.disabled = true;
-  try {
-    await provider.planSafeAttachmentCleanup();
-    cleanupPage = null;
-    cleanupOverview = null;
-    cleanupState.page = 1;
-    cleanupState.groupKey = null;
-    cleanupPreflight = null;
-    await loadCleanupPage({ verifySource: false });
-    void refreshAdvancedPlanSummary();
-    setStatus(automaticMarked ? "已取消安全自動清理標記。" : "已套用安全自動清理標記。", false);
-  } catch (error) {
-    setStatus(error.message, true);
-  } finally {
-    if (cleanupOverview) renderCleanupOverview();
-  }
+  await applySafeAttachmentCleanup(
+    automaticMarked ? "已取消安全自動清理標記。" : "已套用安全自動清理標記。"
+  );
 }
 
 async function clearManualAttachmentPlan() {
@@ -3355,7 +3386,7 @@ elements.cleanupSort.addEventListener("change", updateCleanupFilter);
 elements.toggleCleanupPlanPreviews.addEventListener("click", toggleCleanupPlanPreviews);
 elements.cleanupPlanCards.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-plan-profile]");
-  if (button) selectCleanupPlan(button.dataset.planProfile);
+  if (button) void selectCleanupPlan(button.dataset.planProfile);
 });
 elements.planSafeAttachmentCleanup.addEventListener("click", () => void toggleSafeAttachmentCleanup());
 elements.clearManualAttachmentPlan.addEventListener("click", () => void clearManualAttachmentPlan());
