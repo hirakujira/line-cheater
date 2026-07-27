@@ -1,6 +1,15 @@
 "use strict";
 
-const { app, BrowserWindow, dialog, ipcMain, net, protocol, session, shell } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  net,
+  protocol,
+  session,
+  shell
+} = require("electron");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");

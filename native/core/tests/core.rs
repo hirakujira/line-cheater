@@ -1512,6 +1512,7 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
         "{\"id\":\"22\",\"method\":\"cleanupPreflight\"}\n",
         "{\"id\":\"23\",\"method\":\"cleanupPlanPreviews\"}\n",
         "{\"id\":\"24\",\"method\":\"cleanupAudit\",\"params\":{\"limit\":20}}\n",
+        "{\"id\":\"25\",\"method\":\"cleanupPreflight\",\"params\":{\"verifySource\":false}}\n",
         "{\"id\":\"8\",\"method\":\"shutdown\"}\n"
     );
     let mut input = std::io::BufReader::new(requests.as_bytes());
@@ -1626,6 +1627,8 @@ fn sidecar_protocol_returns_bounded_pages_and_structured_errors() {
             .unwrap()
             .is_empty()
     );
+    assert_eq!(response("25")["result"]["blockerCount"], 0);
+    assert_eq!(response("25")["result"]["catalogSourceCurrent"], true);
     let indexed_messages: i64 = Connection::open(work.join("search.sqlite"))
         .unwrap()
         .query_row("SELECT COUNT(*) FROM messages_fts", [], |row| row.get(0))

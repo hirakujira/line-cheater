@@ -88,11 +88,21 @@ grouped below rather than treated as separate feature changes.
   conservative, balanced, and aggressive previews; only the conservative safe
   image rule is directly auto-applicable, while the other scopes remain
   review-only.
-- Cleanup actions now retain a bounded recent activity history and produce a
+- The desktop cleanup preview now has an explicit plan selector: choosing a
+  profile resets the bounded view to all attachment groups on page one and
+  collapses the comparison cards until the user asks to change the plan. The
+  category cards remain separate focus controls for SQLite-unreferenced and
+  unconfirmed review. Non-blocking preflight warnings stay out of the primary
+  workspace; only blockers expand the safety panel. Cleanup and chat image
+  previews hydrate only near the visible viewport, with at most four concurrent
+  native preview requests; the renderer shows FTS5 build progress and the
+  verified sidecar session avoids repeating full source-content verification on
+  every subsequent search.
+- Cleanup actions retain a bounded recent activity history and produce a
   reproducible plan fingerprint from the source fingerprint, removal reasons,
-  selected paths, chat-removal plan, and orphan-message plan. The desktop shows
-  recent actions and can copy a plan summary without serializing the full file
-  list.
+  selected paths, chat-removal plan, and orphan-message plan. This audit data
+  remains a native-core compatibility/provenance surface, while the primary
+  desktop cleanup workspace keeps the audit panel out of the main flow.
 - Candidate creation now opens a restore checklist asking the user to retain
   the original backup, test in a safe environment, and verify chats/images/
   SQLite after restore before the candidate writer starts.
@@ -302,10 +312,11 @@ Verified implementation:
 2026-07-27:
 
 - Rust: 1.96.0.
-- Native tests: 33 passed; the combined Electron/provider test command: 60
+- Native tests: 33 passed; the combined Electron/provider test command: 63
   passed. The sidecar fixture covers the new preflight and three plan-preview
   responses plus cleanup audit history; the renderer shell checks the new
-  blindspot, audit, candidate-report, and restore-checklist controls.
+  blindspot, audit, candidate-report, restore-checklist, plan-selection, and
+  lazy-preview controls.
 - Electron: 43.2.0 pinned; `npm audit` reported 0 vulnerabilities.
 - Ignored real fixture: 1.1 GB, 13,512 files, 11,239 classified attachments.
 - Catalog scan: approximately 0.36 seconds on the current machine.
@@ -827,6 +838,13 @@ Search results keep the same `(timestamp, pk)` forward/backward cursor and
 unavailable, the source schema is unusual, or the index query fails, the core
 falls back to the escaped read-only SQLite `LIKE` implementation. Neither path
 creates tables or indexes in the original LINE databases.
+After the session's initial source verification succeeds, later FTS searches
+reuse that session boundary instead of hashing every catalog entry again. A
+new catalog scan or source replacement still resets the verification state;
+explicit cleanup preflight and candidate creation retain their own full source
+verification gates. The Electron renderer surfaces `searchIndexProgress` during
+the first index build so a large first search is observable rather than looking
+like a frozen message panel.
 
 `scanCatalog` extracts numeric message ID hints from media filenames and
 correlates attachment rows in 200-ID batches against both message databases.

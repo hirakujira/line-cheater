@@ -42,8 +42,8 @@ let cleanupPage = null;
 let cleanupOverview = null;
 let cleanupPreflight = null;
 let cleanupPlanPreviews = null;
-let cleanupAudit = null;
 let cleanupPreflightLoading = false;
+let cleanupPlanPreviewsCollapsed = false;
 let cleanupLoading = false;
 let cleanupReloadPending = false;
 let cleanupSearchTimer = null;
@@ -61,7 +61,8 @@ const cleanupState = {
   kind: "all",
   category: "all",
   sort: "size",
-  groupKey: null
+  groupKey: null,
+  planProfile: null
 };
 
 const elements = {
@@ -137,12 +138,7 @@ const elements = {
   cleanupPlanPreviews: document.querySelector("#cleanup-plan-previews"),
   cleanupPlanPreviewsSummary: document.querySelector("#cleanup-plan-previews-summary"),
   cleanupPlanCards: document.querySelector("#cleanup-plan-cards"),
-  cleanupAudit: document.querySelector("#cleanup-audit"),
-  cleanupAuditSummary: document.querySelector("#cleanup-audit-summary"),
-  refreshCleanupAudit: document.querySelector("#refresh-cleanup-audit"),
-  copyCleanupPlan: document.querySelector("#copy-cleanup-plan"),
-  cleanupAuditPlan: document.querySelector("#cleanup-audit-plan"),
-  cleanupAuditEvents: document.querySelector("#cleanup-audit-events"),
+  toggleCleanupPlanPreviews: document.querySelector("#toggle-cleanup-plan-previews"),
   planSafeAttachmentCleanup: document.querySelector("#plan-safe-attachment-cleanup"),
   clearManualAttachmentPlan: document.querySelector("#clear-manual-attachment-plan"),
   categorySummary: document.querySelector("#category-summary"),
@@ -199,6 +195,24 @@ const categoryLabels = {
   unreferenced: "SQLite 未引用",
   unconfirmed: "無法確認",
   no_attachments: "沒有附件的對話"
+};
+
+const cleanupPlanProfiles = {
+  conservative: {
+    label: "保守方案",
+    category: "all",
+    selectionSummary: "顯示全部分類；下方按鈕可套用已確認的安全自動標記。"
+  },
+  balanced: {
+    label: "平衡方案",
+    category: "all",
+    selectionSummary: "顯示全部分類；可從分類卡聚焦 SQLite 未引用附件，請逐一人工確認。"
+  },
+  aggressive: {
+    label: "積極方案",
+    category: "all",
+    selectionSummary: "顯示全部分類；可依序聚焦 SQLite 未引用與無法確認附件，請先檢查來源內容。"
+  }
 };
 
 function setStatus(message, error) {
@@ -311,7 +325,6 @@ function returnToWelcome() {
 function invalidateCleanupInsights() {
   cleanupPreflight = null;
   cleanupPlanPreviews = null;
-  cleanupAudit = null;
 }
 
 function resetAfterCandidateBuild() {
@@ -747,8 +760,10 @@ async function openSource(kind) {
       kind: "all",
       category: "all",
       sort: "size",
-      groupKey: null
+      groupKey: null,
+      planProfile: null
     });
+    cleanupPlanPreviewsCollapsed = false;
     setAdvancedMode(false);
     elements.cleanupSearch.value = "";
     elements.cleanupKind.value = "all";
@@ -757,17 +772,15 @@ async function openSource(kind) {
     elements.cleanupList.replaceChildren(emptyState("請先掃描附件。"));
     elements.cleanupAutomationSummary.textContent =
       "安全自動清理只會標記已確認的圖片原檔，並保留非空縮圖。";
-    elements.cleanupPreflight.classList.remove("has-blockers", "has-warnings");
+    elements.cleanupPreflight.classList.remove("has-blockers");
+    elements.cleanupPreflight.classList.add("hidden");
     elements.cleanupPreflightTitle.textContent = "清理前盲點掃描";
     elements.cleanupPreflightSummary.textContent = "正在檢查來源、索引與不確定檔案…";
     elements.cleanupPreflightRisks.replaceChildren();
     elements.cleanupPlanCards.replaceChildren();
-    elements.cleanupAudit.classList.remove("has-events");
-    elements.cleanupAuditSummary.textContent = "正在整理最近操作與計畫指紋…";
-    elements.cleanupAuditPlan.replaceChildren();
-    elements.cleanupAuditEvents.replaceChildren();
-    elements.refreshCleanupAudit.disabled = true;
-    elements.copyCleanupPlan.disabled = true;
+    elements.cleanupPlanPreviews.classList.remove("is-collapsed");
+    elements.toggleCleanupPlanPreviews.disabled = true;
+    elements.toggleCleanupPlanPreviews.textContent = "選擇方案";
     elements.planSafeAttachmentCleanup.disabled = true;
     elements.clearManualAttachmentPlan.disabled = true;
     elements.duplicateGroups.replaceChildren(emptyState("先掃描附件，找出完全相同的檔案。"));
@@ -1266,48 +1279,85 @@ function renderMessage(message) {
   return row;
 }
 
-async function hydrateMessagePreviews(container, renderGeneration) {
+function hydrateMessagePreview(media, renderGeneration) {
+  if (!Array.isArray(media.previewPaths) || !media.previewPaths.length ||
+      media.dataset.previewState) return Promise.resolve();
+  media.dataset.previewState = "loading";
+  return (async () => {
+    let url = null;
+    let caption = media.previewCaption;
+    for (const path of media.previewPaths) {
+      try {
+        url = await bridge.attachmentPreviewUrl(path);
+        caption = fileName(path);
+        if (url) break;
+      } catch (_error) {
+        // Unsupported originals fall back to the matching thumbnail.
+      }
+    }
+    if (!url || renderGeneration !== messageRenderGeneration || !media.isConnected) {
+      media.dataset.previewState = "failed";
+      return;
+    }
+    const figure = document.createElement("figure");
+    figure.className = "message-image";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "message-image-button";
+    button.setAttribute("aria-label", `放大預覽：${caption}`);
+    const image = document.createElement("img");
+    image.alt = caption;
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.addEventListener("error", () => {
+      figure.classList.add("preview-error");
+      media.dataset.previewState = "failed";
+    }, { once: true });
+    button.addEventListener("click", () => showImageModal(url, caption, button));
+    button.append(image);
+    const note = document.createElement("figcaption");
+    note.textContent = "開啟圖片預覽";
+    figure.append(button, note);
+    media.dataset.previewState = "loaded";
+    media.replaceChildren(figure);
+    image.src = url;
+  })();
+}
+
+function hydrateMessagePreviews(container, renderGeneration) {
+  if (container.messagePreviewObserver) container.messagePreviewObserver.disconnect();
   const mediaItems = Array.from(container.querySelectorAll(".message-media"))
     .filter((media) => Array.isArray(media.previewPaths) && media.previewPaths.length);
-  let next = 0;
-  async function worker() {
-    while (next < mediaItems.length) {
-      const media = mediaItems[next++];
-      let url = null;
-      let caption = media.previewCaption;
-      for (const path of media.previewPaths) {
-        try {
-          url = await bridge.attachmentPreviewUrl(path);
-          caption = fileName(path);
-          if (url) break;
-        } catch (_error) {
-          // Unsupported originals fall back to the matching thumbnail.
-        }
-      }
-      if (!url || renderGeneration !== messageRenderGeneration || !media.isConnected) {
-        continue;
-      }
-      const figure = document.createElement("figure");
-      figure.className = "message-image";
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "message-image-button";
-      button.setAttribute("aria-label", `放大預覽：${caption}`);
-      const image = document.createElement("img");
-      image.alt = caption;
-      image.loading = "eager";
-      image.decoding = "async";
-      image.addEventListener("error", () => figure.classList.add("preview-error"), { once: true });
-      button.addEventListener("click", () => showImageModal(url, caption, button));
-      button.append(image);
-      const note = document.createElement("figcaption");
-      note.textContent = "開啟圖片預覽";
-      figure.append(button, note);
-      media.replaceChildren(figure);
-      image.src = url;
+  const queue = [];
+  let active = 0;
+  const pump = () => {
+    while (active < 4 && queue.length) {
+      const media = queue.shift();
+      active += 1;
+      void hydrateMessagePreview(media, renderGeneration).finally(() => {
+        active -= 1;
+        pump();
+      });
     }
+  };
+  const enqueue = (media) => {
+    if (!media || media.dataset.previewState) return;
+    queue.push(media);
+    pump();
+  };
+  if (typeof IntersectionObserver !== "function") {
+    for (const media of mediaItems) enqueue(media);
+    return;
   }
-  await Promise.all(Array.from({ length: Math.min(4, mediaItems.length) }, () => worker()));
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      observer.unobserve(entry.target);
+      enqueue(entry.target);
+    }
+  }, { root: elements.messages, rootMargin: "480px 0px" });
+  container.messagePreviewObserver = observer;
+  for (const media of mediaItems) observer.observe(media);
 }
 
 function isSystemMessage(message) {
@@ -1747,7 +1797,8 @@ function cleanupOptions(overrides) {
   };
 }
 
-async function loadCleanupPage() {
+async function loadCleanupPage(options) {
+  options = options || {};
   if (!provider) return;
   if (cleanupLoading) {
     cleanupReloadPending = true;
@@ -1773,19 +1824,18 @@ async function loadCleanupPage() {
       cleanupOverview = overview;
       page = loadedPage;
     }
-    const [preflight, previews, audit] = await Promise.all([
-      cleanupPreflight || provider.cleanupPreflight(),
-      cleanupPlanPreviews || provider.cleanupPlanPreviews(),
-      cleanupAudit || provider.cleanupAudit(20)
+    const [preflight, previews] = await Promise.all([
+      cleanupPreflight || provider.cleanupPreflight({
+        verifySource: options.verifySource !== false
+      }),
+      cleanupPlanPreviews || provider.cleanupPlanPreviews()
     ]);
     cleanupPreflight = preflight;
     cleanupPlanPreviews = previews;
-    cleanupAudit = audit;
     cleanupPage = page;
     renderCleanupOverview();
     renderCleanupPreflight();
     renderCleanupPlanPreviews();
-    renderCleanupAudit();
     renderCleanupPage();
   } catch (error) {
     setStatus(error.message, true);
@@ -1803,15 +1853,14 @@ async function loadCleanupPage() {
 function renderCleanupPreflight() {
   if (!cleanupPreflight) return;
   const blockers = Number(cleanupPreflight.blockerCount) || 0;
-  const warnings = Number(cleanupPreflight.warningCount) || 0;
   const safeCandidates = Number(cleanupPreflight.safeCandidateCount) || 0;
+  const visible = blockers > 0;
+  elements.cleanupPreflight.classList.toggle("hidden", !visible);
   elements.cleanupPreflight.classList.toggle("has-blockers", blockers > 0);
-  elements.cleanupPreflight.classList.toggle("has-warnings", blockers === 0 && warnings > 0);
+  if (!visible) return;
   elements.cleanupPreflightTitle.textContent = blockers
     ? `清理前盲點掃描：暫停（${blockers} 個阻擋項）`
-    : warnings
-      ? `清理前盲點掃描：可繼續，但有 ${warnings} 個提醒`
-      : "清理前盲點掃描：可以繼續";
+    : "清理前盲點掃描";
   elements.cleanupPreflightSummary.textContent =
     `SQLite ${cleanupPreflight.sqliteQuickCheck} · ` +
     `索引 ${cleanupPreflight.scanStatus} · ` +
@@ -1842,9 +1891,23 @@ function renderCleanupPlanPreviews() {
   const fragment = document.createDocumentFragment();
   for (const preview of cleanupPlanPreviews) {
     const card = document.createElement("article");
+    const selected = cleanupState.planProfile === preview.profile;
     card.className = `cleanup-plan-card ${preview.profile || ""}`;
+    card.classList.toggle("selected", selected);
+    card.setAttribute("role", "radio");
+    card.setAttribute("aria-checked", String(selected));
+    card.dataset.planProfile = preview.profile || "";
+    const heading = document.createElement("div");
+    heading.className = "cleanup-plan-card-heading";
     const title = document.createElement("strong");
     title.textContent = preview.title;
+    const select = document.createElement("button");
+    select.type = "button";
+    select.className = "cleanup-plan-select";
+    select.dataset.planProfile = preview.profile || "";
+    select.setAttribute("aria-pressed", String(selected));
+    select.textContent = selected ? "目前方案" : "選擇方案";
+    heading.append(title, select);
     const description = document.createElement("p");
     description.textContent = preview.description;
     const metrics = document.createElement("div");
@@ -1863,99 +1926,46 @@ function renderCleanupPlanPreviews() {
       note.textContent = warning;
       warnings.append(note);
     }
-    card.append(title, description, metrics, warnings);
+    card.append(heading, description, metrics, warnings);
     fragment.append(card);
   }
   elements.cleanupPlanCards.replaceChildren(fragment);
-  elements.cleanupPlanPreviewsSummary.textContent =
-    "保守方案可由上方按鈕套用；平衡與積極方案只列出人工複核範圍。";
+  const selectedProfile = cleanupPlanProfiles[cleanupState.planProfile];
+  elements.cleanupPlanPreviews.classList.toggle("is-collapsed", cleanupPlanPreviewsCollapsed);
+  elements.cleanupPlanPreviewsSummary.textContent = selectedProfile
+    ? `目前選擇：${selectedProfile.label}。${selectedProfile.selectionSummary}`
+    : "請選擇方案；選取只會切換檢視範圍，不會立即標記或刪除檔案。";
+  elements.toggleCleanupPlanPreviews.disabled = !cleanupPlanPreviews.length;
+  elements.toggleCleanupPlanPreviews.textContent = cleanupPlanPreviewsCollapsed
+    ? "變更方案"
+    : selectedProfile
+      ? "收起方案"
+      : "選擇方案";
 }
 
-const cleanupActionLabels = {
-  mark_attachment: "手動標記附件",
-  unmark_attachment: "取消附件標記",
-  clear_manual_plan: "清除手動計畫",
-  plan_safe_automatic: "套用安全自動計畫",
-  clear_safe_automatic_plan: "取消安全自動計畫",
-  plan_chat_removal: "加入聊天室清理",
-  clear_chat_removal: "取消聊天室清理",
-  plan_automatic_advanced: "套用進階自動計畫",
-  clear_automatic_advanced_plan: "取消進階自動計畫",
-  clear_advanced_plan: "清除進階計畫",
-  toggle_all: "切換整組附件",
-  keep_thumbnail: "套用保留縮圖"
-};
-
-function renderCleanupAudit() {
-  if (!cleanupAudit || !cleanupAudit.plan) return;
-  const plan = cleanupAudit.plan;
-  const fingerprint = String(plan.planFingerprint || "");
-  const sourceFingerprint = String(plan.sourceFingerprint || "");
-  elements.cleanupAudit.classList.toggle("has-events", (cleanupAudit.events || []).length > 0);
-  elements.cleanupAuditSummary.textContent =
-    `計畫 SHA-256 ${fingerprint.slice(0, 16) || "尚未建立"} · ` +
-    `最近 ${(cleanupAudit.events || []).length.toLocaleString()} 筆操作`;
-  const planFragment = document.createDocumentFragment();
-  const fingerprintNode = document.createElement("code");
-  fingerprintNode.textContent = fingerprint || "尚未建立計畫";
-  fingerprintNode.title = "清理計畫指紋；來源或標記內容改變後會改變。";
-  const sourceNode = document.createElement("span");
-  sourceNode.textContent = sourceFingerprint
-    ? `來源指紋 ${sourceFingerprint.slice(0, 16)} · `
-    : "來源指紋未建立 · ";
-  const counts = document.createElement("span");
-  counts.textContent =
-    `已標記 ${Number(plan.markedCount || 0).toLocaleString()} 個 · ` +
-    `手動 ${Number(plan.manualMarkedCount || 0).toLocaleString()} · ` +
-    `自動 ${Number(plan.automaticMarkedCount || 0).toLocaleString()} · ` +
-    `聊天室 ${Number(plan.chatMarkedCount || 0).toLocaleString()} · ` +
-    `資料庫 ${Number(plan.plannedChatCount || 0).toLocaleString()} 個聊天室 / ` +
-    `${Number(plan.plannedMessageCount || 0).toLocaleString()} 則訊息`;
-  planFragment.append(sourceNode, fingerprintNode, counts);
-  elements.cleanupAuditPlan.replaceChildren(planFragment);
-
-  const eventsFragment = document.createDocumentFragment();
-  for (const event of cleanupAudit.events || []) {
-    const item = document.createElement("div");
-    item.className = "cleanup-audit-event";
-    const action = document.createElement("strong");
-    action.textContent = cleanupActionLabels[event.action] || event.action;
-    const detail = document.createElement("span");
-    detail.textContent = `${event.scope || ""} · ${event.detail || ""}`;
-    const time = document.createElement("small");
-    const timestamp = Number(event.createdAt) * 1000;
-    const date = Number.isFinite(timestamp) && timestamp > 0
-      ? new Date(timestamp).toLocaleString()
-      : "時間未知";
-    time.textContent = `${date} · ${Number(event.fileCount || 0).toLocaleString()} 個 · ${formatBytes(event.bytes || 0)}`;
-    item.append(action, detail, time);
-    eventsFragment.append(item);
-  }
-  elements.cleanupAuditEvents.replaceChildren(eventsFragment);
-  elements.refreshCleanupAudit.disabled = !provider;
-  elements.copyCleanupPlan.disabled = !fingerprint;
+function selectCleanupPlan(profile) {
+  const selectedProfile = cleanupPlanProfiles[profile];
+  if (!selectedProfile) return;
+  cleanupState.planProfile = profile;
+  cleanupPlanPreviewsCollapsed = true;
+  cleanupState.category = selectedProfile.category;
+  cleanupState.kind = "all";
+  cleanupState.page = 1;
+  cleanupState.groupKey = null;
+  elements.cleanupCategory.value = selectedProfile.category;
+  elements.cleanupKind.value = "all";
+  elements.cleanupKind.disabled = false;
+  renderCleanupPlanPreviews();
+  if (cleanupOverview) renderCleanupOverview();
+  if (provider) void loadCleanupPage({ verifySource: false });
+  const searchNote = cleanupState.search ? "；已保留目前搜尋條件" : "";
+  setStatus(`已選擇${selectedProfile.label}；分類範圍已回到全部檔案${searchNote}，可從分類卡聚焦複核範圍。`, false);
 }
 
-async function copyCleanupPlanSummary() {
-  if (!cleanupAudit || !cleanupAudit.plan) return;
-  const plan = cleanupAudit.plan;
-  const summary = [
-    "LINE Cheater 清理計畫摘要",
-    `來源：${plan.sourcePath || "未知"}`,
-    `來源指紋：${plan.sourceFingerprint || "未建立"}`,
-    `計畫指紋：${plan.planFingerprint || "未建立"}`,
-    `已標記：${Number(plan.markedCount || 0).toLocaleString()} 個 / ${formatBytes(plan.markedBytes || 0)}`,
-    `手動：${Number(plan.manualMarkedCount || 0).toLocaleString()} 個 / ${formatBytes(plan.manualMarkedBytes || 0)}`,
-    `自動：${Number(plan.automaticMarkedCount || 0).toLocaleString()} 個 / ${formatBytes(plan.automaticMarkedBytes || 0)}`,
-    `聊天室：${Number(plan.chatMarkedCount || 0).toLocaleString()} 個 / ${formatBytes(plan.chatMarkedBytes || 0)}`,
-    `資料庫：${Number(plan.plannedChatCount || 0).toLocaleString()} 個聊天室 / ${Number(plan.plannedMessageCount || 0).toLocaleString()} 則訊息`
-  ].join("\n");
-  try {
-    await navigator.clipboard.writeText(summary);
-    setStatus("已複製可重現清理計畫摘要。", false);
-  } catch (error) {
-    setStatus(`無法複製計畫摘要：${error.message}`, true);
-  }
+function toggleCleanupPlanPreviews() {
+  if (!cleanupPlanPreviews || !cleanupPlanPreviews.length) return;
+  cleanupPlanPreviewsCollapsed = !cleanupPlanPreviewsCollapsed;
+  renderCleanupPlanPreviews();
 }
 
 async function refreshCleanupPreflight() {
@@ -1963,17 +1973,14 @@ async function refreshCleanupPreflight() {
   cleanupPreflightLoading = true;
   elements.refreshCleanupPreflight.disabled = true;
   try {
-    const [preflight, previews, audit] = await Promise.all([
+    const [preflight, previews] = await Promise.all([
       provider.cleanupPreflight(),
-      provider.cleanupPlanPreviews(),
-      provider.cleanupAudit(20)
+      provider.cleanupPlanPreviews()
     ]);
     cleanupPreflight = preflight;
     cleanupPlanPreviews = previews;
-    cleanupAudit = audit;
     renderCleanupPreflight();
     renderCleanupPlanPreviews();
-    renderCleanupAudit();
     setCandidateBuildDisabled(false);
     setStatus("已完成清理前盲點掃描。", false);
   } catch (error) {
@@ -2000,8 +2007,8 @@ function renderCleanupOverview() {
     : "目前沒有符合安全規則的圖片原檔；PDF、影片、無縮圖或無法確認的附件會保留。";
   elements.planSafeAttachmentCleanup.disabled = !provider || !automaticCandidates;
   elements.planSafeAttachmentCleanup.textContent = automaticMarked
-    ? "取消自動標記"
-    : "自動標記安全瘦身";
+    ? cleanupState.planProfile === "conservative" ? "取消保守方案標記" : "取消安全自動標記"
+    : cleanupState.planProfile === "conservative" ? "套用保守方案" : "套用安全自動標記";
   elements.clearManualAttachmentPlan.disabled = !provider || !manualMarked;
   const fragment = document.createDocumentFragment();
   for (const total of cleanupOverview.categories) {
@@ -2187,6 +2194,9 @@ function disposeCleanupAlbum() {
   if (!cleanupAlbumSession) return;
   cleanupAlbumSession.disposed = true;
   if (cleanupAlbumSession.resizeObserver) cleanupAlbumSession.resizeObserver.disconnect();
+  for (const { node } of cleanupAlbumSession.pages.values()) {
+    if (node.cleanupPreviewObserver) node.cleanupPreviewObserver.disconnect();
+  }
   cleanupAlbumSession = null;
 }
 
@@ -2365,6 +2375,7 @@ function trimCleanupAlbumPages(session, direction) {
     const entry = session.pages.get(pageNumber);
     if (!entry) break;
     measureCleanupAlbumPage(session, pageNumber, entry.node);
+    if (entry.node.cleanupPreviewObserver) entry.node.cleanupPreviewObserver.disconnect();
     if (session.resizeObserver) session.resizeObserver.unobserve(entry.node);
     entry.node.remove();
     session.pages.delete(pageNumber);
@@ -2596,49 +2607,84 @@ function renderCleanupReview(review) {
   return card;
 }
 
-async function hydrateCleanupPreviews(section, renderGeneration) {
+function hydrateCleanupPreview(preview, renderGeneration) {
+  if (!Array.isArray(preview.previewPaths) || !preview.previewPaths.length ||
+      preview.dataset.previewState) return Promise.resolve();
+  preview.dataset.previewState = "loading";
+  return (async () => {
+    let url = null;
+    let caption = "附件預覽";
+    for (const path of preview.previewPaths) {
+      try {
+        url = await bridge.attachmentPreviewUrl(path);
+        caption = fileName(path);
+        if (url) break;
+      } catch (_error) {
+        // Try the thumbnail fallback before leaving the bounded placeholder.
+      }
+    }
+    if (!url || renderGeneration !== cleanupRenderGeneration || !preview.isConnected) {
+      preview.dataset.previewState = "failed";
+      return;
+    }
+    const image = document.createElement("img");
+    image.alt = caption;
+    image.loading = "lazy";
+    image.decoding = "async";
+    const open = document.createElement("span");
+    open.className = "cleanup-preview-open";
+    open.textContent = "點擊放大";
+    image.addEventListener("error", () => {
+      image.remove();
+      open.remove();
+      preview.disabled = true;
+      preview.dataset.previewState = "failed";
+    }, { once: true });
+    preview.disabled = false;
+    preview.dataset.previewState = "loaded";
+    preview.setAttribute("aria-label", `放大預覽：${caption}`);
+    preview.addEventListener("click", () => showImageModal(url, caption, preview), { once: true });
+    preview.prepend(image);
+    preview.append(open);
+    image.src = url;
+    const note = preview.querySelector("small");
+    if (note) note.remove();
+  })();
+}
+
+function hydrateCleanupPreviews(section, renderGeneration) {
   const previews = Array.from(section.querySelectorAll(".cleanup-preview"))
     .filter((preview) => Array.isArray(preview.previewPaths) && preview.previewPaths.length);
-  let next = 0;
-  async function worker() {
-    while (next < previews.length) {
-      const preview = previews[next];
-      next += 1;
-      let url = null;
-      let caption = "附件預覽";
-      for (const path of preview.previewPaths) {
-        try {
-          url = await bridge.attachmentPreviewUrl(path);
-          caption = fileName(path);
-          if (url) break;
-        } catch (_error) {
-          // Try the thumbnail fallback before leaving the bounded placeholder.
-        }
-      }
-      if (!url || renderGeneration !== cleanupRenderGeneration || !preview.isConnected) continue;
-      const image = document.createElement("img");
-      image.alt = caption;
-      image.loading = "lazy";
-      image.decoding = "async";
-      const open = document.createElement("span");
-      open.className = "cleanup-preview-open";
-      open.textContent = "點擊放大";
-      image.addEventListener("error", () => {
-        image.remove();
-        open.remove();
-        preview.disabled = true;
-      }, { once: true });
-      preview.disabled = false;
-      preview.setAttribute("aria-label", `放大預覽：${caption}`);
-      preview.addEventListener("click", () => showImageModal(url, caption, preview));
-      preview.prepend(image);
-      preview.append(open);
-      image.src = url;
-      const note = preview.querySelector("small");
-      if (note) note.remove();
+  const queue = [];
+  let active = 0;
+  const pump = () => {
+    while (active < 4 && queue.length) {
+      const preview = queue.shift();
+      active += 1;
+      void hydrateCleanupPreview(preview, renderGeneration).finally(() => {
+        active -= 1;
+        pump();
+      });
     }
+  };
+  const enqueue = (preview) => {
+    if (!preview || preview.dataset.previewState) return;
+    queue.push(preview);
+    pump();
+  };
+  if (typeof IntersectionObserver !== "function") {
+    for (const preview of previews) enqueue(preview);
+    return;
   }
-  await Promise.all(Array.from({ length: Math.min(4, previews.length) }, () => worker()));
+  const observer = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      observer.unobserve(entry.target);
+      enqueue(entry.target);
+    }
+  }, { root: elements.cleanupList, rootMargin: "480px 0px" });
+  section.cleanupPreviewObserver = observer;
+  for (const preview of previews) observer.observe(preview);
 }
 
 function renderEvidence(review) {
@@ -2747,16 +2793,21 @@ async function changeAttachmentMark(checkbox) {
 }
 
 async function applyGroupAction(groupKey, action, button) {
+  const originalText = button.textContent;
   button.disabled = true;
+  button.textContent = "套用中…";
+  setStatus(action === "keep_thumbnail" ? "正在套用保留縮圖…" : "正在更新聊天室附件標記…", false);
   try {
     cleanupOverview = await provider.applyCleanupGroupAction(groupKey, action);
-    invalidateCleanupInsights();
-    await loadCleanupPage();
-    await refreshAdvancedPlanSummary();
+    cleanupPreflight = null;
+    await loadCleanupPage({ verifySource: false });
+    void refreshAdvancedPlanSummary();
+    setStatus(action === "keep_thumbnail" ? "已套用保留縮圖。" : "已更新聊天室附件標記。", false);
   } catch (error) {
     setStatus(error.message, true);
   } finally {
     button.disabled = false;
+    button.textContent = originalText;
   }
 }
 
@@ -2771,10 +2822,14 @@ async function toggleSafeAttachmentCleanup() {
   if (!window.confirm(prompt)) return;
   elements.planSafeAttachmentCleanup.disabled = true;
   try {
-    cleanupOverview = await provider.planSafeAttachmentCleanup();
-    invalidateCleanupInsights();
-    await loadCleanupPage();
-    await refreshAdvancedPlanSummary();
+    await provider.planSafeAttachmentCleanup();
+    cleanupPage = null;
+    cleanupOverview = null;
+    cleanupState.page = 1;
+    cleanupState.groupKey = null;
+    cleanupPreflight = null;
+    await loadCleanupPage({ verifySource: false });
+    void refreshAdvancedPlanSummary();
     setStatus(automaticMarked ? "已取消安全自動清理標記。" : "已套用安全自動清理標記。", false);
   } catch (error) {
     setStatus(error.message, true);
@@ -2791,9 +2846,13 @@ async function clearManualAttachmentPlan() {
   )) return;
   elements.clearManualAttachmentPlan.disabled = true;
   try {
-    cleanupOverview = await provider.clearManualAttachmentPlan();
-    invalidateCleanupInsights();
-    await loadCleanupPage();
+    await provider.clearManualAttachmentPlan();
+    cleanupPage = null;
+    cleanupOverview = null;
+    cleanupState.page = 1;
+    cleanupState.groupKey = null;
+    cleanupPreflight = null;
+    await loadCleanupPage({ verifySource: false });
     setStatus("已清除手動附件標記；自動與聊天室計畫仍保留。", false);
   } catch (error) {
     setStatus(error.message, true);
@@ -3071,8 +3130,6 @@ elements.refreshAdvancedReport.addEventListener("click", () => void loadAdvanced
 elements.planAutomaticCleanup.addEventListener("click", () => void toggleAutomaticCleanup());
 elements.scanCatalog.addEventListener("click", () => void scanCatalog());
 elements.refreshCleanupPreflight.addEventListener("click", () => void refreshCleanupPreflight());
-elements.refreshCleanupAudit.addEventListener("click", () => void refreshCleanupPreflight());
-elements.copyCleanupPlan.addEventListener("click", () => void copyCleanupPlanSummary());
 elements.hashDuplicates.addEventListener("click", () => void hashDuplicates());
 elements.duplicateAutoMerge.addEventListener("click", toggleDuplicateAutoMerge);
 elements.cancelDuplicateScan.addEventListener("click", () => void cancelCurrentOperation("duplicate"));
@@ -3121,6 +3178,11 @@ elements.clearSearch.addEventListener("click", () => {
 elements.cleanupKind.addEventListener("change", updateCleanupFilter);
 elements.cleanupCategory.addEventListener("change", updateCleanupFilter);
 elements.cleanupSort.addEventListener("change", updateCleanupFilter);
+elements.toggleCleanupPlanPreviews.addEventListener("click", toggleCleanupPlanPreviews);
+elements.cleanupPlanCards.addEventListener("click", (event) => {
+  const button = event.target.closest("button[data-plan-profile]");
+  if (button) selectCleanupPlan(button.dataset.planProfile);
+});
 elements.planSafeAttachmentCleanup.addEventListener("click", () => void toggleSafeAttachmentCleanup());
 elements.clearManualAttachmentPlan.addEventListener("click", () => void clearManualAttachmentPlan());
 elements.cleanupSearch.addEventListener("input", () => {
@@ -3260,6 +3322,13 @@ bridge.on("catalogContextProgress", (event) => {
       `正在比對 SQLite…（${event.processedFiles.toLocaleString()} / ${event.totalFiles.toLocaleString()}）`
     );
   }
+});
+bridge.on("searchIndexProgress", (event) => {
+  if (!messageLoading || !activeSearch) return;
+  const processed = Number(event.processedMessages) || 0;
+  elements.messageStatus.textContent = processed
+    ? `首次搜尋正在建立 FTS5 索引…已整理 ${processed.toLocaleString()} 則訊息`
+    : "首次搜尋正在建立 FTS5 索引…";
 });
 bridge.on("candidateProgress", (event) => {
   elements.progress.max = Math.max(event.totalBytes, 1);

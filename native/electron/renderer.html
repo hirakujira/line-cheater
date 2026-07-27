@@ -249,28 +249,15 @@
                   <div class="cleanup-plan-previews-heading">
                     <div>
                       <strong id="cleanup-plan-previews-title">清理方案預演</strong>
-                      <span id="cleanup-plan-previews-summary">預覽不同風險範圍；只有安全候選可自動套用。</span>
+                      <span id="cleanup-plan-previews-summary">
+                        請選擇方案；選取只會切換檢視範圍，不會立即標記或刪除檔案。
+                      </span>
                     </div>
+                    <button id="toggle-cleanup-plan-previews" class="secondary-button" type="button" disabled>
+                      選擇方案
+                    </button>
                   </div>
-                  <div id="cleanup-plan-cards" class="cleanup-plan-cards"></div>
-                </section>
-                <section id="cleanup-audit" class="cleanup-audit" aria-labelledby="cleanup-audit-title">
-                  <div class="cleanup-audit-heading">
-                    <div>
-                      <strong id="cleanup-audit-title">操作紀錄與可重現計畫</strong>
-                      <span id="cleanup-audit-summary">正在整理最近操作與計畫指紋…</span>
-                    </div>
-                    <div class="cleanup-audit-actions">
-                      <button id="refresh-cleanup-audit" class="secondary-button" type="button" disabled>
-                        重新整理
-                      </button>
-                      <button id="copy-cleanup-plan" class="secondary-button" type="button" disabled>
-                        複製計畫摘要
-                      </button>
-                    </div>
-                  </div>
-                  <div id="cleanup-audit-plan" class="cleanup-audit-plan"></div>
-                  <div id="cleanup-audit-events" class="cleanup-audit-events"></div>
+                  <div id="cleanup-plan-cards" class="cleanup-plan-cards" role="radiogroup" aria-label="清理方案"></div>
                 </section>
                 <div class="cleanup-plan-bar" aria-live="polite">
                   <div>

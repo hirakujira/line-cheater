@@ -178,8 +178,10 @@
     return this.bridge.request("cleanupOverview", {});
   };
 
-  NativeDataProvider.prototype.cleanupPreflight = function () {
-    return this.bridge.request("cleanupPreflight", {});
+  NativeDataProvider.prototype.cleanupPreflight = function (options) {
+    options = options || {};
+    var params = options.verifySource === false ? { verifySource: false } : {};
+    return this.bridge.request("cleanupPreflight", params);
   };
 
   NativeDataProvider.prototype.cleanupPlanPreviews = function () {

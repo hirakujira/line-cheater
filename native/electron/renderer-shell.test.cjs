@@ -296,8 +296,12 @@ test("keeps cleanup bounded while presenting a continuous month-sectioned album"
   assert.match(renderer, /classList\.add\("is-detail"\)/);
   assert.match(renderer, /choice\.setAttribute\("aria-description", impactText\)/);
   assert.match(styles, /\.workspace-content\s*\{[^}]*overflow: hidden/);
-  assert.match(styles, /\.cleanup-panel\s*\{[^}]*height: 100%[^}]*overflow: hidden/);
+  assert.match(styles, /\.cleanup-panel\s*\{[^}]*height: 100%[^}]*overflow-x: hidden[^}]*overflow-y: auto/);
+  assert.match(styles, /\.cleanup-panel\s*\{[^}]*overflow-x: hidden[^}]*overflow-y: auto/);
+  assert.match(styles, /\.cleanup-results\s*\{[^}]*min-height: 320px[^}]*flex: 0 0 320px/);
+  assert.match(styles, /\.cleanup-list\s*\{[^}]*overflow-x: hidden[^}]*overflow-y: auto/);
   assert.match(styles, /\.cleanup-group-list\s*\{[^}]*grid-template-rows: repeat\(4,/);
+  assert.match(styles, /\.cleanup-group-list\s*\{[^}]*min-height: 306px/);
   assert.match(styles, /\.cleanup-review-grid\s*\{[^}]*repeat\(auto-fill, minmax\(min\(180px,/);
   assert.match(styles, /\.cleanup-month-header\s*\{[^}]*position: sticky/);
   assert.match(styles, /\.cleanup-preview img\s*\{[^}]*object-fit: contain/);
@@ -327,30 +331,70 @@ test("exposes separate safe-automatic and manual cleanup controls", () => {
   assert.match(main, /"clearManualAttachmentPlan"/);
 });
 
+test("restarts the cleanup overview after global attachment-plan changes", () => {
+  assert.match(
+    renderer,
+    /await provider\.planSafeAttachmentCleanup\(\);\s+cleanupPage = null;\s+cleanupOverview = null;\s+cleanupState\.page = 1;\s+cleanupState\.groupKey = null;/
+  );
+  assert.match(
+    renderer,
+    /await provider\.clearManualAttachmentPlan\(\);\s+cleanupPage = null;\s+cleanupOverview = null;\s+cleanupState\.page = 1;\s+cleanupState\.groupKey = null;/
+  );
+  assert.match(renderer, /await loadCleanupPage\(\{ verifySource: false \}\)/);
+  assert.match(renderer, /void refreshAdvancedPlanSummary\(\)/);
+});
+
 test("surfaces cleanup blindspot scans, plan previews, and candidate verification", () => {
   assert.match(html, /id="cleanup-preflight"/);
   assert.match(html, /id="refresh-cleanup-preflight"/);
   assert.match(html, /id="cleanup-plan-cards"/);
+  assert.match(html, /請選擇方案；選取只會切換檢視範圍/);
   assert.match(html, /id="package-modal-report"/);
   assert.match(renderer, /provider\.cleanupPreflight\(\)/);
   assert.match(renderer, /provider\.cleanupPlanPreviews\(\)/);
   assert.match(renderer, /function renderCleanupPreflight\(\)/);
   assert.match(renderer, /function renderCleanupPlanPreviews\(\)/);
+  assert.match(renderer, /function selectCleanupPlan\(profile\)/);
+  assert.match(renderer, /cleanupPlanPreviewsCollapsed = true/);
+  assert.match(renderer, /function toggleCleanupPlanPreviews\(\)/);
+  assert.match(renderer, /const visible = blockers > 0/);
+  assert.match(renderer, /classList\.toggle\("hidden", !visible\)/);
+  assert.match(renderer, /conservative: \{\s+label: "保守方案",\s+category: "all",/);
+  assert.match(renderer, /balanced: \{\s+label: "平衡方案",\s+category: "all",/);
+  assert.match(renderer, /aggressive: \{\s+label: "積極方案",\s+category: "all",/);
+  assert.match(renderer, /cleanupState\.category = selectedProfile\.category/);
+  assert.match(renderer, /分類範圍已回到全部檔案/);
+  assert.match(html, /role="radiogroup" aria-label="清理方案"/);
+  assert.match(html, /id="toggle-cleanup-plan-previews"/);
+  assert.match(styles, /\.cleanup-plan-previews\.is-collapsed \.cleanup-plan-cards/);
   assert.match(renderer, /function renderCandidateReport\(report\)/);
   assert.match(renderer, /Number\(cleanupPreflight\.blockerCount\)/);
   assert.match(main, /"cleanupPreflight"/);
   assert.match(main, /"cleanupPlanPreviews"/);
 });
 
-test("surfaces cleanup audit history and restore checklist", () => {
-  assert.match(html, /id="cleanup-audit"/);
-  assert.match(html, /id="copy-cleanup-plan"/);
+test("keeps long-running searches and image loading responsive", () => {
+  assert.match(renderer, /bridge\.on\("searchIndexProgress"/);
+  assert.match(renderer, /首次搜尋正在建立 FTS5 索引/);
+  assert.match(renderer, /new IntersectionObserver/);
+  assert.match(renderer, /rootMargin: "480px 0px"/);
+  assert.match(renderer, /preview\.dataset\.previewState = "loading"/);
+  assert.match(renderer, /active < 4/);
+  assert.match(renderer, /cleanupPreviewObserver\.disconnect\(\)/);
+});
+
+test("keeps audit details out of the primary cleanup workflow", () => {
+  assert.doesNotMatch(html, /id="cleanup-audit"/);
+  assert.doesNotMatch(renderer, /provider\.cleanupAudit\(20\)/);
+  assert.doesNotMatch(renderer, /function renderCleanupAudit\(\)/);
+  assert.doesNotMatch(renderer, /function copyCleanupPlanSummary\(\)/);
+  assert.match(main, /"cleanupAudit"/);
+});
+
+test("surfaces the restore checklist before candidate creation", () => {
   assert.match(html, /id="restore-checklist-modal"/);
   assert.match(html, /id="restore-check-original"/);
   assert.match(html, /id="restore-check-confirm"/);
-  assert.match(renderer, /provider\.cleanupAudit\(20\)/);
-  assert.match(renderer, /function renderCleanupAudit\(\)/);
-  assert.match(renderer, /function copyCleanupPlanSummary\(\)/);
   assert.match(renderer, /function requestRestoreChecklist\(\)/);
   assert.match(renderer, /if \(!await requestRestoreChecklist\(\)\) return;/);
   assert.match(main, /"cleanupAudit"/);

@@ -224,9 +224,11 @@ test("forwards cleanup preflight and plan preview reports", async () => {
     }
   });
   await provider.cleanupPreflight();
+  await provider.cleanupPreflight({ verifySource: false });
   await provider.cleanupPlanPreviews();
   assert.deepEqual(calls, [
     { method: "cleanupPreflight", params: {} },
+    { method: "cleanupPreflight", params: { verifySource: false } },
     { method: "cleanupPlanPreviews", params: {} }
   ]);
 });
