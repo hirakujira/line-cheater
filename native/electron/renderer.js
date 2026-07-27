@@ -201,17 +201,17 @@ const cleanupPlanProfiles = {
   conservative: {
     label: "保守方案",
     category: "all",
-    selectionSummary: "顯示全部清單；下方按鈕可套用已確認的安全自動標記。"
+    selectionSummary: "顯示全部分類；下方按鈕可套用已確認的安全自動標記。"
   },
   balanced: {
     label: "平衡方案",
-    category: "unreferenced",
-    selectionSummary: "切換到 SQLite 未引用清單，請逐一人工確認；不會自動標記。"
+    category: "all",
+    selectionSummary: "顯示全部分類；可從分類卡聚焦 SQLite 未引用附件，請逐一人工確認。"
   },
   aggressive: {
     label: "積極方案",
-    category: "unconfirmed",
-    selectionSummary: "切換到無法確認清單，請先檢查來源內容；不會自動標記。"
+    category: "all",
+    selectionSummary: "顯示全部分類；可依序聚焦 SQLite 未引用與無法確認附件，請先檢查來源內容。"
   }
 };
 
@@ -1958,7 +1958,8 @@ function selectCleanupPlan(profile) {
   renderCleanupPlanPreviews();
   if (cleanupOverview) renderCleanupOverview();
   if (provider) void loadCleanupPage({ verifySource: false });
-  setStatus(`已選擇${selectedProfile.label}；清單已切換為${categoryLabels[selectedProfile.category]}。`, false);
+  const searchNote = cleanupState.search ? "；已保留目前搜尋條件" : "";
+  setStatus(`已選擇${selectedProfile.label}；分類範圍已回到全部檔案${searchNote}，可從分類卡聚焦複核範圍。`, false);
 }
 
 function toggleCleanupPlanPreviews() {

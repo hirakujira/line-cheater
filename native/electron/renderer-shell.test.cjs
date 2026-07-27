@@ -359,6 +359,11 @@ test("surfaces cleanup blindspot scans, plan previews, and candidate verificatio
   assert.match(renderer, /function toggleCleanupPlanPreviews\(\)/);
   assert.match(renderer, /const visible = blockers > 0/);
   assert.match(renderer, /classList\.toggle\("hidden", !visible\)/);
+  assert.match(renderer, /conservative: \{\s+label: "保守方案",\s+category: "all",/);
+  assert.match(renderer, /balanced: \{\s+label: "平衡方案",\s+category: "all",/);
+  assert.match(renderer, /aggressive: \{\s+label: "積極方案",\s+category: "all",/);
+  assert.match(renderer, /cleanupState\.category = selectedProfile\.category/);
+  assert.match(renderer, /分類範圍已回到全部檔案/);
   assert.match(html, /role="radiogroup" aria-label="清理方案"/);
   assert.match(html, /id="toggle-cleanup-plan-previews"/);
   assert.match(styles, /\.cleanup-plan-previews\.is-collapsed \.cleanup-plan-cards/);

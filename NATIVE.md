@@ -89,13 +89,15 @@ grouped below rather than treated as separate feature changes.
   image rule is directly auto-applicable, while the other scopes remain
   review-only.
 - The desktop cleanup preview now has an explicit plan selector: choosing a
-  profile switches the bounded review filter and collapses the comparison cards
-  until the user asks to change the plan. Non-blocking preflight warnings stay
-  out of the primary workspace; only blockers expand the safety panel. Cleanup
-  and chat image previews hydrate only near the visible viewport, with at most
-  four concurrent native preview requests; the renderer shows FTS5 build
-  progress and the verified sidecar session avoids repeating full source-content
-  verification on every subsequent search.
+  profile resets the bounded view to all attachment groups on page one and
+  collapses the comparison cards until the user asks to change the plan. The
+  category cards remain separate focus controls for SQLite-unreferenced and
+  unconfirmed review. Non-blocking preflight warnings stay out of the primary
+  workspace; only blockers expand the safety panel. Cleanup and chat image
+  previews hydrate only near the visible viewport, with at most four concurrent
+  native preview requests; the renderer shows FTS5 build progress and the
+  verified sidecar session avoids repeating full source-content verification on
+  every subsequent search.
 - Cleanup actions retain a bounded recent activity history and produce a
   reproducible plan fingerprint from the source fingerprint, removal reasons,
   selected paths, chat-removal plan, and orphan-message plan. This audit data
