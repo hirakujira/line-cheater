@@ -734,6 +734,9 @@ fn handle_request<W: Write>(
         "clearManualAttachmentPlan" => Ok(serde_json::to_value(
             session.catalog.clear_manual_attachment_plan()?,
         )?),
+        "clearAllRemovalPlans" => Ok(serde_json::to_value(
+            session.catalog.clear_all_user_removal_plans()?,
+        )?),
         "stageAttachmentPreview" => {
             let params: PreviewParams = parse_params(request)?;
             Ok(serde_json::to_value(
