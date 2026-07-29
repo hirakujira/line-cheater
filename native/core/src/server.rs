@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::candidate::build_candidate;
+use crate::candidate::{
+    CandidateOptions, build_candidate_with_options, line_square_rebuild_required,
+};
 use crate::catalog::Catalog;
 use crate::database::{
     Fts5MessageIndex, LineDatabase, LineSquareDatabase, OrphanMessage, UnifiedGroupDatabase,
@@ -283,6 +285,8 @@ struct BuildCandidateParams {
     full_crc: bool,
     #[serde(default)]
     link_duplicates: bool,
+    #[serde(default)]
+    allow_line_square_rebuild: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -897,12 +901,15 @@ fn handle_request<W: Write>(
             session
                 .catalog
                 .set_active_job("candidate", request.job_id.as_deref())?;
-            let report = build_candidate(
+            let build_result = build_candidate_with_options(
                 &session.prepared.original_path,
                 &params.output,
                 &session.catalog,
-                params.full_crc,
-                params.link_duplicates,
+                CandidateOptions {
+                    full_crc: params.full_crc,
+                    link_duplicates: params.link_duplicates,
+                    allow_corrupt_line_square_rebuild: params.allow_line_square_rebuild,
+                },
                 |progress| {
                     if progress.processed_entries % 64 == 0
                         || progress.processed_entries == progress.total_entries
@@ -923,7 +930,20 @@ fn handle_request<W: Write>(
                         Ok(())
                     }
                 },
-            )?;
+            );
+            let report = match build_result {
+                Ok(report) => report,
+                Err(error) if line_square_rebuild_required(&error) => {
+                    session.catalog.clear_active_job("candidate")?;
+                    return Ok(json!({
+                        "lineSquareRebuildRequired": true,
+                    }));
+                }
+                Err(error) => {
+                    let _ = session.catalog.clear_active_job("candidate");
+                    return Err(error);
+                }
+            };
             session.catalog.clear_active_job("candidate")?;
             Ok(serde_json::to_value(report)?)
         }

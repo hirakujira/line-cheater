@@ -3210,10 +3210,47 @@ async function buildCandidate() {
     setCandidateBuildDisabled(true);
     const linkDuplicates =
       advancedMode && duplicateScanComplete && duplicateAutoMergeEnabled;
-    const report = await provider.buildCandidate(output.token, {
+    let report = await provider.buildCandidate(output.token, {
       fullCrc: true,
-      linkDuplicates
+      linkDuplicates,
+      allowLineSquareRebuild: false
     });
+    if (report && report.lineSquareRebuildRequired === true) {
+      updatePackageModalProgress(
+        0,
+        "偵測到 LineSquare.sqlite 損壞，正在等待是否重建的確認。"
+      );
+      const rebuild = await requestConfirmation({
+        title: "LineSquare.sqlite 已損壞",
+        message:
+          "若繼續，候選檔會重建空白的 LineSquare.sqlite，所有社群聊天室與社群訊息都不會保留。\n\n" +
+          "一般 LINE 聊天資料不受影響，原始備份也不會被修改。是否重建並繼續建立瘦身檔？",
+        cancelLabel: "取消建立",
+        confirmLabel: "重建並繼續",
+        danger: true
+      });
+      if (!rebuild) {
+        try {
+          await bridge.discardCandidateOutput(output.token);
+        } catch (error) {
+          console.warn(`Unable to discard candidate output authorization: ${error.message}`);
+        }
+        const message = "已取消建立；LineSquare.sqlite 與原始備份均未修改。";
+        setStatus(message, false);
+        packageInProgress = false;
+        completePackageModal(false, "已取消建立", message);
+        return;
+      }
+      const rebuildMessage =
+        `已授權重建空白 LineSquare.sqlite，正在繼續建立 ${output.displayName}。`;
+      setStatus(rebuildMessage);
+      updatePackageModalProgress(0, rebuildMessage);
+      report = await provider.buildCandidate(output.token, {
+        fullCrc: true,
+        linkDuplicates,
+        allowLineSquareRebuild: true
+      });
+    }
     renderCandidateReport(report);
     let successMessage =
       `候選檔完成：保留 ${report.outputEntries.toLocaleString()} 筆、` +

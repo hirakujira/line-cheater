@@ -48,6 +48,7 @@ LINE Cheater 是用來瀏覽、搜尋、整理與瘦身 iOS LINE App Container �
 - 依 CPU／實體記憶體自動調整 SQLite cache、mmap 與平行封存驗證 worker
 - 進階移除指定聊天室、空聊天室、僅系統訊息聊天室及孤立 `LineSquare` 訊息
 - 在新建候選檔內重寫 SQLite、執行 `VACUUM`，並串流建立 ZIP64 `.imazingapp`
+- 若重寫時確認 `LineSquare.sqlite` 已損壞，桌面版會先停止並詢問是否重建；只有使用者選擇「重建並繼續」後，候選檔才會以可讀 schema 重建空白社群資料庫。完成報告會顯示資料未保留警告，原始備份不會被修改。此容錯不套用至保存重要聊天的 `Line.sqlite`
 
 桌面版產生的候選檔已成功通過實際 iMazing 流程還原到手機，還原後可正常開啟 LINE。
 建立候選檔前會要求確認：原始備份已保留、會在安全環境測試還原，以及還原後會驗證聊天室、圖片與 SQLite。來源備份始終以唯讀方式處理。

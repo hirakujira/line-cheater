@@ -2,6 +2,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const { createHash } = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 
 const electronRoot = path.resolve(__dirname, "..");
@@ -93,15 +94,7 @@ function copyDirectory(source, destination) {
 }
 
 function sha256(file) {
-  const script = [
-    "$ErrorActionPreference = 'Stop'",
-    `(Get-FileHash -LiteralPath '${file.replace(/'/g, "''")}' -Algorithm SHA256).Hash`
-  ].join("; ");
-  return run(
-    "powershell.exe",
-    ["-NoProfile", "-NonInteractive", "-Command", script],
-    { capture: true }
-  ).trim().toLowerCase();
+  return createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
 function packageZip() {

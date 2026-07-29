@@ -21,6 +21,12 @@ contextBridge.exposeInMainWorld("lineNativeBridge", Object.freeze({
   chooseCandidateOutput() {
     return ipcRenderer.invoke("line-native:choose-candidate-output");
   },
+  discardCandidateOutput(token) {
+    if (typeof token !== "string" || !token) {
+      return Promise.reject(new TypeError("Invalid candidate output token."));
+    }
+    return ipcRenderer.invoke("line-native:discard-candidate-output", token);
+  },
   cancelOperation() {
     return ipcRenderer.invoke("line-native:cancel-operation");
   },

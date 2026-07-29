@@ -507,6 +507,9 @@ cargo run -p line-cheater -- \
 
 `--link-duplicates` is the experimental CLI equivalent of the desktop
 Advanced-mode option and requires a completed exact-duplicate hash scan.
+The CLI never silently replaces corrupt community data; after reviewing the
+failure, rerun with `--allow-corrupt-line-square-rebuild` to grant the same
+authorization that the desktop confirmation dialog requests.
 
 CLI cursor components are an atomic pair. Supplying only one component is an
 error. The sidecar's chat cursor additionally includes `source`; renderer code
@@ -883,6 +886,12 @@ limitations:
   delete exact planned chats/messages in a transaction, run `VACUUM` and
   `quick_check`, write the snapshot as the candidate database entry, and omit
   stale WAL/SHM sidecars. The selected source remains byte-for-byte untouched.
+- If a `LineSquare.sqlite` rewrite fails due to confirmed SQLite corruption, the
+  first desktop build attempt pauses for explicit confirmation. Once authorized,
+  the builder recreates an empty database from the readable source schema (or a
+  minimal `ZCHAT`/`ZMESSAGE` schema), requires `quick_check=ok`, and reports the
+  discarded community data as a warning. This fallback is deliberately not
+  applied to `Line.sqlite`.
 - Advanced duplicate linking writes Unix symbolic-link entries into the ZIP.
   Generated directory and `.imazingapp` fixtures verify link type, relative
   target, removal-first planning, all-members-removed behavior, CRC, and

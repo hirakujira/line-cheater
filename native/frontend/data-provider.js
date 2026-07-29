@@ -282,7 +282,8 @@
     return this.bridge.request("buildCandidate", {
       output: output,
       fullCrc: Boolean(options.fullCrc),
-      linkDuplicates: Boolean(options.linkDuplicates)
+      linkDuplicates: Boolean(options.linkDuplicates),
+      allowLineSquareRebuild: Boolean(options.allowLineSquareRebuild)
     });
   };
 

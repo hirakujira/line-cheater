@@ -294,6 +294,20 @@ async function registerIpc() {
     return { token, displayName: path.basename(result.filePath) };
   });
 
+  ipcMain.handle("line-native:discard-candidate-output", async (event, token) => {
+    assertTrustedSender(event);
+    token = String(token || "");
+    const output = outputTokens.get(token);
+    if (!output) return false;
+    outputTokens.delete(token);
+    const workDir = sessionWorkDir(app.getPath("userData"), activeSource);
+    return cleanCancelledOperation({
+      method: "buildCandidate",
+      output,
+      workDir
+    });
+  });
+
   ipcMain.handle("line-native:cancel-operation", async (event) => {
     assertTrustedSender(event);
     if (!sidecar || !activeSource) return false;
@@ -371,14 +385,16 @@ async function registerIpc() {
       : {};
     const userDataPath = app.getPath("userData");
     const workDir = sessionWorkDir(userDataPath, activeSource);
+    let candidateOutputToken = null;
     if (method === "buildCandidate") {
       const token = String(safeParams.output || "");
       const output = outputTokens.get(token);
       if (!output) throw new Error("候選輸出授權已失效，請重新選擇位置。");
-      outputTokens.delete(token);
       if (outputFallsInsideSession(workDir, output)) {
+        outputTokens.delete(token);
         throw new Error("候選輸出不能儲存在 LINE Cheater 的本機快取內。");
       }
+      candidateOutputToken = token;
       safeParams.output = output;
     }
     const client = sidecar;
@@ -395,8 +411,13 @@ async function registerIpc() {
     try {
       const result = await client.request(method, safeParams, { jobId });
       if (method !== "buildCandidate") return result;
+      if (result && result.lineSquareRebuildRequired === true) return result;
+      outputTokens.delete(candidateOutputToken);
       const cacheResult = await closeCompletedSession(client, workDir);
       return { ...result, ...cacheResult };
+    } catch (error) {
+      if (candidateOutputToken) outputTokens.delete(candidateOutputToken);
+      throw error;
     } finally {
       if (activeOperation === operation) activeOperation = null;
     }
