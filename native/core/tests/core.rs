@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 use line_backup_native::{
-    AttachmentKind, Catalog, ChatCursor, LineDatabase, LineSquareDatabase, MessageCursor,
-    NativeSession, PreparePhase, SourceKind, UnifiedGroupDatabase, build_candidate, inspect_source,
-    prepare_source, prepare_source_reporting, serve,
+    AttachmentKind, CandidateOptions, Catalog, ChatCursor, LineDatabase, LineSquareDatabase,
+    MessageCursor, NativeSession, PreparePhase, SourceKind, UnifiedGroupDatabase, build_candidate,
+    build_candidate_with_options, inspect_source, line_square_rebuild_required, prepare_source,
+    prepare_source_reporting, serve,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -168,6 +169,45 @@ fn add_square_fixture(source: &Path) {
         .join("Message Attachments/square-chat/23456789.jpg");
     fs::create_dir_all(attachment.parent().unwrap()).unwrap();
     fs::write(attachment, b"square attachment").unwrap();
+}
+
+fn corrupt_square_index(source: &Path) {
+    let line_database = source.join(inspect_source(source).unwrap().database_path);
+    let square_database = line_database.with_file_name("LineSquare.sqlite");
+    let connection = Connection::open(&square_database).unwrap();
+    connection
+        .execute_batch(
+            "
+            CREATE TABLE ZCORRUPTION_SENTINEL (
+                Z_PK INTEGER PRIMARY KEY,
+                ZVALUE TEXT
+            );
+            INSERT INTO ZCORRUPTION_SENTINEL VALUES (1, 'sentinel');
+            CREATE INDEX ZCORRUPTION_INDEX ON ZCORRUPTION_SENTINEL(ZVALUE);
+            PRAGMA writable_schema = ON;
+            ",
+        )
+        .unwrap();
+    let table_root: i64 = connection
+        .query_row(
+            "SELECT rootpage FROM sqlite_schema WHERE name = 'ZCORRUPTION_SENTINEL'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sqlite_schema SET rootpage = ?1 WHERE name = 'ZCORRUPTION_INDEX'",
+            [table_root],
+        )
+        .unwrap();
+    let schema_version: i64 = connection
+        .query_row("PRAGMA schema_version", [], |row| row.get(0))
+        .unwrap();
+    connection
+        .pragma_update(None, "schema_version", schema_version + 1)
+        .unwrap();
+    connection.close().unwrap();
 }
 
 fn add_chat_title_fixtures(source: &Path) {
@@ -1844,6 +1884,95 @@ fn advanced_cleanup_rewrites_candidate_sqlite_and_removes_chat_files_only() {
     assert_eq!(advanced.planned_chats, 1);
     assert_eq!(advanced.planned_database_messages, 4);
     assert_eq!(advanced.planned_files, 3);
+}
+
+#[test]
+fn corrupt_line_square_is_replaced_with_an_empty_database() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    add_square_fixture(&source);
+    corrupt_square_index(&source);
+    let report = inspect_source(&source).unwrap();
+    let square_path = source
+        .join(&report.database_path)
+        .with_file_name("LineSquare.sqlite");
+    let corrupt_check: String = Connection::open(&square_path)
+        .unwrap()
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .unwrap();
+    assert_ne!(corrupt_check, "ok");
+
+    let work = temporary.path().join("corrupt-square-work");
+    let prepared = prepare_source(&source, &work).unwrap();
+    let square_database =
+        LineSquareDatabase::open(prepared.square_database_path.as_deref().unwrap()).unwrap();
+    let selected = square_database.chat_for_cleanup(8).unwrap();
+    let catalog_path = work.join("catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .set_chat_removal_planned(&selected, true, "selected")
+        .unwrap();
+
+    let output = temporary.path().join("LINE-corrupt-square.imazingapp");
+    let error = build_candidate(&source, &output, &catalog, true, false, |_| Ok(())).unwrap_err();
+    assert!(line_square_rebuild_required(&error));
+    assert!(!output.exists());
+
+    let candidate = build_candidate_with_options(
+        &source,
+        &output,
+        &catalog,
+        CandidateOptions {
+            full_crc: true,
+            link_duplicates: false,
+            allow_corrupt_line_square_rebuild: true,
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(candidate.rewritten_databases.len(), 1);
+    assert!(
+        candidate
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("LineSquare.sqlite") && warning.contains("空白"))
+    );
+
+    let square_entry = report
+        .database_path
+        .rsplit_once('/')
+        .map(|(parent, _)| format!("{parent}/LineSquare.sqlite"))
+        .unwrap();
+    let extracted_square = temporary.path().join("candidate-empty-LineSquare.sqlite");
+    let mut archive = zip::ZipArchive::new(fs::File::open(&output).unwrap()).unwrap();
+    {
+        let mut entry = archive.by_name(&square_entry).unwrap();
+        let mut output = fs::File::create(&extracted_square).unwrap();
+        std::io::copy(&mut entry, &mut output).unwrap();
+    }
+    let connection = Connection::open(&extracted_square).unwrap();
+    let quick_check: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .unwrap();
+    let chats: i64 = connection
+        .query_row("SELECT COUNT(*) FROM ZCHAT", [], |row| row.get(0))
+        .unwrap();
+    let messages: i64 = connection
+        .query_row("SELECT COUNT(*) FROM ZMESSAGE", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(quick_check, "ok");
+    assert_eq!(chats, 0);
+    assert_eq!(messages, 0);
+    connection.close().unwrap();
+
+    let original_check: String = Connection::open(&square_path)
+        .unwrap()
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .unwrap();
+    assert_ne!(original_check, "ok");
 }
 
 #[test]

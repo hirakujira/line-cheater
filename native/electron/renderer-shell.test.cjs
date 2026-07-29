@@ -429,6 +429,19 @@ test("surfaces the restore checklist before candidate creation", () => {
   assert.match(styles, /\.restore-checklist-modal\s*\{/);
 });
 
+test("requires explicit confirmation before rebuilding corrupt LineSquare data", () => {
+  assert.match(renderer, /report\.lineSquareRebuildRequired === true/);
+  assert.match(renderer, /title: "LineSquare\.sqlite 已損壞"/);
+  assert.match(renderer, /confirmLabel: "重建並繼續"/);
+  assert.match(renderer, /cancelLabel: "取消建立"/);
+  assert.match(renderer, /allowLineSquareRebuild: false/);
+  assert.match(renderer, /allowLineSquareRebuild: true/);
+  assert.match(renderer, /bridge\.discardCandidateOutput\(output\.token\)/);
+  assert.match(preload, /discardCandidateOutput\(token\)/);
+  assert.match(main, /result\.lineSquareRebuildRequired === true/);
+  assert.match(main, /"line-native:discard-candidate-output"/);
+});
+
 test("supports cleanup page jumps and restores the overview page after chat detail", () => {
   assert.match(html, /id="cleanup-page-input"/);
   assert.match(html, /id="cleanup-page-total"/);

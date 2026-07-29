@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet};
+use std::error::Error as StdError;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -7,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use rusqlite::backup::Backup;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, ErrorCode, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
@@ -49,6 +51,30 @@ pub struct CandidateReport {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CandidateOptions {
+    pub full_crc: bool,
+    pub link_duplicates: bool,
+    pub allow_corrupt_line_square_rebuild: bool,
+}
+
+#[derive(Debug)]
+pub struct LineSquareRebuildRequired;
+
+impl fmt::Display for LineSquareRebuildRequired {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "LineSquare.sqlite is corrupt and requires explicit authorization before it can be rebuilt as an empty database",
+        )
+    }
+}
+
+impl StdError for LineSquareRebuildRequired {}
+
+pub fn line_square_rebuild_required(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LineSquareRebuildRequired>().is_some()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileFingerprint {
     bytes: u64,
@@ -74,6 +100,20 @@ struct DatabaseRewrite {
 struct DatabaseRewrites {
     entries: HashMap<String, DatabaseRewrite>,
     skipped_sidecars: HashSet<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct SchemaObject {
+    object_type: String,
+    name: String,
+    sql: String,
+}
+
+#[derive(Debug, Default)]
+struct EmptyDatabaseRebuild {
+    used_minimal_schema: bool,
+    skipped_schema_objects: usize,
 }
 
 #[derive(Debug)]
@@ -139,11 +179,39 @@ pub fn build_candidate<F>(
     catalog: &Catalog,
     full_crc: bool,
     link_duplicates: bool,
+    on_progress: F,
+) -> Result<CandidateReport>
+where
+    F: FnMut(CandidateProgress) -> Result<()>,
+{
+    build_candidate_with_options(
+        source,
+        output,
+        catalog,
+        CandidateOptions {
+            full_crc,
+            link_duplicates,
+            allow_corrupt_line_square_rebuild: false,
+        },
+        on_progress,
+    )
+}
+
+pub fn build_candidate_with_options<F>(
+    source: &Path,
+    output: &Path,
+    catalog: &Catalog,
+    options: CandidateOptions,
     mut on_progress: F,
 ) -> Result<CandidateReport>
 where
     F: FnMut(CandidateProgress) -> Result<()>,
 {
+    let CandidateOptions {
+        full_crc,
+        link_duplicates,
+        allow_corrupt_line_square_rebuild,
+    } = options;
     let source = source
         .canonicalize()
         .with_context(|| format!("source does not exist: {}", source.display()))?;
@@ -168,7 +236,12 @@ where
         DuplicateSymlinkPlan::default()
     };
     let cleanup_plan = catalog.database_cleanup_plan()?;
-    let rewrites = prepare_database_rewrites(&source, catalog, &cleanup_plan)?;
+    let rewrites = prepare_database_rewrites(
+        &source,
+        catalog,
+        &cleanup_plan,
+        allow_corrupt_line_square_rebuild,
+    )?;
     let build_plan = CandidateBuildPlan {
         catalog,
         marked: &marked,
@@ -278,6 +351,7 @@ fn prepare_database_rewrites(
     source: &Path,
     catalog: &Catalog,
     plan: &DatabaseCleanupPlan,
+    allow_corrupt_line_square_rebuild: bool,
 ) -> Result<DatabaseRewrites> {
     if plan.is_empty() {
         return Ok(DatabaseRewrites::default());
@@ -287,13 +361,14 @@ fn prepare_database_rewrites(
         .parent()
         .context("catalog path has no working directory")?;
     let prepared = prepare_source(source, work_dir)?;
-    prepare_rewrites_from_prepared(&prepared, work_dir, plan)
+    prepare_rewrites_from_prepared(&prepared, work_dir, plan, allow_corrupt_line_square_rebuild)
 }
 
 fn prepare_rewrites_from_prepared(
     prepared: &PreparedSource,
     work_dir: &Path,
     plan: &DatabaseCleanupPlan,
+    allow_corrupt_line_square_rebuild: bool,
 ) -> Result<DatabaseRewrites> {
     let mut rewrites = DatabaseRewrites::default();
     let line_chats = plan
@@ -302,10 +377,13 @@ fn prepare_rewrites_from_prepared(
         .filter(|chat| chat.source == "line")
         .map(|chat| chat.chat_pk)
         .collect::<Vec<_>>();
-    let square_chats = plan
+    let square_planned_chats = plan
         .chats
         .iter()
         .filter(|chat| chat.source == "square")
+        .collect::<Vec<_>>();
+    let square_chats = square_planned_chats
+        .iter()
         .map(|chat| chat.chat_pk)
         .collect::<Vec<_>>();
     if plan
@@ -345,8 +423,22 @@ fn prepare_rewrites_from_prepared(
             .as_deref()
             .context("cleanup plan references LineSquare.sqlite, but it is unavailable")?;
         let destination = rewrite_directory.join("LineSquare.cleaned.sqlite");
-        let (removed_chats, removed_messages) =
-            rewrite_database(source, &destination, &square_chats, &square_orphans)?;
+        let planned_messages = square_planned_chats
+            .iter()
+            .map(|chat| chat.message_count.max(0) as u64)
+            .sum::<u64>()
+            .saturating_add(square_orphans.len() as u64);
+        let (removed_chats, removed_messages, warning) = rewrite_square_database(
+            source,
+            &destination,
+            &square_chats,
+            &square_orphans,
+            planned_messages,
+            allow_corrupt_line_square_rebuild,
+        )?;
+        if let Some(warning) = warning {
+            rewrites.warnings.push(warning);
+        }
         let entry_name = sibling_entry_name(&prepared.report.database_path, "LineSquare.sqlite");
         insert_database_rewrite(
             &mut rewrites,
@@ -477,6 +569,236 @@ fn rewrite_database(
     Ok((removed_chats, removed_messages))
 }
 
+fn rewrite_square_database(
+    source: &Path,
+    destination: &Path,
+    chat_pks: &[i64],
+    orphan_message_pks: &[i64],
+    planned_messages: u64,
+    allow_corrupt_line_square_rebuild: bool,
+) -> Result<(u64, u64, Option<String>)> {
+    match rewrite_database(source, destination, chat_pks, orphan_message_pks) {
+        Ok((removed_chats, removed_messages)) => {
+            return Ok((removed_chats, removed_messages, None));
+        }
+        Err(error) if sqlite_integrity_failure(source, &error) => {
+            if !allow_corrupt_line_square_rebuild {
+                return Err(LineSquareRebuildRequired.into());
+            }
+        }
+        Err(error) => return Err(error),
+    }
+
+    let source_chats = readable_table_count(source, "ZCHAT").unwrap_or(chat_pks.len() as u64);
+    let source_messages = readable_table_count(source, "ZMESSAGE").unwrap_or(planned_messages);
+    let rebuild = rebuild_empty_square_database(source, destination)
+        .context("failed to replace corrupt LineSquare.sqlite with an empty database")?;
+    let mut warning = "LineSquare.sqlite 完整性檢查失敗；候選檔已改用空白社群資料庫，所有可讀取的社群聊天室與訊息均未保留，原始備份未被修改。".to_string();
+    if rebuild.used_minimal_schema {
+        warning.push_str(" 原始 schema 無法完整讀取，已補建最低限度的 ZCHAT／ZMESSAGE 結構。");
+    } else if rebuild.skipped_schema_objects > 0 {
+        warning.push_str(&format!(
+            " 有 {} 個非必要 schema 物件無法重建。",
+            rebuild.skipped_schema_objects
+        ));
+    }
+    Ok((source_chats, source_messages, Some(warning)))
+}
+
+fn sqlite_integrity_failure(source: &Path, rewrite_error: &anyhow::Error) -> bool {
+    if rewrite_error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<rusqlite::Error>())
+        .any(is_sqlite_corruption_error)
+    {
+        return true;
+    }
+    if rewrite_error
+        .to_string()
+        .contains("rewritten SQLite failed quick_check")
+    {
+        return true;
+    }
+    match open_read_only_database(source).and_then(|connection| {
+        connection
+            .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+            .map_err(Into::into)
+    }) {
+        Ok(result) => !result.eq_ignore_ascii_case("ok"),
+        Err(error) => error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<rusqlite::Error>())
+            .any(is_sqlite_corruption_error),
+    }
+}
+
+fn is_sqlite_corruption_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase)
+    )
+}
+
+fn readable_table_count(source: &Path, table: &str) -> Option<u64> {
+    let connection = open_read_only_database(source).ok()?;
+    let sql = format!("SELECT COUNT(*) FROM {}", quoted_identifier(table));
+    connection
+        .query_row(&sql, [], |row| row.get::<_, i64>(0))
+        .ok()
+        .map(|count| count.max(0) as u64)
+}
+
+fn rebuild_empty_square_database(
+    source: &Path,
+    destination: &Path,
+) -> Result<EmptyDatabaseRebuild> {
+    let (schema, source_user_version, source_application_id, schema_readable) =
+        match read_database_schema(source) {
+            Ok(value) => (value.0, value.1, value.2, true),
+            Err(_) => (Vec::new(), None, None, false),
+        };
+    remove_database_files(destination)?;
+    let destination_connection = Connection::open(destination)?;
+    destination_connection.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         PRAGMA journal_mode = DELETE;",
+    )?;
+
+    let mut rebuild = EmptyDatabaseRebuild {
+        used_minimal_schema: !schema_readable,
+        skipped_schema_objects: 0,
+    };
+    for object in schema {
+        if object.name.to_ascii_lowercase().starts_with("sqlite_")
+            || schema_object_exists(&destination_connection, &object.object_type, &object.name)?
+        {
+            continue;
+        }
+        if destination_connection.execute_batch(&object.sql).is_err() {
+            rebuild.skipped_schema_objects += 1;
+        }
+    }
+    if !table_exists(&destination_connection, "ZCHAT")? {
+        destination_connection.execute_batch(MINIMAL_SQUARE_CHAT_SCHEMA)?;
+        rebuild.used_minimal_schema = true;
+    }
+    if !table_exists(&destination_connection, "ZMESSAGE")? {
+        destination_connection.execute_batch(MINIMAL_SQUARE_MESSAGE_SCHEMA)?;
+        rebuild.used_minimal_schema = true;
+    }
+    if let Some(user_version) = source_user_version {
+        destination_connection.pragma_update(None, "user_version", user_version)?;
+    }
+    if let Some(application_id) = source_application_id {
+        destination_connection.pragma_update(None, "application_id", application_id)?;
+    }
+    destination_connection.execute_batch("VACUUM; PRAGMA optimize;")?;
+    let quick_check: String =
+        destination_connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if !quick_check.eq_ignore_ascii_case("ok") {
+        bail!("empty LineSquare.sqlite failed quick_check: {quick_check}");
+    }
+    drop(destination_connection);
+    Ok(rebuild)
+}
+
+fn read_database_schema(source: &Path) -> Result<(Vec<SchemaObject>, Option<i64>, Option<i64>)> {
+    let connection = open_read_only_database(source)?;
+    let user_version = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .ok();
+    let application_id = connection
+        .query_row("PRAGMA application_id", [], |row| row.get(0))
+        .ok();
+    let mut statement = connection.prepare(
+        "SELECT type, name, sql
+         FROM sqlite_schema
+         WHERE sql IS NOT NULL
+           AND type IN ('table', 'index', 'trigger', 'view')
+         ORDER BY CASE type
+                    WHEN 'table' THEN 0
+                    WHEN 'index' THEN 1
+                    WHEN 'trigger' THEN 2
+                    ELSE 3
+                  END,
+                  rowid",
+    )?;
+    let schema = statement
+        .query_map([], |row| {
+            Ok(SchemaObject {
+                object_type: row.get(0)?,
+                name: row.get(1)?,
+                sql: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok((schema, user_version, application_id))
+}
+
+fn schema_object_exists(connection: &Connection, object_type: &str, name: &str) -> Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM sqlite_schema WHERE type = ?1 AND name = ?2
+         )",
+        params![object_type, name],
+        |row| row.get(0),
+    )?)
+}
+
+fn table_exists(connection: &Connection, name: &str) -> Result<bool> {
+    schema_object_exists(connection, "table", name)
+}
+
+fn open_read_only_database(path: &Path) -> Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_URI
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    Ok(Connection::open_with_flags(path, flags)?)
+}
+
+fn remove_database_files(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_file(path)?;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
+        if sidecar.exists() {
+            fs::remove_file(sidecar)?;
+        }
+    }
+    Ok(())
+}
+
+fn quoted_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+const MINIMAL_SQUARE_CHAT_SCHEMA: &str = "
+    CREATE TABLE ZCHAT (
+        Z_PK INTEGER PRIMARY KEY,
+        ZMID TEXT,
+        ZTYPE INTEGER,
+        ZSQUARE INTEGER,
+        ZNAME TEXT
+    );
+";
+
+const MINIMAL_SQUARE_MESSAGE_SCHEMA: &str = "
+    CREATE TABLE ZMESSAGE (
+        Z_PK INTEGER PRIMARY KEY,
+        ZID TEXT,
+        ZTIMESTAMP INTEGER,
+        ZCHAT INTEGER,
+        ZSENDER INTEGER,
+        ZSENDSTATUS INTEGER,
+        ZCONTENTTYPE INTEGER,
+        ZMESSAGETYPE TEXT,
+        ZTEXT TEXT,
+        ZLATITUDE REAL,
+        ZLONGITUDE REAL
+    );
+";
+
 fn sibling_entry_name(database_name: &str, filename: &str) -> String {
     database_name
         .rsplit_once('/')
@@ -506,6 +828,7 @@ where
     let total_bytes = build_info.compressed_bytes;
     let protected_before = build_info.protected_hashes;
     let mut warnings = build_info.warnings;
+    warnings.extend(rewrites.warnings.iter().cloned());
     if !protected_before
         .keys()
         .any(|path| path.ends_with("/Messages/Line.sqlite"))
@@ -831,6 +1154,7 @@ where
                 "directory sources are stored without compression; ZIP metadata may differ from iMazing"
                     .to_string(),
             ];
+            warnings.extend(rewrites.warnings.iter().cloned());
             if duplicate_symlinks.linked_entries() > 0 {
                 warnings.push(
                     "duplicate attachments use relative symbolic links; verify iMazing restore compatibility before relying on this candidate"

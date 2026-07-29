@@ -105,9 +105,25 @@ test("forwards explicit duplicate-link candidate mode", async () => {
     params: {
       output: "output-token",
       fullCrc: true,
-      linkDuplicates: true
+      linkDuplicates: true,
+      allowLineSquareRebuild: false
     }
   });
+});
+
+test("forwards explicit LineSquare rebuild authorization", async () => {
+  const calls = [];
+  const provider = new NativeDataProvider({
+    request: async (method, params) => {
+      calls.push({ method, params });
+      return {};
+    }
+  });
+  await provider.buildCandidate("output-token", {
+    fullCrc: true,
+    allowLineSquareRebuild: true
+  });
+  assert.equal(calls[0].params.allowLineSquareRebuild, true);
 });
 
 test("validates and forwards bounded message searches", async () => {

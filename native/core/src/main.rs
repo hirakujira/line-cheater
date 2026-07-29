@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use line_backup_native::{
-    AttachmentCursor, AttachmentKind, Catalog, ChatCursor, DuplicateGroupCursor, LineDatabase,
-    LineSquareDatabase, MessageCursor, NativeSession, UnifiedGroupDatabase, build_candidate,
-    inspect_source, prepare_source, serve,
+    AttachmentCursor, AttachmentKind, CandidateOptions, Catalog, ChatCursor, DuplicateGroupCursor,
+    LineDatabase, LineSquareDatabase, MessageCursor, NativeSession, UnifiedGroupDatabase,
+    build_candidate_with_options, inspect_source, prepare_source, serve,
 };
 use serde::Serialize;
 
@@ -107,6 +107,8 @@ enum Command {
         full_crc: bool,
         #[arg(long)]
         link_duplicates: bool,
+        #[arg(long)]
+        allow_corrupt_line_square_rebuild: bool,
     },
     HashDuplicates {
         #[arg(long)]
@@ -289,14 +291,18 @@ fn main() -> Result<()> {
             output,
             full_crc,
             link_duplicates,
+            allow_corrupt_line_square_rebuild,
         } => {
             let catalog = Catalog::open(&catalog)?;
-            let report = build_candidate(
+            let report = build_candidate_with_options(
                 &source,
                 &output,
                 &catalog,
-                full_crc,
-                link_duplicates,
+                CandidateOptions {
+                    full_crc,
+                    link_duplicates,
+                    allow_corrupt_line_square_rebuild,
+                },
                 |progress| {
                     if progress.processed_entries % 64 == 0
                         || progress.processed_entries == progress.total_entries
