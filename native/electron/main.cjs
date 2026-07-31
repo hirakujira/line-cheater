@@ -38,6 +38,7 @@ const allowedMethods = new Set([
   "clearAllRemovalPlans",
   "catalogStats",
   "cleanupOverview",
+  "cleanupCategoryActionState",
   "cleanupPreflight",
   "cleanupPlanPreviews",
   "cleanupAudit",

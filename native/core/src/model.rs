@@ -232,6 +232,20 @@ pub struct CleanupCategoryTotal {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct CleanupCategoryActionState {
+    pub category: String,
+    pub attachment_count: u64,
+    pub marked_attachment_count: u64,
+    pub thumbnail_candidate_count: u64,
+    pub chat_count: u64,
+    pub planned_chat_count: u64,
+    pub keeping_all_thumbnails: bool,
+    pub deleting_all_attachments: bool,
+    pub deleting_all_chats: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct CleanupOverview {
     pub categories: Vec<CleanupCategoryTotal>,
     pub marked_count: u64,

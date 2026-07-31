@@ -14,8 +14,8 @@ use crate::database::{
 };
 use crate::model::{
     AdvancedCleanupReport, AttachmentCursor, AttachmentKind, Chat, ChatCursor, ChatPage,
-    CleanupGroupPage, CleanupPreflightReport, CleanupRisk, DEFAULT_PAGE_SIZE, DuplicateGroupCursor,
-    MessageCursor, MessagePage,
+    CleanupCategoryActionState, CleanupGroupPage, CleanupPreflightReport, CleanupRisk,
+    DEFAULT_PAGE_SIZE, DuplicateGroupCursor, MessageCursor, MessagePage,
 };
 use crate::performance::system_performance_profile;
 use crate::source::{PreparedSource, SourceKind, prepare_source_reporting};
@@ -345,6 +345,12 @@ struct CleanupGroupActionParams {
 struct CleanupCategoryActionParams {
     category: String,
     action: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupCategoryActionStateParams {
+    category: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -789,6 +795,13 @@ fn handle_request<W: Write>(
         }
         "catalogStats" => Ok(serde_json::to_value(session.catalog.stats()?)?),
         "cleanupOverview" => Ok(serde_json::to_value(session.catalog.cleanup_overview()?)?),
+        "cleanupCategoryActionState" => {
+            let params: CleanupCategoryActionStateParams = parse_params(request)?;
+            let state: CleanupCategoryActionState = session
+                .catalog
+                .cleanup_category_action_state(&params.category)?;
+            Ok(serde_json::to_value(state)?)
+        }
         "cleanupPreflight" => {
             let params = if request.params.is_null() {
                 CleanupPreflightParams {
@@ -866,6 +879,11 @@ fn handle_request<W: Write>(
             let params: CleanupCategoryActionParams = parse_params(request)?;
             let request_id = request.id.clone();
             let job_id = request.job_id.clone();
+            let progress_phase = if params.action.starts_with("clear_") {
+                "取消分類附件標記"
+            } else {
+                "寫入分類附件標記"
+            };
             Ok(serde_json::to_value(
                 session.catalog.apply_cleanup_category_action(
                     &params.category,
@@ -875,7 +893,7 @@ fn handle_request<W: Write>(
                             output,
                             &request_id,
                             job_id.as_deref(),
-                            "寫入分類附件標記",
+                            progress_phase,
                             progress.processed_records,
                             progress.total_records,
                         )
@@ -892,10 +910,15 @@ fn handle_request<W: Write>(
                 "community" => Some("community"),
                 _ => anyhow::bail!("unsupported chat cleanup category"),
             };
-            let mut chats = all_chats_for_cleanup(session)?;
-            if let Some(kind) = kind {
-                chats.retain(|chat| chat.kind == kind);
-            }
+            let chats = if session.catalog.chat_index_is_current()? {
+                session.catalog.indexed_chats_for_cleanup(kind)?
+            } else {
+                let mut chats = all_chats_for_cleanup(session)?;
+                if let Some(kind) = kind {
+                    chats.retain(|chat| chat.kind == kind);
+                }
+                chats
+            };
             let request_id = request.id.clone();
             let job_id = request.job_id.clone();
             session.catalog.set_chats_removal_planned_reporting(

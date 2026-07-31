@@ -106,6 +106,7 @@ test("selects the platform-native desktop icon and packages Windows assets", () 
 });
 
 test("verifies the complete Windows package payload", () => {
+  assert.match(windowsPackager, /process\.env\.LINE_CHEATER_DIST_ROOT/);
   assert.match(windowsPackager, /const requiredPackageFiles = \[/);
   assert.match(windowsPackager, /required file: \$\{relativePath\}/);
   assert.match(windowsPackager, /verifiedMetadata\.productName !== productName/);
@@ -317,8 +318,9 @@ test("keeps cleanup bounded while presenting a continuous month-sectioned album"
 test("reuses cleanup overview while paging groups", () => {
   assert.match(
     renderer,
-    /if \(cleanupOverview\) \{\s+page = await provider\.listCleanupGroups\(cleanupOptions\(\)\);/
+    /if \(cleanupOverview\) \{\s+\[page, cleanupCategoryActionState\] = await Promise\.all/
   );
+  assert.match(renderer, /provider\.listCleanupGroups\(cleanupOptions\(\)\)/);
   assert.match(renderer, /cleanupOverview = await provider\.applyCleanupGroupAction\(/);
   assert.match(renderer, /cleanupPage = cleanupOverview = null;/);
 });
@@ -351,15 +353,19 @@ test("requires confirmation before cancelling work or closing the app", () => {
   assert.match(main, /buttons: \["繼續使用", "確認關閉"\]/);
 });
 
-test("supports category-wide attachment and chat actions with locked mutation progress", () => {
+test("supports reversible category-wide actions with locked mutation progress", () => {
   assert.match(html, /id="category-bulk-actions"/);
   assert.match(html, /id="category-keep-thumbnails"/);
   assert.match(html, /id="category-delete-attachments"/);
   assert.match(html, /id="category-delete-chats"/);
   assert.match(html, /id="operation-modal"[^>]*role="dialog"[^>]*aria-modal="true"/);
-  assert.match(renderer, /provider\.applyCleanupCategoryAction\(category, "keep_thumbnail"\)/);
-  assert.match(renderer, /provider\.applyCleanupCategoryAction\(category, "delete_all"\)/);
-  assert.match(renderer, /provider\.setCleanupCategoryChatsRemovalPlanned\(category, true\)/);
+  assert.match(renderer, /provider\.cleanupCategoryActionState\(requestedCategory\)/);
+  assert.match(renderer, /cancelling \? "clear_keep_thumbnail" : "keep_thumbnail"/);
+  assert.match(renderer, /cancelling \? "clear_delete_all" : "delete_all"/);
+  assert.match(renderer, /provider\.setCleanupCategoryChatsRemovalPlanned\(category, !cancelling\)/);
+  assert.match(renderer, /取消全部只保留縮圖/);
+  assert.match(renderer, /取消刪除分類所有附件/);
+  assert.match(renderer, /取消刪除分類所有聊天室/);
   assert.match(renderer, /\["all", "individual", "group", "community"\]\.includes\(category\)/);
   assert.match(renderer, /runCleanupMutation\(/);
   assert.match(renderer, /bridge\.on\("cleanupMutationProgress"/);
@@ -367,6 +373,7 @@ test("supports category-wide attachment and chat actions with locked mutation pr
   assert.match(styles, /\.category-bulk-actions/);
   assert.match(styles, /body\.operation-modal-open/);
   assert.match(main, /"applyCleanupCategoryAction"/);
+  assert.match(main, /"cleanupCategoryActionState"/);
   assert.match(main, /"setCleanupCategoryChatsRemovalPlanned"/);
   assert.match(preload, /"cleanupMutationProgress"/);
 });

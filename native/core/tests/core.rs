@@ -1180,6 +1180,28 @@ fn applies_category_actions_to_individual_group_and_community_files_with_progres
         .find(|group| group.chat_id == "square-chat")
         .unwrap();
     assert!(community.keeping_thumbnails);
+    let all_action_state = catalog.cleanup_category_action_state("all").unwrap();
+    assert!(all_action_state.keeping_all_thumbnails);
+    assert!(!all_action_state.deleting_all_attachments);
+
+    let mut clear_thumbnail_progress = Vec::new();
+    let overview = catalog
+        .apply_cleanup_category_action("all", "clear_keep_thumbnail", |progress| {
+            clear_thumbnail_progress.push(progress);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        clear_thumbnail_progress.last().unwrap().processed_records,
+        3
+    );
+    assert_eq!(overview.manual_marked_count, 0);
+    assert!(
+        !catalog
+            .cleanup_category_action_state("all")
+            .unwrap()
+            .keeping_all_thumbnails
+    );
 
     let mut delete_progress = Vec::new();
     let overview = catalog
@@ -1189,11 +1211,37 @@ fn applies_category_actions_to_individual_group_and_community_files_with_progres
         })
         .unwrap();
     assert_eq!(delete_progress.first().unwrap().processed_records, 0);
-    assert_eq!(delete_progress.last().unwrap().processed_records, 1);
-    assert_eq!(delete_progress.last().unwrap().total_records, 1);
-    assert_eq!(overview.manual_marked_count, 4);
+    assert_eq!(delete_progress.last().unwrap().processed_records, 2);
+    assert_eq!(delete_progress.last().unwrap().total_records, 2);
+    assert_eq!(overview.manual_marked_count, 2);
+    assert!(
+        catalog
+            .cleanup_category_action_state("community")
+            .unwrap()
+            .deleting_all_attachments
+    );
+
+    let mut clear_attachment_progress = Vec::new();
+    let overview = catalog
+        .apply_cleanup_category_action("community", "clear_delete_all", |progress| {
+            clear_attachment_progress.push(progress);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        clear_attachment_progress.last().unwrap().processed_records,
+        2
+    );
+    assert_eq!(overview.manual_marked_count, 0);
+    assert!(
+        !catalog
+            .cleanup_category_action_state("community")
+            .unwrap()
+            .deleting_all_attachments
+    );
 
     let community_chats = square_database.all_chats_for_cleanup().unwrap();
+    catalog.replace_chat_index(&community_chats).unwrap();
     let mut chat_progress = Vec::new();
     catalog
         .set_chats_removal_planned_reporting(&community_chats, true, "selected", |progress| {
@@ -1214,6 +1262,35 @@ fn applies_category_actions_to_individual_group_and_community_files_with_progres
             .unwrap()
             .planned_chats,
         1
+    );
+    let community_action_state = catalog.cleanup_category_action_state("community").unwrap();
+    assert!(community_action_state.deleting_all_chats);
+    assert_eq!(community_action_state.chat_count, 1);
+
+    let mut clear_chat_progress = Vec::new();
+    catalog
+        .set_chats_removal_planned_reporting(&community_chats, false, "selected", |progress| {
+            clear_chat_progress.push(progress);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        clear_chat_progress.first().unwrap().phase,
+        "取消聊天室清理計畫"
+    );
+    assert_eq!(clear_chat_progress.last().unwrap().processed_records, 1);
+    assert!(
+        !catalog
+            .cleanup_category_action_state("community")
+            .unwrap()
+            .deleting_all_chats
+    );
+    assert_eq!(
+        catalog
+            .advanced_cleanup_report(0, 0, true, 0, 0, 0)
+            .unwrap()
+            .planned_chats,
+        0
     );
 }
 
@@ -1279,6 +1356,27 @@ fn bulk_chat_removal_reports_staged_progress_without_repeated_attachment_scans()
             .unwrap()
             .planned_chats,
         1_001
+    );
+
+    let mut clear_progress = Vec::new();
+    catalog
+        .set_chats_removal_planned_reporting(&chats, false, "selected", |item| {
+            clear_progress.push(item);
+            Ok(())
+        })
+        .unwrap();
+    let clear_chat_progress = clear_progress
+        .iter()
+        .filter(|item| item.phase == "取消聊天室清理計畫")
+        .map(|item| item.processed_records)
+        .collect::<Vec<_>>();
+    assert_eq!(clear_chat_progress, vec![0, 500, 1_000, 1_001]);
+    assert_eq!(
+        catalog
+            .advanced_cleanup_report(0, 0, true, 0, 0, 0)
+            .unwrap()
+            .planned_chats,
+        0
     );
 }
 

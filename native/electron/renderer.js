@@ -44,6 +44,7 @@ let confirmationModalResolver = null;
 let operationModalTrigger = null;
 let cleanupPage = null;
 let cleanupOverview = null;
+let cleanupCategoryActionState = null;
 let cleanupPlanNotice = "";
 let cleanupPreflight = null;
 let cleanupPlanPreviews = null;
@@ -356,6 +357,7 @@ function returnToWelcome() {
 function invalidateCleanupInsights() {
   cleanupPreflight = null;
   cleanupPlanPreviews = null;
+  cleanupCategoryActionState = null;
 }
 
 function cleanupPlanDescription(overview) {
@@ -420,6 +422,7 @@ function resetAfterCandidateBuild() {
   duplicateMembers.clear();
   cleanupPage = null;
   cleanupOverview = null;
+  cleanupCategoryActionState = null;
   invalidateCleanupInsights();
   cleanupReloadPending = false;
   disposeCleanupAlbum();
@@ -638,6 +641,7 @@ async function runCleanupMutation(options, task) {
     throw new Error("已有資料庫操作正在進行，請等待目前操作完成。");
   }
   cleanupMutationInProgress = true;
+  renderCategoryBulkActions();
   showOperationModal(options.title, options.message);
   await waitForUiPaint();
   try {
@@ -1046,6 +1050,7 @@ async function openSource(kind) {
     disposeCleanupAlbum();
     cleanupReloadPending = false;
     cleanupPage = cleanupOverview = null;
+    cleanupCategoryActionState = null;
     cleanupPlanNotice = "";
     invalidateCleanupInsights();
     Object.assign(cleanupState, {
@@ -2072,6 +2077,7 @@ async function scanCatalog(options) {
     cleanupState.page = 1;
     cleanupState.groupKey = null;
     cleanupPage = cleanupOverview = null;
+    cleanupCategoryActionState = null;
     invalidateCleanupInsights();
     await loadCleanupPage();
     setCandidateBuildDisabled(false);
@@ -2124,16 +2130,36 @@ async function loadCleanupPage(options) {
   syncCleanupPageInput();
   elements.cleanupList.setAttribute("aria-busy", "true");
   try {
+    const requestedCategory = cleanupState.category;
+    const supportsCategoryActions = [
+      "all",
+      "individual",
+      "group",
+      "community",
+      "unreferenced",
+      "unconfirmed"
+    ].includes(requestedCategory);
+    const actionStateRequest = supportsCategoryActions &&
+      cleanupCategoryActionState?.category !== requestedCategory
+      ? provider.cleanupCategoryActionState(requestedCategory)
+      : supportsCategoryActions
+        ? Promise.resolve(cleanupCategoryActionState)
+      : Promise.resolve(null);
     let page;
     if (cleanupOverview) {
-      page = await provider.listCleanupGroups(cleanupOptions());
+      [page, cleanupCategoryActionState] = await Promise.all([
+        provider.listCleanupGroups(cleanupOptions()),
+        actionStateRequest
+      ]);
     } else {
-      const [overview, loadedPage] = await Promise.all([
+      const [overview, loadedPage, actionState] = await Promise.all([
         provider.cleanupOverview(),
-        provider.listCleanupGroups(cleanupOptions())
+        provider.listCleanupGroups(cleanupOptions()),
+        actionStateRequest
       ]);
       cleanupOverview = overview;
       page = loadedPage;
+      cleanupCategoryActionState = actionState;
     }
     const [preflight, previews] = await Promise.all([
       cleanupPreflight || provider.cleanupPreflight({
@@ -2390,17 +2416,66 @@ function renderCategoryBulkActions() {
   elements.categoryBulkActions.classList.toggle("hidden", !supported);
   if (!supported) return;
   const label = categoryActionLabel(category);
+  const actionState = cleanupCategoryActionState?.category === category
+    ? cleanupCategoryActionState
+    : null;
+  const keepingAllThumbnails = Boolean(actionState?.keepingAllThumbnails);
+  const deletingAllAttachments = Boolean(actionState?.deletingAllAttachments);
+  const deletingAllChats = Boolean(actionState?.deletingAllChats);
+  const activeActions = [
+    keepingAllThumbnails && "只保留縮圖",
+    deletingAllAttachments && "刪除所有附件",
+    deletingAllChats && "刪除所有聊天室"
+  ].filter(Boolean);
   elements.categoryBulkTitle.textContent = `${label}快速設定`;
-  elements.categoryBulkDescription.textContent = chatBacked
-    ? `可一次處理整個${label}；刪除聊天室需先開啟進階模式。`
-    : `${label}沒有可靠的聊天室歸屬，但可一次標記刪除這個分類的所有附件。`;
+  elements.categoryBulkDescription.textContent = !actionState
+    ? "正在確認目前的批次設定…"
+    : activeActions.length
+      ? `已套用：${activeActions.join("、")}；按相同按鈕即可批量取消。`
+      : chatBacked
+        ? `可一次處理整個${label}；刪除聊天室需先開啟進階模式。`
+        : `${label}沒有可靠的聊天室歸屬，但可一次標記刪除這個分類的所有附件。`;
   elements.categoryKeepThumbnails.classList.toggle("hidden", !chatBacked);
   elements.categoryDeleteChats.classList.toggle("hidden", !chatBacked);
-  elements.categoryKeepThumbnails.disabled = !provider || cleanupMutationInProgress;
-  elements.categoryDeleteAttachments.disabled = !provider || cleanupMutationInProgress;
-  elements.categoryDeleteChats.disabled = !provider || cleanupMutationInProgress || !advancedMode;
+  elements.categoryKeepThumbnails.textContent = keepingAllThumbnails
+    ? "取消全部只保留縮圖"
+    : "全部只保留縮圖";
+  elements.categoryDeleteAttachments.textContent = deletingAllAttachments
+    ? "取消刪除分類所有附件"
+    : "刪除分類所有附件";
+  elements.categoryDeleteChats.textContent = deletingAllChats
+    ? "取消刪除分類所有聊天室"
+    : "刪除分類所有聊天室";
+  elements.categoryKeepThumbnails.setAttribute("aria-pressed", String(keepingAllThumbnails));
+  elements.categoryDeleteAttachments.setAttribute("aria-pressed", String(deletingAllAttachments));
+  elements.categoryDeleteChats.setAttribute("aria-pressed", String(deletingAllChats));
+  elements.categoryDeleteAttachments.classList.toggle("danger-button", !deletingAllAttachments);
+  elements.categoryDeleteAttachments.classList.toggle("secondary-button", deletingAllAttachments);
+  elements.categoryDeleteChats.classList.toggle("danger-button", !deletingAllChats);
+  elements.categoryDeleteChats.classList.toggle("secondary-button", deletingAllChats);
+  elements.categoryKeepThumbnails.disabled = !provider ||
+    !actionState ||
+    cleanupMutationInProgress ||
+    (!keepingAllThumbnails && !Number(actionState.thumbnailCandidateCount));
+  elements.categoryDeleteAttachments.disabled = !provider ||
+    !actionState ||
+    cleanupMutationInProgress ||
+    (!deletingAllAttachments && !Number(actionState.attachmentCount));
+  elements.categoryDeleteChats.disabled = !provider ||
+    !actionState ||
+    cleanupMutationInProgress ||
+    !advancedMode ||
+    (!deletingAllChats && !Number(actionState.chatCount));
+  elements.categoryKeepThumbnails.title = keepingAllThumbnails
+    ? `取消${label}目前的只保留縮圖手動標記`
+    : `將${label}全部設定為只保留縮圖`;
+  elements.categoryDeleteAttachments.title = deletingAllAttachments
+    ? `取消${label}目前的所有手動附件刪除標記`
+    : `將${label}的所有附件加入清理計畫`;
   elements.categoryDeleteChats.title = advancedMode
-    ? `將${label}的所有聊天室加入清理計畫`
+    ? deletingAllChats
+      ? `取消${label}所有聊天室的刪除計畫`
+      : `將${label}的所有聊天室加入清理計畫`
     : "請先開啟進階模式，才能刪除整個聊天室";
 }
 
@@ -3198,7 +3273,7 @@ async function applyGroupAction(groupKey, action, button) {
       successMessage: action === "keep_thumbnail" ? "只保留縮圖設定已完成。" : "聊天室附件標記已更新。"
     }, async () => {
       cleanupOverview = await provider.applyCleanupGroupAction(groupKey, action);
-      cleanupPreflight = null;
+      invalidateCleanupInsights();
       await loadCleanupPage({ verifySource: false });
       void refreshAdvancedPlanSummary();
     });
@@ -3215,31 +3290,47 @@ async function applyCategoryKeepThumbnails() {
   const category = cleanupState.category;
   if (!provider || !["all", "individual", "group", "community"].includes(category)) return;
   const label = categoryActionLabel(category);
+  const cancelling = Boolean(
+    cleanupCategoryActionState?.category === category &&
+    cleanupCategoryActionState.keepingAllThumbnails
+  );
   if (!await requestConfirmation({
-    title: `將${label}只保留縮圖？`,
-    message:
-      `要一次將${label}設定為只保留縮圖嗎？\n\n` +
-      "只會標記具有已辨識、非空縮圖的圖片原檔；縮圖、PDF、影片、無縮圖及無法確認的附件都會保留。已整個排入清理的聊天室不會變更。",
-    confirmLabel: "全部只保留縮圖",
-    danger: true
+    title: cancelling ? `取消${label}只保留縮圖？` : `將${label}只保留縮圖？`,
+    message: cancelling
+      ? `要批量取消${label}目前的只保留縮圖設定嗎？\n\n` +
+        "只會清除這個分類內相關圖片原檔的手動標記；安全自動標記及聊天室刪除計畫會保留。"
+      : `要一次將${label}設定為只保留縮圖嗎？\n\n` +
+        "只會標記具有已辨識、非空縮圖的圖片原檔；縮圖、PDF、影片、無縮圖及無法確認的附件都會保留。已整個排入清理的聊天室不會變更。",
+    confirmLabel: cancelling ? "取消全部只保留縮圖" : "全部只保留縮圖",
+    danger: !cancelling
   })) return;
   try {
     cleanupOverview = await runCleanupMutation({
-      title: `正在設定${label}`,
+      title: cancelling ? `正在取消${label}只保留縮圖` : `正在設定${label}`,
       message: "正在分批寫入清理計畫，請勿重複操作或關閉此視窗。",
-      successMessage: `${label}的只保留縮圖設定已完成。`
+      successMessage: cancelling
+        ? `${label}的只保留縮圖設定已批量取消。`
+        : `${label}的只保留縮圖設定已完成。`
     }, async () => {
-      const overview = await provider.applyCleanupCategoryAction(category, "keep_thumbnail");
+      const overview = await provider.applyCleanupCategoryAction(
+        category,
+        cancelling ? "clear_keep_thumbnail" : "keep_thumbnail"
+      );
       cleanupPage = null;
       cleanupState.page = 1;
       cleanupState.groupKey = null;
-      cleanupPreflight = null;
+      invalidateCleanupInsights();
       cleanupOverview = overview;
       await loadCleanupPage({ verifySource: false });
       void refreshAdvancedPlanSummary();
       return cleanupOverview;
     });
-    setStatus(`已將${label}設定為只保留縮圖。`, false);
+    setStatus(
+      cancelling
+        ? `已批量取消${label}的只保留縮圖設定。`
+        : `已將${label}設定為只保留縮圖。`,
+      false
+    );
   } catch (error) {
     reportCleanupMutationError(error);
   } finally {
@@ -3258,31 +3349,47 @@ async function deleteCategoryAttachments() {
     "unconfirmed"
   ].includes(category)) return;
   const label = categoryActionLabel(category);
+  const cancelling = Boolean(
+    cleanupCategoryActionState?.category === category &&
+    cleanupCategoryActionState.deletingAllAttachments
+  );
   if (!await requestConfirmation({
-    title: `刪除${label}的所有附件？`,
-    message:
-      `要將${label}內的所有附件加入清理計畫嗎？\n\n` +
-      "這會包含原圖、縮圖、影片、PDF 與其他附件，且不受上方附件類型篩選影響；原始備份不會被修改。",
-    confirmLabel: "刪除所有附件",
-    danger: true
+    title: cancelling ? `取消刪除${label}的所有附件？` : `刪除${label}的所有附件？`,
+    message: cancelling
+      ? `要批量取消${label}目前的所有手動附件刪除標記嗎？\n\n` +
+        "安全自動標記及聊天室刪除計畫會保留。"
+      : `要將${label}內的所有附件加入清理計畫嗎？\n\n` +
+        "這會包含原圖、縮圖、影片、PDF 與其他附件，且不受上方附件類型篩選影響；原始備份不會被修改。",
+    confirmLabel: cancelling ? "取消刪除所有附件" : "刪除所有附件",
+    danger: !cancelling
   })) return;
   try {
     cleanupOverview = await runCleanupMutation({
-      title: `正在標記${label}附件`,
+      title: cancelling ? `正在取消${label}附件刪除` : `正在標記${label}附件`,
       message: "正在分批寫入整個分類的附件清理計畫，請勿重複操作或關閉此視窗。",
-      successMessage: `${label}的所有附件已加入清理計畫。`
+      successMessage: cancelling
+        ? `${label}的所有手動附件刪除標記已取消。`
+        : `${label}的所有附件已加入清理計畫。`
     }, async () => {
-      const overview = await provider.applyCleanupCategoryAction(category, "delete_all");
+      const overview = await provider.applyCleanupCategoryAction(
+        category,
+        cancelling ? "clear_delete_all" : "delete_all"
+      );
       cleanupPage = null;
       cleanupState.page = 1;
       cleanupState.groupKey = null;
-      cleanupPreflight = null;
+      invalidateCleanupInsights();
       cleanupOverview = overview;
       await loadCleanupPage({ verifySource: false });
       void refreshAdvancedPlanSummary();
       return cleanupOverview;
     });
-    setStatus(`已將${label}的所有附件加入清理計畫。`, false);
+    setStatus(
+      cancelling
+        ? `已批量取消${label}的所有手動附件刪除標記。`
+        : `已將${label}的所有附件加入清理計畫。`,
+      false
+    );
   } catch (error) {
     reportCleanupMutationError(error);
   } finally {
@@ -3296,21 +3403,29 @@ async function deleteCategoryChats() {
     return;
   }
   const label = categoryActionLabel(category);
+  const cancelling = Boolean(
+    cleanupCategoryActionState?.category === category &&
+    cleanupCategoryActionState.deletingAllChats
+  );
   if (!await requestConfirmation({
-    title: `刪除${label}的所有聊天室？`,
-    message:
-      `要將${label}的所有聊天室、全部訊息與其附件加入清理計畫嗎？\n\n` +
-      "這是整個聊天室層級的操作；原始備份不會被修改，但建立出的瘦身檔將不包含這些聊天室。",
-    confirmLabel: "刪除所有聊天室",
-    danger: true
+    title: cancelling ? `取消刪除${label}的所有聊天室？` : `刪除${label}的所有聊天室？`,
+    message: cancelling
+      ? `要批量取消${label}目前的所有聊天室刪除計畫嗎？\n\n` +
+        "聊天室、訊息與其附件會重新保留在建立出的瘦身檔。"
+      : `要將${label}的所有聊天室、全部訊息與其附件加入清理計畫嗎？\n\n` +
+        "這是整個聊天室層級的操作；原始備份不會被修改，但建立出的瘦身檔將不包含這些聊天室。",
+    confirmLabel: cancelling ? "取消刪除所有聊天室" : "刪除所有聊天室",
+    danger: !cancelling
   })) return;
   try {
     await runCleanupMutation({
-      title: `正在標記${label}聊天室`,
-      message: "正在逐一更新聊天室、訊息與附件清理狀態，請勿重複操作或關閉此視窗。",
-      successMessage: `${label}的所有聊天室已加入清理計畫。`
+      title: cancelling ? `正在取消${label}聊天室刪除` : `正在標記${label}聊天室`,
+      message: "正在分批更新聊天室、訊息與附件清理狀態，請勿重複操作或關閉此視窗。",
+      successMessage: cancelling
+        ? `${label}的所有聊天室刪除計畫已取消。`
+        : `${label}的所有聊天室已加入清理計畫。`
     }, async () => {
-      const report = await provider.setCleanupCategoryChatsRemovalPlanned(category, true);
+      const report = await provider.setCleanupCategoryChatsRemovalPlanned(category, !cancelling);
       renderAdvancedReport(report);
       cleanupPage = cleanupOverview = null;
       cleanupState.page = 1;
@@ -3318,7 +3433,12 @@ async function deleteCategoryChats() {
       invalidateCleanupInsights();
       await Promise.all([loadChats(null), loadCleanupPage()]);
     });
-    setStatus(`已將${label}的所有聊天室加入清理計畫。`, false);
+    setStatus(
+      cancelling
+        ? `已批量取消${label}的所有聊天室刪除計畫。`
+        : `已將${label}的所有聊天室加入清理計畫。`,
+      false
+    );
   } catch (error) {
     reportCleanupMutationError(error);
   } finally {
@@ -3340,7 +3460,7 @@ async function applySafeAttachmentCleanup(message) {
       cleanupOverview = null;
       cleanupState.page = 1;
       cleanupState.groupKey = null;
-      cleanupPreflight = null;
+      invalidateCleanupInsights();
       await loadCleanupPage({ verifySource: false });
       void refreshAdvancedPlanSummary();
     });
@@ -3393,7 +3513,7 @@ async function clearManualAttachmentPlan() {
       cleanupOverview = null;
       cleanupState.page = 1;
       cleanupState.groupKey = null;
-      cleanupPreflight = null;
+      invalidateCleanupInsights();
       await loadCleanupPage({ verifySource: false });
     });
     setStatus("已清除手動附件標記；自動與聊天室計畫仍保留。", false);
@@ -3682,6 +3802,7 @@ async function buildCandidate() {
 function updateCleanupFilter() {
   cleanupState.kind = elements.cleanupKind.value;
   cleanupState.category = elements.cleanupCategory.value;
+  cleanupCategoryActionState = null;
   if (cleanupState.category === "no_attachments") {
     cleanupState.kind = "all";
     elements.cleanupKind.value = "all";
@@ -3844,6 +3965,7 @@ elements.categorySummary.addEventListener("click", (event) => {
   const button = event.target.closest("button[data-category]");
   if (!button) return;
   cleanupState.category = button.dataset.category || "all";
+  cleanupCategoryActionState = null;
   cleanupState.groupKey = null;
   cleanupState.page = 1;
   elements.cleanupCategory.value = cleanupState.category;
