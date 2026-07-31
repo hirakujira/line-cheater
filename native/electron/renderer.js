@@ -25,6 +25,7 @@ let selectedSourceKind = null;
 let sourceGeneration = 0;
 let messageRenderGeneration = 0;
 let packageInProgress = false;
+let cleanupMutationInProgress = false;
 let cancelInProgress = false;
 let restoreChecklistResolve = null;
 let duplicateLoading = false;
@@ -40,6 +41,7 @@ const duplicateMembers = new Map();
 let imageModalTrigger = null;
 let confirmationModalTrigger = null;
 let confirmationModalResolver = null;
+let operationModalTrigger = null;
 let cleanupPage = null;
 let cleanupOverview = null;
 let cleanupPlanNotice = "";
@@ -145,6 +147,12 @@ const elements = {
   planSafeAttachmentCleanup: document.querySelector("#plan-safe-attachment-cleanup"),
   clearManualAttachmentPlan: document.querySelector("#clear-manual-attachment-plan"),
   categorySummary: document.querySelector("#category-summary"),
+  categoryBulkActions: document.querySelector("#category-bulk-actions"),
+  categoryBulkTitle: document.querySelector("#category-bulk-title"),
+  categoryBulkDescription: document.querySelector("#category-bulk-description"),
+  categoryKeepThumbnails: document.querySelector("#category-keep-thumbnails"),
+  categoryDeleteAttachments: document.querySelector("#category-delete-attachments"),
+  categoryDeleteChats: document.querySelector("#category-delete-chats"),
   cleanupResultInfo: document.querySelector("#cleanup-result-info"),
   cleanupList: document.querySelector("#cleanup-list"),
   cleanupPrev: document.querySelector("#cleanup-prev"),
@@ -176,6 +184,13 @@ const elements = {
   packageModalProgressLabel: document.querySelector("#package-modal-progress-label"),
   packageModalCancel: document.querySelector("#package-modal-cancel"),
   packageModalClose: document.querySelector("#package-modal-close"),
+  operationModal: document.querySelector("#operation-modal"),
+  operationModalCard: document.querySelector("#operation-modal .package-modal-card"),
+  operationModalTitle: document.querySelector("#operation-modal-title"),
+  operationModalMessage: document.querySelector("#operation-modal-message"),
+  operationModalProgress: document.querySelector("#operation-modal-progress"),
+  operationModalProgressLabel: document.querySelector("#operation-modal-progress-label"),
+  operationModalClose: document.querySelector("#operation-modal-close"),
   restoreChecklistModal: document.querySelector("#restore-checklist-modal"),
   restoreChecklistCard: document.querySelector("#restore-checklist-modal .restore-checklist-card"),
   restoreCheckOriginal: document.querySelector("#restore-check-original"),
@@ -204,6 +219,10 @@ const categoryLabels = {
   unconfirmed: "無法確認",
   no_attachments: "沒有附件的對話"
 };
+
+function categoryActionLabel(category) {
+  return category === "all" ? "全部分類" : categoryLabels[category] || category;
+}
 
 const cleanupPlanProfiles = {
   conservative: {
@@ -429,6 +448,7 @@ function syncModalBusy() {
   const modalStates = [
     [elements.loadModal, "load-modal-open"],
     [elements.packageModal, "package-modal-open"],
+    [elements.operationModal, "operation-modal-open"],
     [elements.restoreChecklistModal, "restore-checklist-open"],
     [elements.imageModal, "image-modal-open"],
     [elements.confirmationModal, "confirmation-modal-open"]
@@ -559,6 +579,75 @@ function closePackageModal() {
   elements.packageModal.classList.add("hidden");
   elements.packageModal.setAttribute("aria-hidden", "true");
   setModalBusy(false, "package-modal-open");
+}
+
+function showOperationModal(title, message) {
+  operationModalTrigger = document.activeElement;
+  elements.operationModal.classList.remove("hidden", "is-success", "is-error");
+  elements.operationModal.classList.add("is-processing", "is-indeterminate");
+  elements.operationModal.setAttribute("aria-hidden", "false");
+  elements.operationModalTitle.textContent = title;
+  elements.operationModalMessage.textContent = message;
+  elements.operationModalClose.classList.add("hidden");
+  updateOperationModalProgress(0, 0, "準備中");
+  syncModalBusy();
+  window.requestAnimationFrame(() => elements.operationModalCard.focus());
+}
+
+function updateOperationModalProgress(processed, total, phase) {
+  const safeTotal = Math.max(0, Number(total) || 0);
+  const safeProcessed = Math.max(0, Math.min(Number(processed) || 0, safeTotal || Infinity));
+  const progress = safeTotal ? Math.round((safeProcessed / safeTotal) * 100) : 0;
+  elements.operationModal.classList.toggle("is-indeterminate", safeTotal === 0);
+  elements.operationModalProgress.style.width = safeTotal ? `${progress}%` : "34%";
+  elements.operationModalProgress.setAttribute("aria-valuenow", String(progress));
+  elements.operationModalProgressLabel.textContent = safeTotal
+    ? `${phase || "寫入中"} ${safeProcessed.toLocaleString()} / ${safeTotal.toLocaleString()} 筆資料 · ${progress}%`
+    : `${phase || "準備中"}…`;
+}
+
+function completeOperationModal(error, message) {
+  elements.operationModal.classList.remove("is-processing", "is-indeterminate", "is-success", "is-error");
+  elements.operationModal.classList.add(error ? "is-error" : "is-success");
+  elements.operationModalTitle.textContent = error ? "操作失敗" : "操作完成";
+  elements.operationModalMessage.textContent = message;
+  if (error) {
+    elements.operationModalClose.classList.remove("hidden");
+    elements.operationModalClose.focus();
+  }
+}
+
+function closeOperationModal() {
+  if (cleanupMutationInProgress) return;
+  elements.operationModal.classList.add("hidden");
+  elements.operationModal.setAttribute("aria-hidden", "true");
+  syncModalBusy();
+  if (operationModalTrigger instanceof HTMLElement && operationModalTrigger.isConnected) {
+    operationModalTrigger.focus();
+  }
+  operationModalTrigger = null;
+}
+
+async function runCleanupMutation(options, task) {
+  if (cleanupMutationInProgress) {
+    throw new Error("已有資料庫操作正在進行，請等待目前操作完成。");
+  }
+  cleanupMutationInProgress = true;
+  showOperationModal(options.title, options.message);
+  await waitForUiPaint();
+  try {
+    const result = await task();
+    updateOperationModalProgress(1, 1, "完成");
+    completeOperationModal(false, options.successMessage || "資料庫更新已完成。");
+    await new Promise((resolve) => window.setTimeout(resolve, 180));
+    cleanupMutationInProgress = false;
+    closeOperationModal();
+    return result;
+  } catch (error) {
+    cleanupMutationInProgress = false;
+    completeOperationModal(true, error.message);
+    throw error;
+  }
 }
 
 function closeRestoreChecklist(confirmed) {
@@ -1840,12 +1929,18 @@ async function changeDuplicateMark(checkbox) {
   const members = duplicateMembers.get(sha256) || [];
   checkbox.disabled = true;
   try {
-    await provider.setAttachmentMarked(path, checkbox.checked);
-    const member = members.find((item) => item.path === path);
-    if (member) member.markedForRemoval = checkbox.checked;
-    cleanupOverview = null;
-    invalidateCleanupInsights();
-    await loadDuplicateGroups(duplicatePageNumber);
+    await runCleanupMutation({
+      title: checkbox.checked ? "正在標記重複副本" : "正在取消重複副本標記",
+      message: "正在寫入附件清理狀態，請勿重複操作。",
+      successMessage: checkbox.checked ? "重複副本已加入清理計畫。" : "重複副本已從清理計畫移除。"
+    }, async () => {
+      await provider.setAttachmentMarked(path, checkbox.checked);
+      const member = members.find((item) => item.path === path);
+      if (member) member.markedForRemoval = checkbox.checked;
+      cleanupOverview = null;
+      invalidateCleanupInsights();
+      await loadDuplicateGroups(duplicatePageNumber);
+    });
     setStatus(checkbox.checked ? "已標記重複副本。" : "已取消標記重複副本。", false);
   } catch (error) {
     checkbox.checked = !checkbox.checked;
@@ -2182,6 +2277,35 @@ function renderCleanupOverview() {
     fragment.append(button);
   }
   elements.categorySummary.replaceChildren(fragment);
+  renderCategoryBulkActions();
+}
+
+function renderCategoryBulkActions() {
+  const category = cleanupState.category;
+  const supported = [
+    "all",
+    "individual",
+    "group",
+    "community",
+    "unreferenced",
+    "unconfirmed"
+  ].includes(category);
+  const chatBacked = ["all", "individual", "group", "community"].includes(category);
+  elements.categoryBulkActions.classList.toggle("hidden", !supported);
+  if (!supported) return;
+  const label = categoryActionLabel(category);
+  elements.categoryBulkTitle.textContent = `${label}快速設定`;
+  elements.categoryBulkDescription.textContent = chatBacked
+    ? `可一次處理整個${label}；刪除聊天室需先開啟進階模式。`
+    : `${label}沒有可靠的聊天室歸屬，但可一次標記刪除這個分類的所有附件。`;
+  elements.categoryKeepThumbnails.classList.toggle("hidden", !chatBacked);
+  elements.categoryDeleteChats.classList.toggle("hidden", !chatBacked);
+  elements.categoryKeepThumbnails.disabled = !provider || cleanupMutationInProgress;
+  elements.categoryDeleteAttachments.disabled = !provider || cleanupMutationInProgress;
+  elements.categoryDeleteChats.disabled = !provider || cleanupMutationInProgress || !advancedMode;
+  elements.categoryDeleteChats.title = advancedMode
+    ? `將${label}的所有聊天室加入清理計畫`
+    : "請先開啟進階模式，才能刪除整個聊天室";
 }
 
 function renderCleanupPage() {
@@ -2332,6 +2456,18 @@ function renderCleanupGroup(group) {
       : "只標記已有非空縮圖的圖片原檔；PDF、影片與無縮圖附件會保留";
     keepThumbnail.textContent = group.keepingThumbnails ? "還原原始圖片" : "只保留縮圖";
     actions.append(keepThumbnail);
+  } else if (canOpen && group.chatKind === "community") {
+    const unavailableThumbnail = document.createElement("button");
+    unavailableThumbnail.type = "button";
+    unavailableThumbnail.className = "cleanup-group-action";
+    unavailableThumbnail.disabled = true;
+    unavailableThumbnail.textContent = group.hasThumbnail
+      ? "沒有可配對原圖"
+      : "沒有可保留縮圖";
+    unavailableThumbnail.title = group.hasThumbnail
+      ? "備份內只有縮圖，或原圖沒有相同的訊息 ID；不會冒險刪除未確認的原圖"
+      : "這個社群沒有非空縮圖可保留";
+    actions.append(unavailableThumbnail);
   }
   if (canOpen) {
     const view = document.createElement("button");
@@ -2930,16 +3066,22 @@ async function changeAttachmentMark(checkbox) {
   const path = checkbox.dataset.attachmentPath;
   checkbox.disabled = true;
   try {
-    await provider.setAttachmentMarked(path, checkbox.checked);
-    invalidateCleanupInsights();
-    if (cleanupState.kind === "marked") {
-      cleanupOverview = null;
-      await loadCleanupPage();
-    } else {
-      cleanupOverview = await provider.cleanupOverview();
-      renderCleanupOverview();
-    }
-    await refreshAdvancedPlanSummary();
+    await runCleanupMutation({
+      title: checkbox.checked ? "正在標記附件" : "正在取消附件標記",
+      message: "正在寫入附件清理狀態，請勿重複操作。",
+      successMessage: checkbox.checked ? "附件已加入清理計畫。" : "附件已從清理計畫移除。"
+    }, async () => {
+      await provider.setAttachmentMarked(path, checkbox.checked);
+      invalidateCleanupInsights();
+      if (cleanupState.kind === "marked") {
+        cleanupOverview = null;
+        await loadCleanupPage();
+      } else {
+        cleanupOverview = await provider.cleanupOverview();
+        renderCleanupOverview();
+      }
+      await refreshAdvancedPlanSummary();
+    });
   } catch (error) {
     checkbox.checked = !checkbox.checked;
     setStatus(error.message, true);
@@ -2954,10 +3096,16 @@ async function applyGroupAction(groupKey, action, button) {
   button.textContent = "套用中…";
   setStatus(action === "keep_thumbnail" ? "正在套用保留縮圖…" : "正在更新聊天室附件標記…", false);
   try {
-    cleanupOverview = await provider.applyCleanupGroupAction(groupKey, action);
-    cleanupPreflight = null;
-    await loadCleanupPage({ verifySource: false });
-    void refreshAdvancedPlanSummary();
+    await runCleanupMutation({
+      title: action === "keep_thumbnail" ? "正在設定只保留縮圖" : "正在更新聊天室附件",
+      message: "正在分批寫入清理計畫，請勿重複操作或關閉此視窗。",
+      successMessage: action === "keep_thumbnail" ? "只保留縮圖設定已完成。" : "聊天室附件標記已更新。"
+    }, async () => {
+      cleanupOverview = await provider.applyCleanupGroupAction(groupKey, action);
+      cleanupPreflight = null;
+      await loadCleanupPage({ verifySource: false });
+      void refreshAdvancedPlanSummary();
+    });
     setStatus(action === "keep_thumbnail" ? "已套用保留縮圖。" : "已更新聊天室附件標記。", false);
   } catch (error) {
     setStatus(error.message, true);
@@ -2967,18 +3115,139 @@ async function applyGroupAction(groupKey, action, button) {
   }
 }
 
+async function applyCategoryKeepThumbnails() {
+  const category = cleanupState.category;
+  if (!provider || !["all", "individual", "group", "community"].includes(category)) return;
+  const label = categoryActionLabel(category);
+  if (!await requestConfirmation({
+    title: `將${label}只保留縮圖？`,
+    message:
+      `要一次將${label}設定為只保留縮圖嗎？\n\n` +
+      "只會標記具有已辨識、非空縮圖的圖片原檔；縮圖、PDF、影片、無縮圖及無法確認的附件都會保留。已整個排入清理的聊天室不會變更。",
+    confirmLabel: "全部只保留縮圖",
+    danger: true
+  })) return;
+  try {
+    cleanupOverview = await runCleanupMutation({
+      title: `正在設定${label}`,
+      message: "正在分批寫入清理計畫，請勿重複操作或關閉此視窗。",
+      successMessage: `${label}的只保留縮圖設定已完成。`
+    }, async () => {
+      const overview = await provider.applyCleanupCategoryAction(category, "keep_thumbnail");
+      cleanupPage = null;
+      cleanupState.page = 1;
+      cleanupState.groupKey = null;
+      cleanupPreflight = null;
+      cleanupOverview = overview;
+      await loadCleanupPage({ verifySource: false });
+      void refreshAdvancedPlanSummary();
+      return cleanupOverview;
+    });
+    setStatus(`已將${label}設定為只保留縮圖。`, false);
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    renderCategoryBulkActions();
+  }
+}
+
+async function deleteCategoryAttachments() {
+  const category = cleanupState.category;
+  if (!provider || ![
+    "all",
+    "individual",
+    "group",
+    "community",
+    "unreferenced",
+    "unconfirmed"
+  ].includes(category)) return;
+  const label = categoryActionLabel(category);
+  if (!await requestConfirmation({
+    title: `刪除${label}的所有附件？`,
+    message:
+      `要將${label}內的所有附件加入清理計畫嗎？\n\n` +
+      "這會包含原圖、縮圖、影片、PDF 與其他附件，且不受上方附件類型篩選影響；原始備份不會被修改。",
+    confirmLabel: "刪除所有附件",
+    danger: true
+  })) return;
+  try {
+    cleanupOverview = await runCleanupMutation({
+      title: `正在標記${label}附件`,
+      message: "正在分批寫入整個分類的附件清理計畫，請勿重複操作或關閉此視窗。",
+      successMessage: `${label}的所有附件已加入清理計畫。`
+    }, async () => {
+      const overview = await provider.applyCleanupCategoryAction(category, "delete_all");
+      cleanupPage = null;
+      cleanupState.page = 1;
+      cleanupState.groupKey = null;
+      cleanupPreflight = null;
+      cleanupOverview = overview;
+      await loadCleanupPage({ verifySource: false });
+      void refreshAdvancedPlanSummary();
+      return cleanupOverview;
+    });
+    setStatus(`已將${label}的所有附件加入清理計畫。`, false);
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    renderCategoryBulkActions();
+  }
+}
+
+async function deleteCategoryChats() {
+  const category = cleanupState.category;
+  if (!provider || !advancedMode || !["all", "individual", "group", "community"].includes(category)) {
+    return;
+  }
+  const label = categoryActionLabel(category);
+  if (!await requestConfirmation({
+    title: `刪除${label}的所有聊天室？`,
+    message:
+      `要將${label}的所有聊天室、全部訊息與其附件加入清理計畫嗎？\n\n` +
+      "這是整個聊天室層級的操作；原始備份不會被修改，但建立出的瘦身檔將不包含這些聊天室。",
+    confirmLabel: "刪除所有聊天室",
+    danger: true
+  })) return;
+  try {
+    await runCleanupMutation({
+      title: `正在標記${label}聊天室`,
+      message: "正在逐一更新聊天室、訊息與附件清理狀態，請勿重複操作或關閉此視窗。",
+      successMessage: `${label}的所有聊天室已加入清理計畫。`
+    }, async () => {
+      const report = await provider.setCleanupCategoryChatsRemovalPlanned(category, true);
+      renderAdvancedReport(report);
+      cleanupPage = cleanupOverview = null;
+      cleanupState.page = 1;
+      cleanupState.groupKey = null;
+      invalidateCleanupInsights();
+      await Promise.all([loadChats(null), loadCleanupPage()]);
+    });
+    setStatus(`已將${label}的所有聊天室加入清理計畫。`, false);
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    renderCategoryBulkActions();
+  }
+}
+
 async function applySafeAttachmentCleanup(message) {
   if (!provider) return;
   elements.planSafeAttachmentCleanup.disabled = true;
   try {
-    await provider.planSafeAttachmentCleanup();
-    cleanupPage = null;
-    cleanupOverview = null;
-    cleanupState.page = 1;
-    cleanupState.groupKey = null;
-    cleanupPreflight = null;
-    await loadCleanupPage({ verifySource: false });
-    void refreshAdvancedPlanSummary();
+    await runCleanupMutation({
+      title: "正在更新安全清理標記",
+      message: "正在分批寫入圖片原檔清理計畫，請勿重複操作。",
+      successMessage: message
+    }, async () => {
+      await provider.planSafeAttachmentCleanup();
+      cleanupPage = null;
+      cleanupOverview = null;
+      cleanupState.page = 1;
+      cleanupState.groupKey = null;
+      cleanupPreflight = null;
+      await loadCleanupPage({ verifySource: false });
+      void refreshAdvancedPlanSummary();
+    });
     setStatus(message, false);
   } catch (error) {
     setStatus(error.message, true);
@@ -3018,13 +3287,19 @@ async function clearManualAttachmentPlan() {
   })) return;
   elements.clearManualAttachmentPlan.disabled = true;
   try {
-    await provider.clearManualAttachmentPlan();
-    cleanupPage = null;
-    cleanupOverview = null;
-    cleanupState.page = 1;
-    cleanupState.groupKey = null;
-    cleanupPreflight = null;
-    await loadCleanupPage({ verifySource: false });
+    await runCleanupMutation({
+      title: "正在清除手動標記",
+      message: "正在分批移除手動附件標記，請勿重複操作。",
+      successMessage: "手動附件標記已清除。"
+    }, async () => {
+      await provider.clearManualAttachmentPlan();
+      cleanupPage = null;
+      cleanupOverview = null;
+      cleanupState.page = 1;
+      cleanupState.groupKey = null;
+      cleanupPreflight = null;
+      await loadCleanupPage({ verifySource: false });
+    });
     setStatus("已清除手動附件標記；自動與聊天室計畫仍保留。", false);
   } catch (error) {
     setStatus(error.message, true);
@@ -3056,6 +3331,7 @@ function setAdvancedMode(enabled) {
   elements.advancedModeState.classList.toggle("enabled", advancedMode);
   elements.advancedLocked.classList.toggle("hidden", advancedMode);
   elements.advancedContent.classList.toggle("hidden", !advancedMode);
+  renderCategoryBulkActions();
   if (cleanupPage) {
     if (cleanupState.groupKey) {
       void loadCleanupPage();
@@ -3131,19 +3407,25 @@ async function setChatRemoval(source, chatPk, title, planned) {
     return;
   }
   try {
-    const report = await provider.setChatRemovalPlanned(source, chatPk, !planned);
-    if (selectedChat &&
-        selectedChat.pk === Number(chatPk) &&
-        (selectedChat.source || "line") === source) {
-      selectedChat.plannedForRemoval = !planned;
-    }
-    renderAdvancedReport(report);
-    cleanupPage = cleanupOverview = null;
-    invalidateCleanupInsights();
-    await Promise.all([
-      loadChats(null),
-      loadCleanupPage()
-    ]);
+    await runCleanupMutation({
+      title: planned ? "正在保留聊天室" : "正在加入聊天室清理計畫",
+      message: "正在更新聊天室、訊息與附件清理狀態，請勿重複操作。",
+      successMessage: planned ? "聊天室已從清理計畫移除。" : "聊天室已加入清理計畫。"
+    }, async () => {
+      const report = await provider.setChatRemovalPlanned(source, chatPk, !planned);
+      if (selectedChat &&
+          selectedChat.pk === Number(chatPk) &&
+          (selectedChat.source || "line") === source) {
+        selectedChat.plannedForRemoval = !planned;
+      }
+      renderAdvancedReport(report);
+      cleanupPage = cleanupOverview = null;
+      invalidateCleanupInsights();
+      await Promise.all([
+        loadChats(null),
+        loadCleanupPage()
+      ]);
+    });
   } catch (error) {
     setStatus(`${action}聊天室失敗：${error.message}`, true);
   }
@@ -3176,10 +3458,16 @@ async function toggleAutomaticCleanup() {
   }
   elements.planAutomaticCleanup.disabled = true;
   try {
-    renderAdvancedReport(await provider.planAutomaticCleanup());
-    cleanupPage = cleanupOverview = null;
-    invalidateCleanupInsights();
-    await Promise.all([loadChats(null), loadCleanupPage()]);
+    await runCleanupMutation({
+      title: planned ? "正在取消自動清理" : "正在套用自動清理",
+      message: "正在更新偵測項目的資料庫清理計畫，請勿重複操作。",
+      successMessage: planned ? "自動偵測項目已取消。" : "自動偵測項目已加入清理計畫。"
+    }, async () => {
+      renderAdvancedReport(await provider.planAutomaticCleanup());
+      cleanupPage = cleanupOverview = null;
+      invalidateCleanupInsights();
+      await Promise.all([loadChats(null), loadCleanupPage()]);
+    });
     setStatus(planned ? "已取消所有自動偵測項目。" : "已將所有偵測項目加入清理計畫。");
   } catch (error) {
     setStatus(error.message, true);
@@ -3301,6 +3589,7 @@ function updateCleanupFilter() {
   elements.cleanupKind.disabled = cleanupState.category === "no_attachments";
   cleanupState.sort = elements.cleanupSort.value;
   cleanupState.page = 1;
+  renderCategoryBulkActions();
   void loadCleanupPage();
 }
 
@@ -3358,6 +3647,7 @@ elements.advancedBuildCandidate.addEventListener("click", () => void buildCandid
 elements.loadModalCancel.addEventListener("click", () => void cancelCurrentOperation("load"));
 elements.packageModalCancel.addEventListener("click", () => void cancelCurrentOperation("package"));
 elements.packageModalClose.addEventListener("click", closePackageModal);
+elements.operationModalClose.addEventListener("click", closeOperationModal);
 elements.restoreCheckOriginal.addEventListener("change", updateRestoreChecklistState);
 elements.restoreCheckTest.addEventListener("change", updateRestoreChecklistState);
 elements.restoreCheckVerify.addEventListener("change", updateRestoreChecklistState);
@@ -3382,6 +3672,7 @@ document.addEventListener("keydown", (event) => {
   const openModal = [
     elements.confirmationModal,
     elements.imageModal,
+    elements.operationModal,
     elements.packageModal,
     elements.loadModal,
     elements.restoreChecklistModal
@@ -3395,6 +3686,7 @@ document.addEventListener("keydown", (event) => {
   if (openModal === elements.confirmationModal) closeConfirmationModal(false);
   else if (openModal === elements.imageModal) closeImageModal();
   else if (openModal === elements.restoreChecklistModal) closeRestoreChecklist(false);
+  else if (openModal === elements.operationModal && !cleanupMutationInProgress) closeOperationModal();
   else if (openModal === elements.packageModal && !packageInProgress) closePackageModal();
 });
 elements.searchForm.addEventListener("submit", async (event) => {
@@ -3427,6 +3719,9 @@ elements.cleanupPlanCards.addEventListener("click", (event) => {
 });
 elements.planSafeAttachmentCleanup.addEventListener("click", () => void toggleSafeAttachmentCleanup());
 elements.clearManualAttachmentPlan.addEventListener("click", () => void clearManualAttachmentPlan());
+elements.categoryKeepThumbnails.addEventListener("click", () => void applyCategoryKeepThumbnails());
+elements.categoryDeleteAttachments.addEventListener("click", () => void deleteCategoryAttachments());
+elements.categoryDeleteChats.addEventListener("click", () => void deleteCategoryChats());
 elements.cleanupSearch.addEventListener("input", () => {
   clearTimeout(cleanupSearchTimer);
   cleanupSearchTimer = setTimeout(() => {
@@ -3448,6 +3743,7 @@ elements.categorySummary.addEventListener("click", (event) => {
   cleanupState.groupKey = null;
   cleanupState.page = 1;
   elements.cleanupCategory.value = cleanupState.category;
+  renderCategoryBulkActions();
   void loadCleanupPage();
 });
 elements.cleanupPageInput.addEventListener("blur", commitCleanupPageInput);
@@ -3551,6 +3847,19 @@ bridge.on("catalogProgress", (event) => {
   }
 });
 bridge.on("catalogContextProgress", (event) => {
+  const repairTotal = Number(event.repairTotalFiles) || 0;
+  if (repairTotal > 0) {
+    const repaired = Math.min(Number(event.repairedFiles) || 0, repairTotal);
+    elements.catalogSummary.textContent =
+      `正在修復原圖關聯：${repaired.toLocaleString()} / ${repairTotal.toLocaleString()} 個附件`;
+    if (!elements.loadModal.classList.contains("hidden")) {
+      updateLoadModalProgress(
+        90 + (repaired / repairTotal) * 3,
+        `正在修復原圖與縮圖關聯…（${repaired.toLocaleString()} / ${repairTotal.toLocaleString()}）`
+      );
+    }
+    return;
+  }
   elements.progress.max = Math.max(event.totalFiles, 1);
   elements.progress.value = event.processedFiles;
   elements.catalogSummary.textContent =
@@ -3564,6 +3873,14 @@ bridge.on("catalogContextProgress", (event) => {
       `正在比對 SQLite…（${event.processedFiles.toLocaleString()} / ${event.totalFiles.toLocaleString()}）`
     );
   }
+});
+bridge.on("cleanupMutationProgress", (event) => {
+  if (elements.operationModal.classList.contains("hidden")) return;
+  updateOperationModalProgress(
+    Number(event.processedRecords) || 0,
+    Number(event.totalRecords) || 0,
+    event.phase || "寫入中"
+  );
 });
 bridge.on("searchIndexProgress", (event) => {
   if (!messageLoading || !activeSearch) return;

@@ -331,6 +331,26 @@ test("exposes separate safe-automatic and manual cleanup controls", () => {
   assert.match(main, /"clearManualAttachmentPlan"/);
 });
 
+test("supports category-wide attachment and chat actions with locked mutation progress", () => {
+  assert.match(html, /id="category-bulk-actions"/);
+  assert.match(html, /id="category-keep-thumbnails"/);
+  assert.match(html, /id="category-delete-attachments"/);
+  assert.match(html, /id="category-delete-chats"/);
+  assert.match(html, /id="operation-modal"[^>]*role="dialog"[^>]*aria-modal="true"/);
+  assert.match(renderer, /provider\.applyCleanupCategoryAction\(category, "keep_thumbnail"\)/);
+  assert.match(renderer, /provider\.applyCleanupCategoryAction\(category, "delete_all"\)/);
+  assert.match(renderer, /provider\.setCleanupCategoryChatsRemovalPlanned\(category, true\)/);
+  assert.match(renderer, /\["all", "individual", "group", "community"\]\.includes\(category\)/);
+  assert.match(renderer, /runCleanupMutation\(/);
+  assert.match(renderer, /bridge\.on\("cleanupMutationProgress"/);
+  assert.match(renderer, /processedRecords/);
+  assert.match(styles, /\.category-bulk-actions/);
+  assert.match(styles, /body\.operation-modal-open/);
+  assert.match(main, /"applyCleanupCategoryAction"/);
+  assert.match(main, /"setCleanupCategoryChatsRemovalPlanned"/);
+  assert.match(preload, /"cleanupMutationProgress"/);
+});
+
 test("uses an accessible shared modal for every confirmation", () => {
   assert.match(html, /id="confirmation-modal" class="confirmation-modal hidden" role="dialog" aria-modal="true"/);
   assert.match(html, /id="confirmation-modal-cancel"/);
@@ -476,6 +496,8 @@ test("offers keep-thumbnail only for thumbnail-backed image originals", () => {
     /PDF、影片與無縮圖附件會保留/
   );
   assert.doesNotMatch(renderer, /group\.hasOriginal && group\.hasThumbnail/);
+  assert.match(renderer, /group\.chatKind === "community"/);
+  assert.match(renderer, /沒有可配對原圖/);
 });
 
 test("lists no-attachment chats only in advanced cleanup mode", () => {

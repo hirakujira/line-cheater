@@ -9,6 +9,7 @@ const eventNames = new Set([
   "searchIndexProgress",
   "catalogProgress",
   "catalogContextProgress",
+  "cleanupMutationProgress",
   "duplicateHashProgress",
   "candidateProgress"
 ]);

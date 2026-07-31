@@ -44,6 +44,8 @@ const allowedMethods = new Set([
   "listCleanupGroups",
   "listCleanupReviews",
   "applyCleanupGroupAction",
+  "applyCleanupCategoryAction",
+  "setCleanupCategoryChatsRemovalPlanned",
   "planSafeAttachmentCleanup",
   "advancedCleanupReport",
   "setChatRemovalPlanned",
@@ -58,7 +60,17 @@ const jobMethods = new Set([
   "scanCatalog",
   "searchMessages",
   "hashDuplicateCandidates",
-  "buildCandidate"
+  "buildCandidate",
+  "setAttachmentMarked",
+  "clearManualAttachmentPlan",
+  "clearAllRemovalPlans",
+  "applyCleanupGroupAction",
+  "applyCleanupCategoryAction",
+  "setCleanupCategoryChatsRemovalPlanned",
+  "planSafeAttachmentCleanup",
+  "setChatRemovalPlanned",
+  "planAutomaticCleanup",
+  "clearAdvancedCleanupPlan"
 ]);
 const assetFiles = new Map([
   ["/assets/icon.png", path.join("assets", "icon.png")],
