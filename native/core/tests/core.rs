@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 use line_backup_native::{
-    AttachmentKind, CandidateOptions, Catalog, ChatCursor, LineDatabase, LineSquareDatabase,
+    AttachmentKind, CandidateOptions, Catalog, Chat, ChatCursor, LineDatabase, LineSquareDatabase,
     MessageCursor, NativeSession, PreparePhase, SourceKind, UnifiedGroupDatabase, build_candidate,
     build_candidate_with_options, inspect_source, line_square_rebuild_required, prepare_source,
     prepare_source_reporting, serve,
@@ -1202,14 +1202,83 @@ fn applies_category_actions_to_individual_group_and_community_files_with_progres
         })
         .unwrap();
     assert_eq!(chat_progress.first().unwrap().processed_records, 0);
-    assert_eq!(chat_progress.last().unwrap().processed_records, 3);
-    assert_eq!(chat_progress.last().unwrap().total_records, 3);
+    assert_eq!(chat_progress.first().unwrap().phase, "整理並寫入聊天室");
+    assert_eq!(chat_progress.last().unwrap().phase, "掃描並寫入聊天室附件");
+    assert_eq!(
+        chat_progress.last().unwrap().processed_records,
+        chat_progress.last().unwrap().total_records
+    );
     assert_eq!(
         catalog
             .advanced_cleanup_report(0, 0, true, 0, 0, 0)
             .unwrap()
             .planned_chats,
         1
+    );
+}
+
+#[test]
+fn bulk_chat_removal_reports_staged_progress_without_repeated_attachment_scans() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let prepared = prepare_source(&source, &temporary.path().join("work")).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let mut catalog = Catalog::open(&temporary.path().join("work/cleanup-catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .index_attachment_contexts(&database, None, None, |_| {})
+        .unwrap();
+
+    let chats = (0_i64..1_001)
+        .map(|index| Chat {
+            pk: 10_000 + index,
+            source: "line".to_string(),
+            id: format!("bulk-chat-{index}"),
+            chat_type: 1,
+            kind: "group".to_string(),
+            title: format!("大量測試聊天室 {index}"),
+            title_source: "fallback".to_string(),
+            message_count: index,
+            human_message_count: index,
+            last_updated: index,
+            last_message: String::new(),
+            planned_for_removal: false,
+        })
+        .collect::<Vec<_>>();
+    let mut progress = Vec::new();
+
+    catalog
+        .set_chats_removal_planned_reporting(&chats, true, "selected", |item| {
+            progress.push(item);
+            Ok(())
+        })
+        .unwrap();
+
+    let chat_progress = progress
+        .iter()
+        .filter(|item| item.phase == "整理並寫入聊天室")
+        .map(|item| item.processed_records)
+        .collect::<Vec<_>>();
+    assert_eq!(chat_progress, vec![0, 500, 1_000, 1_001]);
+
+    let attachment_progress = progress
+        .iter()
+        .filter(|item| item.phase == "掃描並寫入聊天室附件")
+        .collect::<Vec<_>>();
+    assert_eq!(attachment_progress.len(), 2);
+    assert_eq!(attachment_progress[0].processed_records, 0);
+    assert_eq!(
+        attachment_progress.last().unwrap().processed_records,
+        attachment_progress.last().unwrap().total_records
+    );
+    assert_eq!(
+        catalog
+            .advanced_cleanup_report(0, 0, true, 0, 0, 0)
+            .unwrap()
+            .planned_chats,
+        1_001
     );
 }
 

@@ -90,10 +90,13 @@ let sidecar = null;
 let activeSource = null;
 let activeOperation = null;
 let updateCheckStarted = false;
+let closeConfirmationOpen = false;
+let closeConfirmed = false;
 const outputTokens = new Map();
 const previewTokens = new Map();
 const MAX_PREVIEW_TOKENS = 128;
 const MAX_PREVIEW_BYTES = 16 * 1024 * 1024;
+const SESSION_CACHE_COMPATIBLE_VERSIONS = ["0.1.23"];
 
 async function checkForUpdates() {
   if (updateCheckStarted || !app.isPackaged) return;
@@ -189,7 +192,8 @@ async function replaceSidecar(source) {
   const { workDir } = prepareSessionCache(
     userDataPath,
     activeSource,
-    app.getVersion()
+    app.getVersion(),
+    SESSION_CACHE_COMPATIBLE_VERSIONS
   );
   const client = new SidecarClient(rustBinaryPath(), [
     "--work-dir", workDir,
@@ -456,6 +460,8 @@ function createWindow() {
       webSecurity: true
     }
   });
+  closeConfirmed = false;
+  closeConfirmationOpen = false;
   mainWindow.setMenuBarVisibility(false);
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   mainWindow.webContents.on("will-navigate", (event, url) => {
@@ -464,6 +470,37 @@ function createWindow() {
   mainWindow.once("ready-to-show", () => {
     mainWindow.show();
     void checkForUpdates();
+  });
+  mainWindow.on("close", (event) => {
+    if (closeConfirmed) return;
+    event.preventDefault();
+    if (closeConfirmationOpen || !mainWindow || mainWindow.isDestroyed()) return;
+    closeConfirmationOpen = true;
+    const windowToClose = mainWindow;
+    void (async () => {
+      try {
+        const operationDetail = activeOperation
+          ? `目前仍在執行「${activeOperation.method}」。關閉會取消工作，尚未提交的資料庫交易將回滾。`
+          : "目前沒有執行中的工作，但關閉後需要重新開啟應用程式才能繼續。";
+        const { response } = await dialog.showMessageBox(windowToClose, {
+          type: activeOperation ? "warning" : "question",
+          title: "確認關閉 LINE Cheater",
+          message: "確定要關閉 LINE Cheater 嗎？",
+          detail: operationDetail,
+          buttons: ["繼續使用", "確認關閉"],
+          defaultId: 0,
+          cancelId: 0,
+          noLink: true
+        });
+        if (response !== 1 || windowToClose.isDestroyed()) return;
+        closeConfirmed = true;
+        windowToClose.close();
+      } catch (error) {
+        console.warn(`Unable to confirm main-window close: ${error.message}`);
+      } finally {
+        closeConfirmationOpen = false;
+      }
+    })();
   });
   mainWindow.on("closed", () => {
     mainWindow = null;

@@ -203,7 +203,9 @@ test("versions session cache and clears it after a successful candidate build", 
   assert.match(main, /prepareSessionCache\(/);
   assert.match(main, /app\.getVersion\(\)/);
   assert.match(sessionCache, /CACHE_VERSION_FILE = "\.line-cheater-cache-version"/);
-  assert.match(sessionCache, /cachedVersion\(workDir\) === version/);
+  assert.match(sessionCache, /previousVersion === version/);
+  assert.match(main, /SESSION_CACHE_COMPATIBLE_VERSIONS = \["0\.1\.23"\]/);
+  assert.match(sessionCache, /compatibleVersions\.includes\(previousVersion\)/);
   assert.match(sessionCache, /clearSessionCache\(userDataPath, workDir\)/);
   assert.match(main, /outputFallsInsideSession\(workDir, output\)/);
   assert.match(main, /const cacheResult = await closeCompletedSession\(client, workDir\)/);
@@ -329,6 +331,24 @@ test("exposes separate safe-automatic and manual cleanup controls", () => {
   assert.match(renderer, /removalReason === "automatic"/);
   assert.match(main, /"planSafeAttachmentCleanup"/);
   assert.match(main, /"clearManualAttachmentPlan"/);
+});
+
+test("requires confirmation before cancelling work or closing the app", () => {
+  assert.match(renderer, /確定取消載入與掃描？/);
+  assert.match(renderer, /確定取消建立瘦身檔？/);
+  assert.match(renderer, /確定取消重複附件掃描？/);
+  assert.match(renderer, /確定取消資料庫操作？/);
+  assert.match(html, /id="operation-modal-cancel"/);
+  assert.match(renderer, /requestRestoreChecklistCancellation/);
+  assert.match(renderer, /確定關閉建立結果？/);
+  assert.match(renderer, /確定關閉操作結果？/);
+  assert.match(renderer, /確定關閉圖片預覽？/);
+  assert.match(renderer, /requestModalClose\("package"\)/);
+  assert.match(renderer, /requestModalClose\("operation"\)/);
+  assert.match(renderer, /requestModalClose\("image"\)/);
+  assert.match(main, /mainWindow\.on\("close"/);
+  assert.match(main, /確認關閉 LINE Cheater/);
+  assert.match(main, /buttons: \["繼續使用", "確認關閉"\]/);
 });
 
 test("supports category-wide attachment and chat actions with locked mutation progress", () => {

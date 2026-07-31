@@ -190,6 +190,7 @@ const elements = {
   operationModalMessage: document.querySelector("#operation-modal-message"),
   operationModalProgress: document.querySelector("#operation-modal-progress"),
   operationModalProgressLabel: document.querySelector("#operation-modal-progress-label"),
+  operationModalCancel: document.querySelector("#operation-modal-cancel"),
   operationModalClose: document.querySelector("#operation-modal-close"),
   restoreChecklistModal: document.querySelector("#restore-checklist-modal"),
   restoreChecklistCard: document.querySelector("#restore-checklist-modal .restore-checklist-card"),
@@ -588,6 +589,9 @@ function showOperationModal(title, message) {
   elements.operationModal.setAttribute("aria-hidden", "false");
   elements.operationModalTitle.textContent = title;
   elements.operationModalMessage.textContent = message;
+  elements.operationModalCancel.classList.remove("hidden");
+  elements.operationModalCancel.disabled = false;
+  elements.operationModalCancel.textContent = "取消操作";
   elements.operationModalClose.classList.add("hidden");
   updateOperationModalProgress(0, 0, "準備中");
   syncModalBusy();
@@ -611,6 +615,7 @@ function completeOperationModal(error, message) {
   elements.operationModal.classList.add(error ? "is-error" : "is-success");
   elements.operationModalTitle.textContent = error ? "操作失敗" : "操作完成";
   elements.operationModalMessage.textContent = message;
+  elements.operationModalCancel.classList.add("hidden");
   if (error) {
     elements.operationModalClose.classList.remove("hidden");
     elements.operationModalClose.focus();
@@ -645,6 +650,12 @@ async function runCleanupMutation(options, task) {
     return result;
   } catch (error) {
     cleanupMutationInProgress = false;
+    if (isOperationCancelled(error)) {
+      completeOperationModal(false, "操作已取消；尚未提交的資料庫變更已回滾。");
+      elements.operationModalClose.classList.remove("hidden");
+      elements.operationModalClose.focus();
+      throw error;
+    }
     completeOperationModal(true, error.message);
     throw error;
   }
@@ -687,14 +698,51 @@ function isOperationCancelled(error) {
   return error && error.code === "operation_cancelled";
 }
 
+function reportCleanupMutationError(error) {
+  if (isOperationCancelled(error)) {
+    setStatus("操作已取消；尚未提交的資料庫變更已回滾。", false);
+    return;
+  }
+  setStatus(error.message, true);
+}
+
 async function cancelCurrentOperation(kind) {
   if (cancelInProgress) return;
+  const cancellation = {
+    load: {
+      title: "確定取消載入與掃描？",
+      message: "取消後會停止目前的附件索引工作；未完成的索引不會當成有效結果。",
+      confirmLabel: "確認取消掃描"
+    },
+    package: {
+      title: "確定取消建立瘦身檔？",
+      message: "取消後會停止建立候選檔，並清理尚未完成的輸出與暫存資料。",
+      confirmLabel: "確認取消建立"
+    },
+    duplicate: {
+      title: "確定取消重複附件掃描？",
+      message: "取消後會清除未完成的雜湊結果，之後需要重新掃描。",
+      confirmLabel: "確認取消掃描"
+    },
+    cleanup: {
+      title: "確定取消資料庫操作？",
+      message: "取消後會停止目前的批次工作；尚未提交的聊天室與附件清理計畫將全部回滾。",
+      confirmLabel: "確認取消操作"
+    }
+  }[kind];
+  if (!cancellation || !await requestConfirmation({
+    ...cancellation,
+    cancelLabel: "繼續目前工作",
+    danger: true
+  })) return;
   cancelInProgress = true;
   const button = kind === "load"
     ? elements.loadModalCancel
     : kind === "package"
       ? elements.packageModalCancel
-      : elements.cancelDuplicateScan;
+      : kind === "cleanup"
+        ? elements.operationModalCancel
+        : elements.cancelDuplicateScan;
   button.disabled = true;
   button.textContent = "取消中…";
   try {
@@ -715,7 +763,13 @@ async function cancelCurrentOperation(kind) {
     }
   } catch (error) {
     button.disabled = false;
-    button.textContent = kind === "load" ? "取消" : kind === "package" ? "取消建立" : "取消掃描";
+    button.textContent = kind === "load"
+      ? "取消"
+      : kind === "package"
+        ? "取消建立"
+        : kind === "cleanup"
+          ? "取消操作"
+          : "取消掃描";
     setStatus(`取消工作失敗：${error.message}`, true);
   } finally {
     cancelInProgress = false;
@@ -741,6 +795,36 @@ function closeImageModal() {
   setModalBusy(false, "image-modal-open");
   if (imageModalTrigger) imageModalTrigger.focus();
   imageModalTrigger = null;
+}
+
+async function requestModalClose(kind) {
+  const closeRequest = {
+    package: {
+      title: "確定關閉建立結果？",
+      message: "關閉後仍可從主畫面的狀態訊息確認結果。",
+      confirmLabel: "確認關閉",
+      close: closePackageModal
+    },
+    operation: {
+      title: "確定關閉操作結果？",
+      message: "關閉後會返回附件瘦身畫面，已完成或已回滾的結果不會改變。",
+      confirmLabel: "確認關閉",
+      close: closeOperationModal
+    },
+    image: {
+      title: "確定關閉圖片預覽？",
+      message: "關閉後會返回原本的附件或聊天室位置。",
+      confirmLabel: "確認關閉",
+      close: closeImageModal
+    }
+  }[kind];
+  if (!closeRequest || !await requestConfirmation({
+    title: closeRequest.title,
+    message: closeRequest.message,
+    cancelLabel: "繼續查看",
+    confirmLabel: closeRequest.confirmLabel
+  })) return;
+  closeRequest.close();
 }
 
 function requestConfirmation(options) {
@@ -1944,7 +2028,7 @@ async function changeDuplicateMark(checkbox) {
     setStatus(checkbox.checked ? "已標記重複副本。" : "已取消標記重複副本。", false);
   } catch (error) {
     checkbox.checked = !checkbox.checked;
-    setStatus(error.message, true);
+    reportCleanupMutationError(error);
   } finally {
     checkbox.disabled = false;
   }
@@ -2278,6 +2362,18 @@ function renderCleanupOverview() {
   }
   elements.categorySummary.replaceChildren(fragment);
   renderCategoryBulkActions();
+}
+
+async function requestRestoreChecklistCancellation() {
+  if (!restoreChecklistResolve) return;
+  if (!await requestConfirmation({
+    title: "確定取消還原前檢查？",
+    message: "取消後會返回目前的清理畫面，不會建立瘦身候選檔。",
+    cancelLabel: "繼續檢查",
+    confirmLabel: "確認取消",
+    danger: true
+  })) return;
+  closeRestoreChecklist(false);
 }
 
 function renderCategoryBulkActions() {
@@ -3084,7 +3180,7 @@ async function changeAttachmentMark(checkbox) {
     });
   } catch (error) {
     checkbox.checked = !checkbox.checked;
-    setStatus(error.message, true);
+    reportCleanupMutationError(error);
   } finally {
     checkbox.disabled = false;
   }
@@ -3108,7 +3204,7 @@ async function applyGroupAction(groupKey, action, button) {
     });
     setStatus(action === "keep_thumbnail" ? "已套用保留縮圖。" : "已更新聊天室附件標記。", false);
   } catch (error) {
-    setStatus(error.message, true);
+    reportCleanupMutationError(error);
   } finally {
     button.disabled = false;
     button.textContent = originalText;
@@ -3145,7 +3241,7 @@ async function applyCategoryKeepThumbnails() {
     });
     setStatus(`已將${label}設定為只保留縮圖。`, false);
   } catch (error) {
-    setStatus(error.message, true);
+    reportCleanupMutationError(error);
   } finally {
     renderCategoryBulkActions();
   }
@@ -3188,7 +3284,7 @@ async function deleteCategoryAttachments() {
     });
     setStatus(`已將${label}的所有附件加入清理計畫。`, false);
   } catch (error) {
-    setStatus(error.message, true);
+    reportCleanupMutationError(error);
   } finally {
     renderCategoryBulkActions();
   }
@@ -3224,7 +3320,7 @@ async function deleteCategoryChats() {
     });
     setStatus(`已將${label}的所有聊天室加入清理計畫。`, false);
   } catch (error) {
-    setStatus(error.message, true);
+    reportCleanupMutationError(error);
   } finally {
     renderCategoryBulkActions();
   }
@@ -3250,7 +3346,7 @@ async function applySafeAttachmentCleanup(message) {
     });
     setStatus(message, false);
   } catch (error) {
-    setStatus(error.message, true);
+    reportCleanupMutationError(error);
   } finally {
     if (cleanupOverview) renderCleanupOverview();
   }
@@ -3302,7 +3398,7 @@ async function clearManualAttachmentPlan() {
     });
     setStatus("已清除手動附件標記；自動與聊天室計畫仍保留。", false);
   } catch (error) {
-    setStatus(error.message, true);
+    reportCleanupMutationError(error);
   } finally {
     if (cleanupOverview) renderCleanupOverview();
   }
@@ -3374,7 +3470,7 @@ async function refreshAdvancedPlanSummary() {
   try {
     renderAdvancedReport(await provider.advancedCleanupReport());
   } catch (error) {
-    setStatus(error.message, true);
+    reportCleanupMutationError(error);
   }
 }
 
@@ -3386,7 +3482,7 @@ async function loadAdvancedReport() {
   try {
     renderAdvancedReport(await provider.advancedCleanupReport());
   } catch (error) {
-    setStatus(error.message, true);
+    reportCleanupMutationError(error);
   } finally {
     advancedLoading = false;
     elements.refreshAdvancedReport.disabled = false;
@@ -3427,7 +3523,11 @@ async function setChatRemoval(source, chatPk, title, planned) {
       ]);
     });
   } catch (error) {
-    setStatus(`${action}聊天室失敗：${error.message}`, true);
+    if (isOperationCancelled(error)) {
+      reportCleanupMutationError(error);
+    } else {
+      setStatus(`${action}聊天室失敗：${error.message}`, true);
+    }
   }
 }
 
@@ -3470,7 +3570,7 @@ async function toggleAutomaticCleanup() {
     });
     setStatus(planned ? "已取消所有自動偵測項目。" : "已將所有偵測項目加入清理計畫。");
   } catch (error) {
-    setStatus(error.message, true);
+    reportCleanupMutationError(error);
   } finally {
     elements.planAutomaticCleanup.disabled = false;
   }
@@ -3646,18 +3746,19 @@ elements.buildCandidate.addEventListener("click", () => void buildCandidate());
 elements.advancedBuildCandidate.addEventListener("click", () => void buildCandidate());
 elements.loadModalCancel.addEventListener("click", () => void cancelCurrentOperation("load"));
 elements.packageModalCancel.addEventListener("click", () => void cancelCurrentOperation("package"));
-elements.packageModalClose.addEventListener("click", closePackageModal);
-elements.operationModalClose.addEventListener("click", closeOperationModal);
+elements.operationModalCancel.addEventListener("click", () => void cancelCurrentOperation("cleanup"));
+elements.packageModalClose.addEventListener("click", () => void requestModalClose("package"));
+elements.operationModalClose.addEventListener("click", () => void requestModalClose("operation"));
 elements.restoreCheckOriginal.addEventListener("change", updateRestoreChecklistState);
 elements.restoreCheckTest.addEventListener("change", updateRestoreChecklistState);
 elements.restoreCheckVerify.addEventListener("change", updateRestoreChecklistState);
-elements.restoreCheckCancel.addEventListener("click", () => closeRestoreChecklist(false));
+elements.restoreCheckCancel.addEventListener("click", () => void requestRestoreChecklistCancellation());
 elements.restoreCheckConfirm.addEventListener("click", () => closeRestoreChecklist(true));
-elements.imageModalClose.addEventListener("click", closeImageModal);
+elements.imageModalClose.addEventListener("click", () => void requestModalClose("image"));
 elements.imageModal.addEventListener("click", (event) => {
   if (event.target === elements.imageModal ||
       event.target.classList.contains("image-modal-backdrop")) {
-    closeImageModal();
+    void requestModalClose("image");
   }
 });
 elements.confirmationModalCancel.addEventListener("click", () => closeConfirmationModal(false));
@@ -3684,10 +3785,13 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key !== "Escape") return;
   if (openModal === elements.confirmationModal) closeConfirmationModal(false);
-  else if (openModal === elements.imageModal) closeImageModal();
-  else if (openModal === elements.restoreChecklistModal) closeRestoreChecklist(false);
-  else if (openModal === elements.operationModal && !cleanupMutationInProgress) closeOperationModal();
-  else if (openModal === elements.packageModal && !packageInProgress) closePackageModal();
+  else if (openModal === elements.imageModal) void requestModalClose("image");
+  else if (openModal === elements.restoreChecklistModal) void requestRestoreChecklistCancellation();
+  else if (openModal === elements.operationModal && !cleanupMutationInProgress) {
+    void requestModalClose("operation");
+  } else if (openModal === elements.packageModal && !packageInProgress) {
+    void requestModalClose("package");
+  }
 });
 elements.searchForm.addEventListener("submit", async (event) => {
   event.preventDefault();

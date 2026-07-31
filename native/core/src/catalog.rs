@@ -139,6 +139,13 @@ pub struct CleanupMutationProgress {
     pub total_records: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct BulkChatMutationProgress {
+    pub phase: &'static str,
+    pub processed_records: u64,
+    pub total_records: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedChat {
     pub source: String,
@@ -1786,7 +1793,7 @@ impl Catalog {
         mut on_progress: F,
     ) -> Result<()>
     where
-        F: FnMut(CleanupMutationProgress) -> Result<()>,
+        F: FnMut(BulkChatMutationProgress) -> Result<()>,
     {
         if !matches!(reason, "selected" | "empty" | "system_only") {
             bail!("invalid chat cleanup reason");
@@ -1797,39 +1804,183 @@ impl Catalog {
         {
             bail!("chat cleanup source must be `line` or `square`");
         }
-
-        let chat_change_counts = chats
-            .iter()
-            .map(|chat| chat_removal_change_count(&self.connection, chat, planned))
-            .collect::<Result<Vec<_>>>()?;
-        let total_records = chat_change_counts
-            .iter()
-            .fold(0_u64, |total, count| total.saturating_add(*count));
-        let mut processed_records = 0_u64;
-        on_progress(CleanupMutationProgress {
-            processed_records,
-            total_records,
-        })?;
-        for (chat, chat_total) in chats.iter().zip(chat_change_counts) {
-            let processed_before_chat = processed_records;
-            self.set_chat_removal_planned_reporting(chat, planned, reason, |progress| {
-                on_progress(CleanupMutationProgress {
-                    processed_records: processed_before_chat
-                        .saturating_add(progress.processed_records)
-                        .min(total_records),
-                    total_records,
-                })
+        if chats.is_empty() {
+            on_progress(BulkChatMutationProgress {
+                phase: "沒有符合的聊天室",
+                processed_records: 1,
+                total_records: 1,
             })?;
-            processed_records = processed_records
-                .saturating_add(chat_total)
-                .min(total_records);
+            return Ok(());
         }
+
+        if !planned {
+            let total_records = chats.len() as u64;
+            on_progress(BulkChatMutationProgress {
+                phase: "取消聊天室清理計畫",
+                processed_records: 0,
+                total_records,
+            })?;
+            for (index, chat) in chats.iter().enumerate() {
+                self.set_chat_removal_planned(chat, false, reason)?;
+                if (index + 1) % CLEANUP_MUTATION_BATCH_SIZE == 0 || index + 1 == chats.len() {
+                    on_progress(BulkChatMutationProgress {
+                        phase: "取消聊天室清理計畫",
+                        processed_records: (index + 1) as u64,
+                        total_records,
+                    })?;
+                }
+            }
+            return Ok(());
+        }
+
+        self.connection.execute_batch(
+            "
+            CREATE TEMP TABLE IF NOT EXISTS bulk_chat_selection (
+                source TEXT NOT NULL,
+                chat_pk INTEGER NOT NULL,
+                chat_id_lower TEXT NOT NULL,
+                PRIMARY KEY(source, chat_pk)
+            );
+            CREATE INDEX IF NOT EXISTS temp.bulk_chat_selection_chat_id
+                ON bulk_chat_selection(chat_id_lower);
+            DELETE FROM temp.bulk_chat_selection;
+            ",
+        )?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let chat_total = chats.len() as u64;
+        on_progress(BulkChatMutationProgress {
+            phase: "整理並寫入聊天室",
+            processed_records: 0,
+            total_records: chat_total,
+        })?;
+        {
+            let mut stage_chat = transaction.prepare(
+                "INSERT OR REPLACE INTO temp.bulk_chat_selection(
+                     source, chat_pk, chat_id_lower
+                 ) VALUES (?1, ?2, LOWER(?3))",
+            )?;
+            let mut plan_chat = transaction.prepare(
+                "
+                INSERT INTO chat_removal_plan(
+                    source, chat_pk, chat_id, chat_title, chat_kind,
+                    message_count, human_message_count, reason, marked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(source, chat_pk) DO UPDATE SET
+                    chat_id = excluded.chat_id,
+                    chat_title = excluded.chat_title,
+                    chat_kind = excluded.chat_kind,
+                    message_count = excluded.message_count,
+                    human_message_count = excluded.human_message_count,
+                    reason = CASE
+                        WHEN chat_removal_plan.reason = 'selected'
+                        THEN chat_removal_plan.reason
+                        ELSE excluded.reason
+                    END,
+                    marked_at = excluded.marked_at
+                ",
+            )?;
+            let now = unix_seconds();
+            for (index, chat) in chats.iter().enumerate() {
+                stage_chat.execute(params![chat.source, chat.pk, chat.id])?;
+                plan_chat.execute(params![
+                    chat.source,
+                    chat.pk,
+                    chat.id,
+                    chat.title,
+                    chat.kind,
+                    chat.message_count,
+                    chat.human_message_count,
+                    reason,
+                    now,
+                ])?;
+                if (index + 1) % CLEANUP_MUTATION_BATCH_SIZE == 0 || index + 1 == chats.len() {
+                    on_progress(BulkChatMutationProgress {
+                        phase: "整理並寫入聊天室",
+                        processed_records: (index + 1) as u64,
+                        total_records: chat_total,
+                    })?;
+                }
+            }
+        }
+
+        let attachment_total: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM files WHERE attachment_kind IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let attachment_total = attachment_total.max(0) as u64;
+        let mut processed_attachments = 0_u64;
+        let mut after_id = 0_i64;
+        on_progress(BulkChatMutationProgress {
+            phase: "掃描並寫入聊天室附件",
+            processed_records: processed_attachments,
+            total_records: attachment_total,
+        })?;
+        loop {
+            let ids = {
+                let mut statement = transaction.prepare(&format!(
+                    "SELECT id FROM files
+                     WHERE attachment_kind IS NOT NULL AND id > ?1
+                     ORDER BY id ASC
+                     LIMIT {CLEANUP_MUTATION_BATCH_SIZE}"
+                ))?;
+                let rows = statement.query_map([after_id], |row| row.get::<_, i64>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if ids.is_empty() {
+                break;
+            }
+            let batch_start = after_id;
+            after_id = *ids.last().unwrap_or(&after_id);
+            let now = unix_seconds();
+            transaction.execute(
+                "
+                INSERT OR IGNORE INTO chat_removal_files(source, chat_pk, path, marked_at)
+                SELECT selected.source, selected.chat_pk, f.path, ?3
+                FROM files f
+                JOIN temp.bulk_chat_selection selected
+                  ON selected.source = f.context_source
+                 AND selected.chat_pk = f.message_chat_pk
+                WHERE f.attachment_kind IS NOT NULL
+                  AND f.reference_status = 'referenced'
+                  AND f.id > ?1 AND f.id <= ?2
+                ",
+                params![batch_start, after_id, now],
+            )?;
+            transaction.execute(
+                "
+                INSERT OR IGNORE INTO chat_removal_files(source, chat_pk, path, marked_at)
+                SELECT selected.source, selected.chat_pk, f.path, ?3
+                FROM files f
+                JOIN temp.bulk_chat_selection selected
+                  ON selected.chat_id_lower = LOWER(f.chat_hint)
+                WHERE f.attachment_kind IS NOT NULL
+                  AND selected.chat_id_lower <> ''
+                  AND f.id > ?1 AND f.id <= ?2
+                  AND (
+                      f.reference_status <> 'referenced'
+                      OR (
+                          selected.source = f.context_source
+                          AND selected.chat_pk = f.message_chat_pk
+                      )
+                  )
+                ",
+                params![batch_start, after_id, now],
+            )?;
+            processed_attachments = processed_attachments
+                .saturating_add(ids.len() as u64)
+                .min(attachment_total);
+            on_progress(BulkChatMutationProgress {
+                phase: "掃描並寫入聊天室附件",
+                processed_records: processed_attachments,
+                total_records: attachment_total,
+            })?;
+        }
+        transaction.commit()?;
+        self.connection
+            .execute("DELETE FROM temp.bulk_chat_selection", [])?;
         self.record_cleanup_activity(
-            if planned {
-                "plan_chat_category_removal"
-            } else {
-                "clear_chat_category_removal"
-            },
+            "plan_chat_category_removal",
             "chat_category",
             "bulk",
             chats.len() as u64,

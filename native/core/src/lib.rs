@@ -10,7 +10,10 @@ pub use candidate::{
     CandidateOptions, CandidateProgress, CandidateReport, build_candidate,
     build_candidate_with_options, line_square_rebuild_required,
 };
-pub use catalog::{Catalog, CatalogContextProgress, CatalogScanProgress, CleanupMutationProgress};
+pub use catalog::{
+    BulkChatMutationProgress, Catalog, CatalogContextProgress, CatalogScanProgress,
+    CleanupMutationProgress,
+};
 pub use database::{LineDatabase, LineSquareDatabase, UnifiedGroupDatabase};
 pub use model::{
     AdvancedCleanupReport, AttachmentContext, AttachmentCursor, AttachmentItem, AttachmentKind,

@@ -907,7 +907,7 @@ fn handle_request<W: Write>(
                         output,
                         &request_id,
                         job_id.as_deref(),
-                        "更新分類聊天室清理計畫",
+                        progress.phase,
                         progress.processed_records,
                         progress.total_records,
                     )

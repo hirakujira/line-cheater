@@ -60,25 +60,35 @@ function writeVersionMarker(workDir, version) {
       flag: "wx",
       mode: 0o600
     });
+    fs.rmSync(marker, { force: true });
     fs.renameSync(temporary, marker);
   } finally {
     fs.rmSync(temporary, { force: true });
   }
 }
 
-function prepareSessionCache(userDataPath, sourcePath, appVersion) {
+function prepareSessionCache(userDataPath, sourcePath, appVersion, compatibleVersions = []) {
   const version = String(appVersion || "").trim();
   if (!version || /[\r\n]/.test(version)) {
     throw new TypeError("A valid LINE Cheater version is required for session caching.");
   }
+  if (!Array.isArray(compatibleVersions) ||
+      compatibleVersions.some((item) => typeof item !== "string" || !item || /[\r\n]/.test(item))) {
+    throw new TypeError("Compatible cache versions must be valid version strings.");
+  }
   const workDir = sessionWorkDir(userDataPath, sourcePath);
-  if (cachedVersion(workDir) === version) {
-    return { workDir, recreated: false };
+  const previousVersion = cachedVersion(workDir);
+  if (previousVersion === version) {
+    return { workDir, recreated: false, migrated: false };
+  }
+  if (previousVersion && compatibleVersions.includes(previousVersion)) {
+    writeVersionMarker(workDir, version);
+    return { workDir, recreated: false, migrated: true };
   }
   clearSessionCache(userDataPath, workDir);
   fs.mkdirSync(workDir, { recursive: true, mode: 0o700 });
   writeVersionMarker(workDir, version);
-  return { workDir, recreated: true };
+  return { workDir, recreated: true, migrated: false };
 }
 
 function isWithin(parent, candidate) {
