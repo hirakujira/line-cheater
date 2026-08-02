@@ -10,16 +10,19 @@ pub use candidate::{
     CandidateOptions, CandidateProgress, CandidateReport, build_candidate,
     build_candidate_with_options, line_square_rebuild_required,
 };
-pub use catalog::{Catalog, CatalogContextProgress, CatalogScanProgress};
+pub use catalog::{
+    BulkChatMutationProgress, Catalog, CatalogContextProgress, CatalogScanProgress,
+    CleanupMutationProgress,
+};
 pub use database::{LineDatabase, LineSquareDatabase, UnifiedGroupDatabase};
 pub use model::{
     AdvancedCleanupReport, AttachmentContext, AttachmentCursor, AttachmentItem, AttachmentKind,
     AttachmentPage, AttachmentPreview, CatalogStats, Chat, ChatCursor, ChatPage, CleanupActivity,
-    CleanupAuditReport, CleanupCategoryTotal, CleanupGroup, CleanupGroupPage, CleanupOverview,
-    CleanupPlanPreview, CleanupPlanSnapshot, CleanupPreflightReport, CleanupReview,
-    CleanupReviewPage, CleanupRisk, DuplicateGroup, DuplicateGroupCursor, DuplicateGroupPage,
-    DuplicateHashProgress, DuplicateMemberPage, Message, MessageAttachment, MessageCursor,
-    MessagePage,
+    CleanupAuditReport, CleanupCategoryActionState, CleanupCategoryTotal, CleanupGroup,
+    CleanupGroupPage, CleanupOverview, CleanupPlanPreview, CleanupPlanSnapshot,
+    CleanupPreflightReport, CleanupReview, CleanupReviewPage, CleanupRisk, DuplicateGroup,
+    DuplicateGroupCursor, DuplicateGroupPage, DuplicateHashProgress, DuplicateMemberPage, Message,
+    MessageAttachment, MessageCursor, MessagePage,
 };
 pub use performance::{PerformanceProfile, system_performance_profile};
 pub use server::{NativeSession, serve};

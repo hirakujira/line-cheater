@@ -19,7 +19,7 @@ function temporaryUserData(t) {
   return directory;
 }
 
-test("keeps same-version cache and rebuilds cache after an app version change", (t) => {
+test("keeps same-version and compatible caches but rebuilds incompatible versions", (t) => {
   const userData = temporaryUserData(t);
   const source = path.join(userData, "source.imazingapp");
   const first = prepareSessionCache(userData, source, "1.2.3");
@@ -33,14 +33,25 @@ test("keeps same-version cache and rebuilds cache after an app version change", 
 
   const same = prepareSessionCache(userData, source, "1.2.3");
   assert.equal(same.recreated, false);
+  assert.equal(same.migrated, false);
   assert.equal(fs.readFileSync(retained, "utf8"), "derived cache");
 
-  const upgraded = prepareSessionCache(userData, source, "1.2.4");
+  const compatible = prepareSessionCache(userData, source, "1.2.4", ["1.2.3"]);
+  assert.equal(compatible.recreated, false);
+  assert.equal(compatible.migrated, true);
+  assert.equal(fs.readFileSync(retained, "utf8"), "derived cache");
+  assert.equal(
+    fs.readFileSync(path.join(compatible.workDir, CACHE_VERSION_FILE), "utf8").trim(),
+    "1.2.4"
+  );
+
+  const upgraded = prepareSessionCache(userData, source, "1.2.5");
   assert.equal(upgraded.recreated, true);
+  assert.equal(upgraded.migrated, false);
   assert.equal(fs.existsSync(retained), false);
   assert.equal(
     fs.readFileSync(path.join(upgraded.workDir, CACHE_VERSION_FILE), "utf8").trim(),
-    "1.2.4"
+    "1.2.5"
   );
 });
 

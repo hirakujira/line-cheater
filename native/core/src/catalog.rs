@@ -18,10 +18,10 @@ use crate::database::{LineDatabase, LineSquareDatabase, OrphanMessage, UnifiedGr
 use crate::model::{
     AdvancedCleanupReport, AttachmentContext, AttachmentCursor, AttachmentItem, AttachmentKind,
     AttachmentPage, AttachmentPreview, CatalogStats, Chat, CleanupActivity, CleanupAuditReport,
-    CleanupCategoryTotal, CleanupGroup, CleanupGroupPage, CleanupOverview, CleanupPlanPreview,
-    CleanupPlanSnapshot, CleanupReview, CleanupReviewPage, DuplicateGroup, DuplicateGroupCursor,
-    DuplicateGroupPage, DuplicateHashProgress, DuplicateMemberPage, Message, MessageAttachment,
-    checked_page_size,
+    CleanupCategoryActionState, CleanupCategoryTotal, CleanupGroup, CleanupGroupPage,
+    CleanupOverview, CleanupPlanPreview, CleanupPlanSnapshot, CleanupReview, CleanupReviewPage,
+    DuplicateGroup, DuplicateGroupCursor, DuplicateGroupPage, DuplicateHashProgress,
+    DuplicateMemberPage, Message, MessageAttachment, checked_page_size,
 };
 use crate::performance::system_performance_profile;
 use crate::source::SourceKind;
@@ -30,10 +30,11 @@ const CATALOG_BATCH_SIZE: usize = 1_000;
 const HASH_UPDATE_BATCH_SIZE: usize = 100;
 const HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const CONTEXT_BATCH_SIZE: usize = 900;
+const CLEANUP_MUTATION_BATCH_SIZE: usize = 500;
 const MAX_CLEANUP_RESPONSE_FILES: usize = 1_000;
 const MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STAGED_PREVIEWS: usize = 32;
-const CONTEXT_INDEX_VERSION: &str = "3";
+const CONTEXT_INDEX_VERSION: &str = "5";
 const CHAT_INDEX_VERSION: &str = "1";
 const CLEANUP_GROUP_EXPR: &str = "
     CASE f.reference_status
@@ -85,6 +86,27 @@ const IMAGE_THUMBNAIL_WITH_ORIGINAL_EXPR: &str = "
           AND original.chat_hint = f.chat_hint
     )
 ";
+const CHAT_REMOVAL_ATTACHMENT_PREDICATE: &str = "
+    f.attachment_kind IS NOT NULL
+    AND (
+        (
+            f.reference_status = 'referenced'
+            AND f.context_source = ?1
+            AND f.message_chat_pk = ?2
+        )
+        OR (
+            ?3 <> ''
+            AND LOWER(f.chat_hint) = LOWER(?3)
+            AND (
+                f.reference_status <> 'referenced'
+                OR (
+                    f.context_source = ?1
+                    AND f.message_chat_pk = ?2
+                )
+            )
+        )
+    )
+";
 const ATTACHMENT_COLUMNS: &str = "
     f.id, f.path, f.bytes, f.modified_ns, f.attachment_kind,
     f.message_id, f.chat_hint, p.path IS NOT NULL, COALESCE(p.reason, ''), f.reference_status,
@@ -107,6 +129,21 @@ pub struct CatalogContextProgress {
     pub referenced_files: u64,
     pub unreferenced_files: u64,
     pub unconfirmed_files: u64,
+    pub repaired_files: u64,
+    pub repair_total_files: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CleanupMutationProgress {
+    pub processed_records: u64,
+    pub total_records: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BulkChatMutationProgress {
+    pub phase: &'static str,
+    pub processed_records: u64,
+    pub total_records: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -786,6 +823,16 @@ impl Catalog {
     }
 
     pub fn clear_manual_attachment_plan(&self) -> Result<CleanupOverview> {
+        self.clear_manual_attachment_plan_reporting(|_| Ok(()))
+    }
+
+    pub fn clear_manual_attachment_plan_reporting<F>(
+        &self,
+        mut on_progress: F,
+    ) -> Result<CleanupOverview>
+    where
+        F: FnMut(CleanupMutationProgress) -> Result<()>,
+    {
         let (file_count, bytes): (i64, i64) = self.connection.query_row(
             "SELECT COUNT(*), COALESCE(SUM(f.bytes), 0)
              FROM removal_plan p JOIN files f ON f.path = p.path
@@ -793,8 +840,25 @@ impl Catalog {
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        self.connection
-            .execute("DELETE FROM removal_plan WHERE reason = 'manual'", [])?;
+        let predicate = "direct.reason = 'manual' AND ?1 = 'manual'";
+        let transaction = self.connection.unchecked_transaction()?;
+        let total = direct_plan_change_count(&transaction, predicate, "manual", false)?;
+        let mut processed = 0_u64;
+        on_progress(CleanupMutationProgress {
+            processed_records: processed,
+            total_records: total,
+        })?;
+        apply_direct_plan_changes(
+            &transaction,
+            predicate,
+            "manual",
+            false,
+            "manual",
+            &mut processed,
+            total,
+            &mut on_progress,
+        )?;
+        transaction.commit()?;
         self.record_cleanup_activity(
             "clear_manual_plan",
             "attachment_plan",
@@ -806,26 +870,64 @@ impl Catalog {
     }
 
     pub fn plan_safe_attachment_cleanup(&self) -> Result<CleanupOverview> {
+        self.plan_safe_attachment_cleanup_reporting(|_| Ok(()))
+    }
+
+    pub fn plan_safe_attachment_cleanup_reporting<F>(
+        &self,
+        mut on_progress: F,
+    ) -> Result<CleanupOverview>
+    where
+        F: FnMut(CleanupMutationProgress) -> Result<()>,
+    {
         let already_planned: bool = self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM removal_plan WHERE reason = 'automatic')",
             [],
             |row| row.get(0),
         )?;
-        if already_planned {
-            self.connection
-                .execute("DELETE FROM removal_plan WHERE reason = 'automatic'", [])?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let predicate = if already_planned {
+            "direct.reason = 'automatic' AND ?1 = 'automatic'".to_string()
         } else {
-            let sql = format!(
-                "INSERT OR IGNORE INTO removal_plan(path, marked_at, reason)
-                 SELECT f.path, ?1, 'automatic'
-                 FROM files f
-                 WHERE {THUMBNAIL_BACKED_IMAGE_EXPR}
-                   AND NOT EXISTS (
-                       SELECT 1 FROM all_removal_plan planned WHERE planned.path = f.path
-                   )"
-            );
-            self.connection.execute(&sql, [unix_seconds()])?;
+            format!(
+                "({THUMBNAIL_BACKED_IMAGE_EXPR})
+                 AND NOT EXISTS (
+                     SELECT 1 FROM all_removal_plan planned WHERE planned.path = f.path
+                 )
+                 AND ?1 = 'automatic'"
+            )
+        };
+        let total =
+            direct_plan_change_count(&transaction, &predicate, "automatic", !already_planned)?;
+        let mut processed = 0_u64;
+        on_progress(CleanupMutationProgress {
+            processed_records: processed,
+            total_records: total,
+        })?;
+        if already_planned {
+            apply_direct_plan_changes(
+                &transaction,
+                &predicate,
+                "automatic",
+                false,
+                "automatic",
+                &mut processed,
+                total,
+                &mut on_progress,
+            )?;
+        } else {
+            apply_direct_plan_changes(
+                &transaction,
+                &predicate,
+                "automatic",
+                true,
+                "automatic",
+                &mut processed,
+                total,
+                &mut on_progress,
+            )?;
         }
+        transaction.commit()?;
         let overview = self.cleanup_overview()?;
         self.record_cleanup_activity(
             if already_planned {
@@ -1072,6 +1174,8 @@ impl Catalog {
             referenced_files: 0,
             unreferenced_files: 0,
             unconfirmed_files: 0,
+            repaired_files: 0,
+            repair_total_files: 0,
         };
         on_progress(progress);
         self.connection.execute(
@@ -1221,12 +1325,131 @@ impl Catalog {
             transaction.commit()?;
             on_progress(progress);
         }
+        self.repair_image_contexts_from_unique_counterparts_reporting(|repair| {
+            progress.repaired_files = repair.processed_records;
+            progress.repair_total_files = repair.total_records;
+            on_progress(progress);
+            Ok(())
+        })?;
+        let (referenced, unreferenced, unconfirmed): (i64, i64, i64) = self.connection.query_row(
+            "SELECT
+                    SUM(CASE WHEN reference_status = 'referenced' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN reference_status = 'unreferenced' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN reference_status = 'unconfirmed' THEN 1 ELSE 0 END)
+                 FROM files WHERE attachment_kind IS NOT NULL",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        progress.referenced_files = referenced.max(0) as u64;
+        progress.unreferenced_files = unreferenced.max(0) as u64;
+        progress.unconfirmed_files = unconfirmed.max(0) as u64;
         self.set_meta("context_status", "complete")?;
         self.set_meta("context_index_version", CONTEXT_INDEX_VERSION)?;
         self.set_meta("context_completed_at", &unix_seconds().to_string())?;
         self.refresh_chat_removal_files()?;
         on_progress(progress);
         Ok(progress)
+    }
+
+    /// Repairs a one-sided attachment lookup when the matching image file already has one
+    /// unambiguous SQLite context. Original images and thumbnails share the same message ID and
+    /// chat directory even when they live under different iOS container roots, so a unique
+    /// counterpart is a stronger signal than leaving either file in a catch-all bucket.
+    pub fn repair_image_contexts_from_unique_counterparts(&self) -> Result<u64> {
+        self.repair_image_contexts_from_unique_counterparts_reporting(|_| Ok(()))
+    }
+
+    pub fn repair_image_contexts_from_unique_counterparts_reporting<F>(
+        &self,
+        mut on_progress: F,
+    ) -> Result<u64>
+    where
+        F: FnMut(CleanupMutationProgress) -> Result<()>,
+    {
+        let columns = "
+            message_pk, message_chat_pk, message_timestamp, message_sender_pk,
+            message_sender_name, message_content_type, message_text, context_source,
+            context_chat_id, context_chat_title, context_chat_kind, reference_status
+        ";
+        let donor_columns = "
+            donor.message_pk, donor.message_chat_pk, donor.message_timestamp,
+            donor.message_sender_pk, donor.message_sender_name, donor.message_content_type,
+            donor.message_text, donor.context_source, donor.context_chat_id,
+            donor.context_chat_title, donor.context_chat_kind, 'referenced'
+        ";
+        let transaction = self.connection.unchecked_transaction()?;
+        let repairs = [("original", "thumbnail"), ("thumbnail", "original")]
+            .into_iter()
+            .map(|(candidate_kind, donor_kind)| {
+                let candidate_predicate = format!(
+                    "candidate.attachment_kind = '{candidate_kind}'
+                     AND candidate.reference_status <> 'referenced'
+                     AND candidate.message_id <> ''
+                     AND candidate.chat_hint <> ''
+                     AND candidate.bytes > 0
+                     AND (
+                         SELECT COUNT(DISTINCT donor.context_source || ':' ||
+                                               CAST(donor.message_pk AS TEXT))
+                         FROM files donor
+                         WHERE donor.attachment_kind = '{donor_kind}'
+                           AND donor.reference_status = 'referenced'
+                           AND donor.message_content_type IN (1, 16, 112)
+                           AND donor.bytes > 0
+                           AND donor.message_id = candidate.message_id
+                           AND donor.chat_hint = candidate.chat_hint
+                     ) = 1"
+                );
+                let update = format!(
+                    "UPDATE files AS target SET ({columns}) = (
+                         SELECT {donor_columns}
+                         FROM files donor
+                         WHERE donor.attachment_kind = '{donor_kind}'
+                           AND donor.reference_status = 'referenced'
+                           AND donor.message_content_type IN (1, 16, 112)
+                           AND donor.bytes > 0
+                           AND donor.message_id = target.message_id
+                           AND donor.chat_hint = target.chat_hint
+                         ORDER BY donor.id ASC
+                         LIMIT 1
+                     )
+                     WHERE target.id IN (
+                         SELECT candidate.id FROM files candidate
+                         WHERE {candidate_predicate}
+                         ORDER BY candidate.id ASC
+                         LIMIT {CONTEXT_BATCH_SIZE}
+                     )"
+                );
+                Ok::<_, anyhow::Error>((candidate_predicate, update))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let total = repairs.iter().try_fold(0_u64, |total, (predicate, _)| {
+            let count: i64 = transaction.query_row(
+                &format!("SELECT COUNT(*) FROM files candidate WHERE {predicate}"),
+                [],
+                |row| row.get(0),
+            )?;
+            Ok::<_, anyhow::Error>(total.saturating_add(count.max(0) as u64))
+        })?;
+        let mut repaired = 0_u64;
+        on_progress(CleanupMutationProgress {
+            processed_records: repaired,
+            total_records: total,
+        })?;
+        for (_, update) in repairs {
+            loop {
+                let changed = transaction.execute(&update, [])? as u64;
+                if changed == 0 {
+                    break;
+                }
+                repaired = repaired.saturating_add(changed).min(total);
+                on_progress(CleanupMutationProgress {
+                    processed_records: repaired,
+                    total_records: total,
+                })?;
+            }
+        }
+        transaction.commit()?;
+        Ok(repaired)
     }
 
     pub fn enrich_planned_chats(&self, chats: &mut [Chat]) -> Result<()> {
@@ -1410,7 +1633,61 @@ impl Catalog {
         })
     }
 
+    pub fn indexed_chats_for_cleanup(&self, kind: Option<&str>) -> Result<Vec<Chat>> {
+        if !self.chat_index_is_current()? {
+            bail!("derived chat index is not ready");
+        }
+        if kind.is_some_and(|value| !matches!(value, "direct" | "group" | "community")) {
+            bail!("unsupported indexed chat cleanup kind");
+        }
+        let kind = kind.unwrap_or("all");
+        let mut statement = self.connection.prepare(
+            "
+            SELECT c.chat_pk, c.source, c.chat_id, c.chat_type, c.chat_kind, c.title,
+                   c.title_source, c.message_count, c.human_message_count, c.last_updated,
+                   c.last_message,
+                   EXISTS(
+                       SELECT 1 FROM chat_removal_plan planned
+                       WHERE planned.source = c.source AND planned.chat_pk = c.chat_pk
+                   )
+            FROM chats c
+            WHERE ?1 = 'all' OR c.chat_kind = ?1
+            ORDER BY c.source ASC, c.chat_pk ASC
+            ",
+        )?;
+        let rows = statement.query_map([kind], |row| {
+            Ok(Chat {
+                pk: row.get(0)?,
+                source: row.get(1)?,
+                id: row.get(2)?,
+                chat_type: row.get(3)?,
+                kind: row.get(4)?,
+                title: row.get(5)?,
+                title_source: row.get(6)?,
+                message_count: row.get(7)?,
+                human_message_count: row.get(8)?,
+                last_updated: row.get(9)?,
+                last_message: row.get(10)?,
+                planned_for_removal: row.get(11)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn set_chat_removal_planned(&self, chat: &Chat, planned: bool, reason: &str) -> Result<()> {
+        self.set_chat_removal_planned_reporting(chat, planned, reason, |_| Ok(()))
+    }
+
+    pub fn set_chat_removal_planned_reporting<F>(
+        &self,
+        chat: &Chat,
+        planned: bool,
+        reason: &str,
+        mut on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(CleanupMutationProgress) -> Result<()>,
+    {
         if !matches!(chat.source.as_str(), "line" | "square") {
             bail!("chat cleanup source must be `line` or `square`");
         }
@@ -1418,6 +1695,12 @@ impl Catalog {
             bail!("invalid chat cleanup reason");
         }
         let transaction = self.connection.unchecked_transaction()?;
+        let total = chat_removal_change_count(&transaction, chat, planned)?;
+        let mut processed = 0_u64;
+        on_progress(CleanupMutationProgress {
+            processed_records: processed,
+            total_records: total,
+        })?;
         if planned {
             transaction.execute(
                 "
@@ -1450,42 +1733,83 @@ impl Catalog {
                     unix_seconds(),
                 ],
             )?;
-            transaction.execute(
-                "
-                INSERT OR IGNORE INTO chat_removal_files(source, chat_pk, path, marked_at)
-                SELECT ?1, ?2, f.path, ?3
-                FROM files f
-                WHERE f.attachment_kind IS NOT NULL
-                  AND (
-                      (
-                          f.reference_status = 'referenced'
-                          AND f.context_source = ?1
-                          AND f.message_chat_pk = ?2
-                      )
-                      OR (
-                          ?4 <> ''
-                          AND LOWER(f.chat_hint) = LOWER(?4)
-                          AND (
-                              f.reference_status <> 'referenced'
-                              OR (
-                                  f.context_source = ?1
-                                  AND f.message_chat_pk = ?2
-                              )
-                          )
-                      )
-                  )
-                ",
-                params![chat.source, chat.pk, unix_seconds(), chat.id],
-            )?;
+            processed = 1;
+            on_progress(CleanupMutationProgress {
+                processed_records: processed,
+                total_records: total,
+            })?;
+            let select_files = format!(
+                "SELECT f.id, f.path FROM files f
+                 WHERE {CHAT_REMOVAL_ATTACHMENT_PREDICATE}
+                   AND NOT EXISTS (
+                       SELECT 1 FROM chat_removal_files current
+                       WHERE current.source = ?1 AND current.chat_pk = ?2
+                         AND current.path = f.path
+                   )
+                   AND f.id > ?4
+                 ORDER BY f.id ASC
+                 LIMIT {CLEANUP_MUTATION_BATCH_SIZE}"
+            );
+            let mut last_id = 0_i64;
+            loop {
+                let batch = {
+                    let mut statement = transaction.prepare(&select_files)?;
+                    let rows = statement
+                        .query_map(params![chat.source, chat.pk, chat.id, last_id], |row| {
+                            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                        })?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                if batch.is_empty() {
+                    break;
+                }
+                last_id = batch.last().map(|item| item.0).unwrap_or(last_id);
+                let mut insert = transaction.prepare(
+                    "INSERT OR IGNORE INTO chat_removal_files(
+                         source, chat_pk, path, marked_at
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                )?;
+                let now = unix_seconds();
+                for (_, path) in &batch {
+                    insert.execute(params![chat.source, chat.pk, path, now])?;
+                }
+                processed = processed.saturating_add(batch.len() as u64).min(total);
+                on_progress(CleanupMutationProgress {
+                    processed_records: processed,
+                    total_records: total,
+                })?;
+            }
         } else {
-            transaction.execute(
-                "DELETE FROM chat_removal_files WHERE source = ?1 AND chat_pk = ?2",
-                params![chat.source, chat.pk],
-            )?;
+            loop {
+                let changed = transaction.execute(
+                    &format!(
+                        "DELETE FROM chat_removal_files
+                         WHERE rowid IN (
+                             SELECT rowid FROM chat_removal_files
+                             WHERE source = ?1 AND chat_pk = ?2
+                             LIMIT {CLEANUP_MUTATION_BATCH_SIZE}
+                         )"
+                    ),
+                    params![chat.source, chat.pk],
+                )?;
+                if changed == 0 {
+                    break;
+                }
+                processed = processed.saturating_add(changed as u64).min(total);
+                on_progress(CleanupMutationProgress {
+                    processed_records: processed,
+                    total_records: total,
+                })?;
+            }
             transaction.execute(
                 "DELETE FROM chat_removal_plan WHERE source = ?1 AND chat_pk = ?2",
                 params![chat.source, chat.pk],
             )?;
+            processed = total;
+            on_progress(CleanupMutationProgress {
+                processed_records: processed,
+                total_records: total,
+            })?;
         }
         transaction.commit()?;
         self.record_cleanup_activity(
@@ -1502,13 +1826,274 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn set_chats_removal_planned_reporting<F>(
+        &self,
+        chats: &[Chat],
+        planned: bool,
+        reason: &str,
+        mut on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(BulkChatMutationProgress) -> Result<()>,
+    {
+        if !matches!(reason, "selected" | "empty" | "system_only") {
+            bail!("invalid chat cleanup reason");
+        }
+        if chats
+            .iter()
+            .any(|chat| !matches!(chat.source.as_str(), "line" | "square"))
+        {
+            bail!("chat cleanup source must be `line` or `square`");
+        }
+        if chats.is_empty() {
+            on_progress(BulkChatMutationProgress {
+                phase: "沒有符合的聊天室",
+                processed_records: 1,
+                total_records: 1,
+            })?;
+            return Ok(());
+        }
+
+        if !planned {
+            let planned_chat_pks = {
+                let mut statement = self
+                    .connection
+                    .prepare("SELECT source, chat_pk FROM chat_removal_plan")?;
+                let rows = statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                let mut planned = HashMap::<String, HashSet<i64>>::new();
+                for row in rows {
+                    let (source, chat_pk) = row?;
+                    planned.entry(source).or_default().insert(chat_pk);
+                }
+                planned
+            };
+            let chats = chats
+                .iter()
+                .filter(|chat| {
+                    planned_chat_pks
+                        .get(&chat.source)
+                        .is_some_and(|planned| planned.contains(&chat.pk))
+                })
+                .collect::<Vec<_>>();
+            let total_records = chats.len() as u64;
+            on_progress(BulkChatMutationProgress {
+                phase: "取消聊天室清理計畫",
+                processed_records: 0,
+                total_records,
+            })?;
+            let transaction = self.connection.unchecked_transaction()?;
+            let mut delete = transaction
+                .prepare("DELETE FROM chat_removal_plan WHERE source = ?1 AND chat_pk = ?2")?;
+            for (index, chat) in chats.iter().enumerate() {
+                delete.execute(params![chat.source, chat.pk])?;
+                if (index + 1) % CLEANUP_MUTATION_BATCH_SIZE == 0 || index + 1 == chats.len() {
+                    on_progress(BulkChatMutationProgress {
+                        phase: "取消聊天室清理計畫",
+                        processed_records: (index + 1) as u64,
+                        total_records,
+                    })?;
+                }
+            }
+            drop(delete);
+            transaction.commit()?;
+            self.record_cleanup_activity(
+                "clear_chat_category_removal",
+                "chat_category",
+                "bulk",
+                chats.len() as u64,
+                0,
+            )?;
+            return Ok(());
+        }
+
+        self.connection.execute_batch(
+            "
+            CREATE TEMP TABLE IF NOT EXISTS bulk_chat_selection (
+                source TEXT NOT NULL,
+                chat_pk INTEGER NOT NULL,
+                chat_id_lower TEXT NOT NULL,
+                PRIMARY KEY(source, chat_pk)
+            );
+            CREATE INDEX IF NOT EXISTS temp.bulk_chat_selection_chat_id
+                ON bulk_chat_selection(chat_id_lower);
+            DELETE FROM temp.bulk_chat_selection;
+            ",
+        )?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let chat_total = chats.len() as u64;
+        on_progress(BulkChatMutationProgress {
+            phase: "整理並寫入聊天室",
+            processed_records: 0,
+            total_records: chat_total,
+        })?;
+        {
+            let mut stage_chat = transaction.prepare(
+                "INSERT OR REPLACE INTO temp.bulk_chat_selection(
+                     source, chat_pk, chat_id_lower
+                 ) VALUES (?1, ?2, LOWER(?3))",
+            )?;
+            let mut plan_chat = transaction.prepare(
+                "
+                INSERT INTO chat_removal_plan(
+                    source, chat_pk, chat_id, chat_title, chat_kind,
+                    message_count, human_message_count, reason, marked_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(source, chat_pk) DO UPDATE SET
+                    chat_id = excluded.chat_id,
+                    chat_title = excluded.chat_title,
+                    chat_kind = excluded.chat_kind,
+                    message_count = excluded.message_count,
+                    human_message_count = excluded.human_message_count,
+                    reason = CASE
+                        WHEN chat_removal_plan.reason = 'selected'
+                        THEN chat_removal_plan.reason
+                        ELSE excluded.reason
+                    END,
+                    marked_at = excluded.marked_at
+                ",
+            )?;
+            let now = unix_seconds();
+            for (index, chat) in chats.iter().enumerate() {
+                stage_chat.execute(params![chat.source, chat.pk, chat.id])?;
+                plan_chat.execute(params![
+                    chat.source,
+                    chat.pk,
+                    chat.id,
+                    chat.title,
+                    chat.kind,
+                    chat.message_count,
+                    chat.human_message_count,
+                    reason,
+                    now,
+                ])?;
+                if (index + 1) % CLEANUP_MUTATION_BATCH_SIZE == 0 || index + 1 == chats.len() {
+                    on_progress(BulkChatMutationProgress {
+                        phase: "整理並寫入聊天室",
+                        processed_records: (index + 1) as u64,
+                        total_records: chat_total,
+                    })?;
+                }
+            }
+        }
+
+        let attachment_total: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM files WHERE attachment_kind IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let attachment_total = attachment_total.max(0) as u64;
+        let mut processed_attachments = 0_u64;
+        let mut after_id = 0_i64;
+        on_progress(BulkChatMutationProgress {
+            phase: "掃描並寫入聊天室附件",
+            processed_records: processed_attachments,
+            total_records: attachment_total,
+        })?;
+        loop {
+            let ids = {
+                let mut statement = transaction.prepare(&format!(
+                    "SELECT id FROM files
+                     WHERE attachment_kind IS NOT NULL AND id > ?1
+                     ORDER BY id ASC
+                     LIMIT {CLEANUP_MUTATION_BATCH_SIZE}"
+                ))?;
+                let rows = statement.query_map([after_id], |row| row.get::<_, i64>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if ids.is_empty() {
+                break;
+            }
+            let batch_start = after_id;
+            after_id = *ids.last().unwrap_or(&after_id);
+            let now = unix_seconds();
+            transaction.execute(
+                "
+                INSERT OR IGNORE INTO chat_removal_files(source, chat_pk, path, marked_at)
+                SELECT selected.source, selected.chat_pk, f.path, ?3
+                FROM files f
+                JOIN temp.bulk_chat_selection selected
+                  ON selected.source = f.context_source
+                 AND selected.chat_pk = f.message_chat_pk
+                WHERE f.attachment_kind IS NOT NULL
+                  AND f.reference_status = 'referenced'
+                  AND f.id > ?1 AND f.id <= ?2
+                ",
+                params![batch_start, after_id, now],
+            )?;
+            transaction.execute(
+                "
+                INSERT OR IGNORE INTO chat_removal_files(source, chat_pk, path, marked_at)
+                SELECT selected.source, selected.chat_pk, f.path, ?3
+                FROM files f
+                JOIN temp.bulk_chat_selection selected
+                  ON selected.chat_id_lower = LOWER(f.chat_hint)
+                WHERE f.attachment_kind IS NOT NULL
+                  AND selected.chat_id_lower <> ''
+                  AND f.id > ?1 AND f.id <= ?2
+                  AND (
+                      f.reference_status <> 'referenced'
+                      OR (
+                          selected.source = f.context_source
+                          AND selected.chat_pk = f.message_chat_pk
+                      )
+                  )
+                ",
+                params![batch_start, after_id, now],
+            )?;
+            processed_attachments = processed_attachments
+                .saturating_add(ids.len() as u64)
+                .min(attachment_total);
+            on_progress(BulkChatMutationProgress {
+                phase: "掃描並寫入聊天室附件",
+                processed_records: processed_attachments,
+                total_records: attachment_total,
+            })?;
+        }
+        transaction.commit()?;
+        self.connection
+            .execute("DELETE FROM temp.bulk_chat_selection", [])?;
+        self.record_cleanup_activity(
+            "plan_chat_category_removal",
+            "chat_category",
+            "bulk",
+            chats.len() as u64,
+            0,
+        )?;
+        Ok(())
+    }
+
     pub fn plan_automatic_cleanup(
         &self,
         chats: &[Chat],
         orphan_messages: &[OrphanMessage],
     ) -> Result<()> {
+        self.plan_automatic_cleanup_reporting(chats, orphan_messages, |_| Ok(()))
+    }
+
+    pub fn plan_automatic_cleanup_reporting<F>(
+        &self,
+        chats: &[Chat],
+        orphan_messages: &[OrphanMessage],
+        mut on_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(CleanupMutationProgress) -> Result<()>,
+    {
+        let total = (chats.len() + orphan_messages.len()) as u64;
+        let mut processed = 0_u64;
+        on_progress(CleanupMutationProgress {
+            processed_records: processed,
+            total_records: total,
+        })?;
         if self.automatic_cleanup_planned()? {
             self.clear_automatic_cleanup_plan()?;
+            processed = total;
+            on_progress(CleanupMutationProgress {
+                processed_records: processed,
+                total_records: total,
+            })?;
             self.record_cleanup_activity(
                 "clear_automatic_advanced_plan",
                 "database_plan",
@@ -1525,6 +2110,11 @@ impl Catalog {
                 "system_only"
             };
             self.set_chat_removal_planned(chat, true, reason)?;
+            processed = processed.saturating_add(1).min(total);
+            on_progress(CleanupMutationProgress {
+                processed_records: processed,
+                total_records: total,
+            })?;
         }
         let transaction = self.connection.unchecked_transaction()?;
         {
@@ -1546,6 +2136,11 @@ impl Catalog {
                     message.chat_pk,
                     unix_seconds()
                 ])?;
+                processed = processed.saturating_add(1).min(total);
+                on_progress(CleanupMutationProgress {
+                    processed_records: processed,
+                    total_records: total,
+                })?;
             }
         }
         transaction.commit()?;
@@ -2497,6 +3092,18 @@ impl Catalog {
         group_key: &str,
         action: &str,
     ) -> Result<CleanupOverview> {
+        self.apply_cleanup_group_action_reporting(group_key, action, |_| Ok(()))
+    }
+
+    pub fn apply_cleanup_group_action_reporting<F>(
+        &self,
+        group_key: &str,
+        action: &str,
+        mut on_progress: F,
+    ) -> Result<CleanupOverview>
+    where
+        F: FnMut(CleanupMutationProgress) -> Result<()>,
+    {
         validate_cleanup_group_key(group_key)?;
         if !matches!(action, "toggle_all" | "keep_thumbnail") {
             bail!("cleanup group action must be `toggle_all` or `keep_thumbnail`");
@@ -2541,24 +3148,13 @@ impl Catalog {
         if total == 0 {
             bail!("cleanup group does not exist");
         }
-        let now = unix_seconds();
+        let transaction = self.connection.unchecked_transaction()?;
+        let mut operations = Vec::<(String, bool)>::new();
         if action == "toggle_all" {
             if marked == total {
-                self.connection.execute(
-                    &format!(
-                        "DELETE FROM removal_plan
-                         WHERE path IN (SELECT f.path FROM files f WHERE {predicate})"
-                    ),
-                    [group_key],
-                )?;
+                operations.push((predicate.clone(), false));
             } else {
-                self.connection.execute(
-                    &format!(
-                        "INSERT OR REPLACE INTO removal_plan(path, marked_at, reason)
-                         SELECT f.path, ?2, 'manual' FROM files f WHERE {predicate}"
-                    ),
-                    params![group_key, now],
-                )?;
+                operations.push((predicate.clone(), true));
             }
         } else {
             if thumbnail_backed_images == 0 {
@@ -2567,40 +3163,307 @@ impl Catalog {
             let keeping_thumbnails = marked_thumbnail_backed_images == thumbnail_backed_images
                 && marked_image_thumbnails == 0;
             if keeping_thumbnails {
-                self.connection.execute(
-                    &format!(
-                        "DELETE FROM removal_plan
-                         WHERE path IN (
-                             SELECT f.path FROM files f
-                             WHERE {predicate} AND ({THUMBNAIL_BACKED_IMAGE_EXPR})
-                         )"
-                    ),
-                    [group_key],
-                )?;
+                operations.push((
+                    format!("{predicate} AND ({THUMBNAIL_BACKED_IMAGE_EXPR})"),
+                    false,
+                ));
             } else {
-                self.connection.execute(
-                    &format!(
-                        "INSERT OR REPLACE INTO removal_plan(path, marked_at, reason)
-                         SELECT f.path, ?2, 'manual' FROM files f
-                         WHERE {predicate} AND ({THUMBNAIL_BACKED_IMAGE_EXPR})"
-                    ),
-                    params![group_key, now],
-                )?;
-                self.connection.execute(
-                    &format!(
-                        "DELETE FROM removal_plan
-                         WHERE path IN (
-                             SELECT f.path FROM files f
-                             WHERE {predicate} AND ({IMAGE_THUMBNAIL_WITH_ORIGINAL_EXPR})
-                         )"
-                    ),
-                    [group_key],
-                )?;
+                operations.push((
+                    format!("{predicate} AND ({THUMBNAIL_BACKED_IMAGE_EXPR})"),
+                    true,
+                ));
+                operations.push((
+                    format!("{predicate} AND ({IMAGE_THUMBNAIL_WITH_ORIGINAL_EXPR})"),
+                    false,
+                ));
             }
         }
+        let total_records = operations.iter().try_fold(0_u64, |total, (filter, mark)| {
+            Ok::<_, anyhow::Error>(total.saturating_add(direct_plan_change_count(
+                &transaction,
+                filter,
+                group_key,
+                *mark,
+            )?))
+        })?;
+        let mut processed = 0_u64;
+        on_progress(CleanupMutationProgress {
+            processed_records: processed,
+            total_records,
+        })?;
+        for (filter, mark) in operations {
+            apply_direct_plan_changes(
+                &transaction,
+                &filter,
+                group_key,
+                mark,
+                "manual",
+                &mut processed,
+                total_records,
+                &mut on_progress,
+            )?;
+        }
+        transaction.commit()?;
         let overview = self.cleanup_overview()?;
         self.record_cleanup_activity(action, "cleanup_group", group_key, 0, 0)?;
         Ok(overview)
+    }
+
+    pub fn apply_cleanup_category_action<F>(
+        &self,
+        category: &str,
+        action: &str,
+        mut on_progress: F,
+    ) -> Result<CleanupOverview>
+    where
+        F: FnMut(CleanupMutationProgress) -> Result<()>,
+    {
+        let supported_category = matches!(
+            category,
+            "all" | "individual" | "group" | "community" | "unreferenced" | "unconfirmed"
+        );
+        if !supported_category {
+            bail!("unsupported cleanup category action");
+        }
+        if !matches!(
+            action,
+            "keep_thumbnail" | "clear_keep_thumbnail" | "delete_all" | "clear_delete_all"
+        ) {
+            bail!(
+                "cleanup category action must be `keep_thumbnail`, `clear_keep_thumbnail`, \
+                 `delete_all`, or `clear_delete_all`"
+            );
+        }
+        if matches!(action, "keep_thumbnail" | "clear_keep_thumbnail")
+            && !matches!(category, "all" | "individual" | "group" | "community")
+        {
+            bail!("keep-thumbnail category action requires a chat-backed category");
+        }
+
+        let category_predicate = if category == "all" {
+            "f.attachment_kind IS NOT NULL AND ?1 = 'all'".to_string()
+        } else {
+            format!("f.attachment_kind IS NOT NULL AND ({CLEANUP_CATEGORY_EXPR}) = ?1")
+        };
+        let operations = if matches!(action, "keep_thumbnail" | "clear_keep_thumbnail") {
+            let keep_thumbnail_predicate = format!(
+                "{category_predicate}
+                 AND NOT EXISTS (
+                     SELECT 1 FROM chat_removal_plan planned_chat
+                     WHERE planned_chat.source = f.context_source
+                       AND planned_chat.chat_pk = f.message_chat_pk
+                 )"
+            );
+            if action == "keep_thumbnail" {
+                vec![
+                    (
+                        format!("{keep_thumbnail_predicate} AND ({THUMBNAIL_BACKED_IMAGE_EXPR})"),
+                        true,
+                    ),
+                    (
+                        format!(
+                            "{keep_thumbnail_predicate} AND ({IMAGE_THUMBNAIL_WITH_ORIGINAL_EXPR})"
+                        ),
+                        false,
+                    ),
+                ]
+            } else {
+                vec![(
+                    format!(
+                        "{keep_thumbnail_predicate}
+                         AND ({THUMBNAIL_BACKED_IMAGE_EXPR})
+                         AND direct.reason = 'manual'"
+                    ),
+                    false,
+                )]
+            }
+        } else if action == "clear_delete_all" {
+            vec![(
+                format!("{category_predicate} AND direct.reason = 'manual'"),
+                false,
+            )]
+        } else {
+            vec![(category_predicate, true)]
+        };
+        let transaction = self.connection.unchecked_transaction()?;
+        let total_records = operations.iter().try_fold(0_u64, |total, (filter, mark)| {
+            Ok::<_, anyhow::Error>(total.saturating_add(direct_plan_change_count(
+                &transaction,
+                filter,
+                category,
+                *mark,
+            )?))
+        })?;
+        let mut processed = 0_u64;
+        on_progress(CleanupMutationProgress {
+            processed_records: processed,
+            total_records,
+        })?;
+        for (filter, mark) in operations {
+            apply_direct_plan_changes(
+                &transaction,
+                &filter,
+                category,
+                mark,
+                "manual",
+                &mut processed,
+                total_records,
+                &mut on_progress,
+            )?;
+        }
+        transaction.commit()?;
+        self.record_cleanup_activity(action, "cleanup_category", category, total_records, 0)?;
+        self.cleanup_overview()
+    }
+
+    pub fn cleanup_category_action_state(
+        &self,
+        category: &str,
+    ) -> Result<CleanupCategoryActionState> {
+        let supported_category = matches!(
+            category,
+            "all" | "individual" | "group" | "community" | "unreferenced" | "unconfirmed"
+        );
+        if !supported_category {
+            bail!("unsupported cleanup category action state");
+        }
+        let chat_backed = matches!(category, "all" | "individual" | "group" | "community");
+        let category_predicate = if category == "all" {
+            "f.attachment_kind IS NOT NULL AND ?1 = 'all'".to_string()
+        } else {
+            format!("f.attachment_kind IS NOT NULL AND ({CLEANUP_CATEGORY_EXPR}) = ?1")
+        };
+        let (
+            attachment_count,
+            marked_attachment_count,
+            manual_marked_attachment_count,
+            thumbnail_candidate_count,
+            marked_thumbnail_candidate_count,
+            manual_thumbnail_candidate_count,
+            marked_image_thumbnail_count,
+        ): (i64, i64, i64, i64, i64, i64, i64) = if chat_backed {
+            let sql = format!(
+                "
+                SELECT COUNT(*),
+                       COALESCE(SUM(CASE WHEN direct.path IS NOT NULL THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN direct.reason = 'manual' THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE
+                           WHEN ({THUMBNAIL_BACKED_IMAGE_EXPR})
+                            AND NOT EXISTS (
+                                SELECT 1 FROM chat_removal_plan planned_chat
+                                WHERE planned_chat.source = f.context_source
+                                  AND planned_chat.chat_pk = f.message_chat_pk
+                            )
+                           THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE
+                           WHEN ({THUMBNAIL_BACKED_IMAGE_EXPR})
+                            AND NOT EXISTS (
+                                SELECT 1 FROM chat_removal_plan planned_chat
+                                WHERE planned_chat.source = f.context_source
+                                  AND planned_chat.chat_pk = f.message_chat_pk
+                            )
+                            AND direct.path IS NOT NULL
+                           THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE
+                           WHEN ({THUMBNAIL_BACKED_IMAGE_EXPR})
+                            AND NOT EXISTS (
+                                SELECT 1 FROM chat_removal_plan planned_chat
+                                WHERE planned_chat.source = f.context_source
+                                  AND planned_chat.chat_pk = f.message_chat_pk
+                            )
+                            AND direct.reason = 'manual'
+                           THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE
+                           WHEN ({IMAGE_THUMBNAIL_WITH_ORIGINAL_EXPR})
+                            AND NOT EXISTS (
+                                SELECT 1 FROM chat_removal_plan planned_chat
+                                WHERE planned_chat.source = f.context_source
+                                  AND planned_chat.chat_pk = f.message_chat_pk
+                            )
+                            AND direct.path IS NOT NULL
+                           THEN 1 ELSE 0 END), 0)
+                FROM files f
+                LEFT JOIN removal_plan direct ON direct.path = f.path
+                WHERE {category_predicate}
+                "
+            );
+            self.connection.query_row(&sql, [category], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })?
+        } else {
+            let sql = format!(
+                "
+                SELECT COUNT(*),
+                       COALESCE(SUM(CASE WHEN direct.path IS NOT NULL THEN 1 ELSE 0 END), 0),
+                       COALESCE(SUM(CASE WHEN direct.reason = 'manual' THEN 1 ELSE 0 END), 0)
+                FROM files f
+                LEFT JOIN removal_plan direct ON direct.path = f.path
+                WHERE {category_predicate}
+                "
+            );
+            let values: (i64, i64, i64) = self.connection.query_row(&sql, [category], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+            (values.0, values.1, values.2, 0, 0, 0, 0)
+        };
+
+        let (chat_count, planned_chat_count): (i64, i64) = if chat_backed {
+            let chat_kind = match category {
+                "individual" => "direct",
+                "group" => "group",
+                "community" => "community",
+                _ => "all",
+            };
+            self.connection.query_row(
+                "
+                SELECT COUNT(*),
+                       COALESCE(SUM(CASE WHEN planned.chat_pk IS NOT NULL THEN 1 ELSE 0 END), 0)
+                FROM chats indexed_chat
+                LEFT JOIN chat_removal_plan planned
+                  ON planned.source = indexed_chat.source
+                 AND planned.chat_pk = indexed_chat.chat_pk
+                WHERE ?1 = 'all' OR indexed_chat.chat_kind = ?1
+                ",
+                [chat_kind],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?
+        } else {
+            (0, 0)
+        };
+
+        let attachment_count = attachment_count.max(0) as u64;
+        let marked_attachment_count = marked_attachment_count.max(0) as u64;
+        let manual_marked_attachment_count = manual_marked_attachment_count.max(0) as u64;
+        let thumbnail_candidate_count = thumbnail_candidate_count.max(0) as u64;
+        let marked_thumbnail_candidate_count = marked_thumbnail_candidate_count.max(0) as u64;
+        let manual_thumbnail_candidate_count = manual_thumbnail_candidate_count.max(0) as u64;
+        let marked_image_thumbnail_count = marked_image_thumbnail_count.max(0) as u64;
+        let chat_count = chat_count.max(0) as u64;
+        let planned_chat_count = planned_chat_count.max(0) as u64;
+        Ok(CleanupCategoryActionState {
+            category: category.to_string(),
+            attachment_count,
+            marked_attachment_count,
+            thumbnail_candidate_count,
+            chat_count,
+            planned_chat_count,
+            keeping_all_thumbnails: thumbnail_candidate_count > 0
+                && marked_thumbnail_candidate_count == thumbnail_candidate_count
+                && manual_thumbnail_candidate_count > 0
+                && marked_image_thumbnail_count == 0,
+            deleting_all_attachments: attachment_count > 0
+                && marked_attachment_count == attachment_count
+                && manual_marked_attachment_count > 0,
+            deleting_all_chats: chat_count > 0 && planned_chat_count == chat_count,
+        })
     }
 
     pub fn hash_duplicate_candidates<F>(
@@ -3080,6 +3943,128 @@ impl Catalog {
             .execute("DELETE FROM meta WHERE key = ?1", [key])?;
         Ok(())
     }
+}
+
+fn chat_removal_change_count(connection: &Connection, chat: &Chat, planned: bool) -> Result<u64> {
+    let attachment_changes: i64 = if planned {
+        connection.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM files f
+                 WHERE {CHAT_REMOVAL_ATTACHMENT_PREDICATE}
+                   AND NOT EXISTS (
+                       SELECT 1 FROM chat_removal_files current
+                       WHERE current.source = ?1 AND current.chat_pk = ?2
+                         AND current.path = f.path
+                   )"
+            ),
+            params![chat.source, chat.pk, chat.id],
+            |row| row.get(0),
+        )?
+    } else {
+        connection.query_row(
+            "SELECT COUNT(*) FROM chat_removal_files WHERE source = ?1 AND chat_pk = ?2",
+            params![chat.source, chat.pk],
+            |row| row.get(0),
+        )?
+    };
+    Ok((attachment_changes.max(0) as u64).saturating_add(1))
+}
+
+fn direct_plan_change_count(
+    transaction: &Transaction<'_>,
+    predicate: &str,
+    scope: &str,
+    mark: bool,
+) -> Result<u64> {
+    let sql = if mark {
+        format!(
+            "SELECT COUNT(*)
+             FROM files f
+             LEFT JOIN removal_plan direct ON direct.path = f.path
+             WHERE ({predicate}) AND direct.path IS NULL"
+        )
+    } else {
+        format!(
+            "SELECT COUNT(*)
+             FROM removal_plan direct
+             JOIN files f ON f.path = direct.path
+             WHERE {predicate}"
+        )
+    };
+    let count: i64 = transaction.query_row(&sql, [scope], |row| row.get(0))?;
+    Ok(count.max(0) as u64)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_direct_plan_changes<F>(
+    transaction: &Transaction<'_>,
+    predicate: &str,
+    scope: &str,
+    mark: bool,
+    reason: &str,
+    processed: &mut u64,
+    total: u64,
+    on_progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(CleanupMutationProgress) -> Result<()>,
+{
+    let select_sql = if mark {
+        format!(
+            "SELECT f.id, f.path
+             FROM files f
+             LEFT JOIN removal_plan direct ON direct.path = f.path
+             WHERE ({predicate}) AND direct.path IS NULL AND f.id > ?2
+             ORDER BY f.id ASC
+             LIMIT {CLEANUP_MUTATION_BATCH_SIZE}"
+        )
+    } else {
+        format!(
+            "SELECT f.id, direct.path
+             FROM removal_plan direct
+             JOIN files f ON f.path = direct.path
+             WHERE ({predicate}) AND f.id > ?2
+             ORDER BY f.id ASC
+             LIMIT {CLEANUP_MUTATION_BATCH_SIZE}"
+        )
+    };
+    let mut last_id = 0_i64;
+    loop {
+        let batch = {
+            let mut statement = transaction.prepare(&select_sql)?;
+            let rows = statement.query_map(params![scope, last_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if batch.is_empty() {
+            break;
+        }
+        last_id = batch.last().map(|item| item.0).unwrap_or(last_id);
+        if mark {
+            let mut insert = transaction.prepare(
+                "INSERT INTO removal_plan(path, marked_at, reason) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(path) DO UPDATE SET
+                     marked_at = excluded.marked_at,
+                     reason = excluded.reason",
+            )?;
+            let now = unix_seconds();
+            for (_, path) in &batch {
+                insert.execute(params![path, now, reason])?;
+            }
+        } else {
+            let mut delete = transaction.prepare("DELETE FROM removal_plan WHERE path = ?1")?;
+            for (_, path) in &batch {
+                delete.execute([path])?;
+            }
+        }
+        *processed = processed.saturating_add(batch.len() as u64).min(total);
+        on_progress(CleanupMutationProgress {
+            processed_records: *processed,
+            total_records: total,
+        })?;
+    }
+    Ok(())
 }
 
 fn insert_records(

@@ -214,6 +214,11 @@ test("forwards cleanup detail and group actions without exposing arbitrary metho
   });
   await provider.listCleanupReviews("chat:u1");
   await provider.applyCleanupGroupAction("chat:u1", "keep_thumbnail");
+  await provider.cleanupCategoryActionState("community");
+  await provider.applyCleanupCategoryAction("community", "keep_thumbnail");
+  await provider.applyCleanupCategoryAction("community", "clear_keep_thumbnail");
+  await provider.applyCleanupCategoryAction("unconfirmed", "delete_all");
+  await provider.applyCleanupCategoryAction("unconfirmed", "clear_delete_all");
   await provider.planSafeAttachmentCleanup();
   await provider.clearManualAttachmentPlan();
   await provider.clearAllRemovalPlans();
@@ -222,13 +227,41 @@ test("forwards cleanup detail and group actions without exposing arbitrary metho
     method: "applyCleanupGroupAction",
     params: { groupKey: "chat:u1", action: "keep_thumbnail" }
   });
-  assert.deepEqual(calls.slice(2), [
+  assert.deepEqual(calls[2], {
+    method: "cleanupCategoryActionState",
+    params: { category: "community" }
+  });
+  assert.deepEqual(calls[3], {
+    method: "applyCleanupCategoryAction",
+    params: { category: "community", action: "keep_thumbnail" }
+  });
+  assert.deepEqual(calls[4], {
+    method: "applyCleanupCategoryAction",
+    params: { category: "community", action: "clear_keep_thumbnail" }
+  });
+  assert.deepEqual(calls[5], {
+    method: "applyCleanupCategoryAction",
+    params: { category: "unconfirmed", action: "delete_all" }
+  });
+  assert.deepEqual(calls[6], {
+    method: "applyCleanupCategoryAction",
+    params: { category: "unconfirmed", action: "clear_delete_all" }
+  });
+  assert.deepEqual(calls.slice(7), [
     { method: "planSafeAttachmentCleanup", params: {} },
     { method: "clearManualAttachmentPlan", params: {} },
     { method: "clearAllRemovalPlans", params: {} }
   ]);
   assert.throws(
     () => provider.applyCleanupGroupAction("chat:u1", "delete_now"),
+    TypeError
+  );
+  assert.throws(
+    () => provider.applyCleanupCategoryAction("unconfirmed", "keep_thumbnail"),
+    TypeError
+  );
+  assert.throws(
+    () => provider.cleanupCategoryActionState("no_attachments"),
     TypeError
   );
 });
@@ -289,6 +322,7 @@ test("validates and forwards advanced SQLite cleanup operations", async () => {
   });
   await provider.advancedCleanupReport();
   await provider.setChatRemovalPlanned("square", 8, true);
+  await provider.setCleanupCategoryChatsRemovalPlanned("community", true);
   await provider.planAutomaticCleanup();
   await provider.clearAdvancedCleanupPlan();
   assert.deepEqual(calls, [
@@ -296,6 +330,10 @@ test("validates and forwards advanced SQLite cleanup operations", async () => {
     {
       method: "setChatRemovalPlanned",
       params: { source: "square", chatPk: 8, planned: true }
+    },
+    {
+      method: "setCleanupCategoryChatsRemovalPlanned",
+      params: { category: "community", planned: true }
     },
     { method: "planAutomaticCleanup", params: {} },
     { method: "clearAdvancedCleanupPlan", params: {} }
@@ -306,6 +344,10 @@ test("validates and forwards advanced SQLite cleanup operations", async () => {
   );
   assert.throws(
     () => provider.setChatRemovalPlanned("line", "not-a-pk", true),
+    TypeError
+  );
+  assert.throws(
+    () => provider.setCleanupCategoryChatsRemovalPlanned("unconfirmed", true),
     TypeError
   );
 });

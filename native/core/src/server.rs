@@ -14,8 +14,8 @@ use crate::database::{
 };
 use crate::model::{
     AdvancedCleanupReport, AttachmentCursor, AttachmentKind, Chat, ChatCursor, ChatPage,
-    CleanupGroupPage, CleanupPreflightReport, CleanupRisk, DEFAULT_PAGE_SIZE, DuplicateGroupCursor,
-    MessageCursor, MessagePage,
+    CleanupCategoryActionState, CleanupGroupPage, CleanupPreflightReport, CleanupRisk,
+    DEFAULT_PAGE_SIZE, DuplicateGroupCursor, MessageCursor, MessagePage,
 };
 use crate::performance::system_performance_profile;
 use crate::source::{PreparedSource, SourceKind, prepare_source_reporting};
@@ -338,6 +338,26 @@ struct CleanupReviewParams {
 struct CleanupGroupActionParams {
     group_key: String,
     action: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupCategoryActionParams {
+    category: String,
+    action: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupCategoryActionStateParams {
+    category: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupCategoryChatsRemovalParams {
+    category: String,
+    planned: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -710,6 +730,8 @@ fn handle_request<W: Write>(
                             "referencedFiles": progress.referenced_files,
                             "unreferencedFiles": progress.unreferenced_files,
                             "unconfirmedFiles": progress.unconfirmed_files,
+                            "repairedFiles": progress.repaired_files,
+                            "repairTotalFiles": progress.repair_total_files,
                         }),
                     );
                 },
@@ -732,15 +754,35 @@ fn handle_request<W: Write>(
         }
         "setAttachmentMarked" => {
             let params: MarkParams = parse_params(request)?;
+            write_cleanup_mutation_progress(output, request, "寫入附件標記", 0, 1)?;
             session.catalog.set_marked(&params.path, params.marked)?;
+            write_cleanup_mutation_progress(output, request, "寫入附件標記", 1, 1)?;
             Ok(serde_json::to_value(session.catalog.stats()?)?)
         }
-        "clearManualAttachmentPlan" => Ok(serde_json::to_value(
-            session.catalog.clear_manual_attachment_plan()?,
-        )?),
-        "clearAllRemovalPlans" => Ok(serde_json::to_value(
-            session.catalog.clear_all_user_removal_plans()?,
-        )?),
+        "clearManualAttachmentPlan" => {
+            let request_id = request.id.clone();
+            let job_id = request.job_id.clone();
+            Ok(serde_json::to_value(
+                session
+                    .catalog
+                    .clear_manual_attachment_plan_reporting(|progress| {
+                        write_cleanup_mutation_progress_values(
+                            output,
+                            &request_id,
+                            job_id.as_deref(),
+                            "清除手動標記",
+                            progress.processed_records,
+                            progress.total_records,
+                        )
+                    })?,
+            )?)
+        }
+        "clearAllRemovalPlans" => {
+            write_cleanup_mutation_progress(output, request, "清除清理計畫", 0, 1)?;
+            let overview = session.catalog.clear_all_user_removal_plans()?;
+            write_cleanup_mutation_progress(output, request, "清除清理計畫", 1, 1)?;
+            Ok(serde_json::to_value(overview)?)
+        }
         "stageAttachmentPreview" => {
             let params: PreviewParams = parse_params(request)?;
             Ok(serde_json::to_value(
@@ -753,6 +795,13 @@ fn handle_request<W: Write>(
         }
         "catalogStats" => Ok(serde_json::to_value(session.catalog.stats()?)?),
         "cleanupOverview" => Ok(serde_json::to_value(session.catalog.cleanup_overview()?)?),
+        "cleanupCategoryActionState" => {
+            let params: CleanupCategoryActionStateParams = parse_params(request)?;
+            let state: CleanupCategoryActionState = session
+                .catalog
+                .cleanup_category_action_state(&params.category)?;
+            Ok(serde_json::to_value(state)?)
+        }
         "cleanupPreflight" => {
             let params = if request.params.is_null() {
                 CleanupPreflightParams {
@@ -807,15 +856,106 @@ fn handle_request<W: Write>(
         }
         "applyCleanupGroupAction" => {
             let params: CleanupGroupActionParams = parse_params(request)?;
+            let request_id = request.id.clone();
+            let job_id = request.job_id.clone();
+            Ok(serde_json::to_value(
+                session.catalog.apply_cleanup_group_action_reporting(
+                    &params.group_key,
+                    &params.action,
+                    |progress| {
+                        write_cleanup_mutation_progress_values(
+                            output,
+                            &request_id,
+                            job_id.as_deref(),
+                            "更新聊天室附件標記",
+                            progress.processed_records,
+                            progress.total_records,
+                        )
+                    },
+                )?,
+            )?)
+        }
+        "applyCleanupCategoryAction" => {
+            let params: CleanupCategoryActionParams = parse_params(request)?;
+            let request_id = request.id.clone();
+            let job_id = request.job_id.clone();
+            let progress_phase = if params.action.starts_with("clear_") {
+                "取消分類附件標記"
+            } else {
+                "寫入分類附件標記"
+            };
+            Ok(serde_json::to_value(
+                session.catalog.apply_cleanup_category_action(
+                    &params.category,
+                    &params.action,
+                    |progress| {
+                        write_cleanup_mutation_progress_values(
+                            output,
+                            &request_id,
+                            job_id.as_deref(),
+                            progress_phase,
+                            progress.processed_records,
+                            progress.total_records,
+                        )
+                    },
+                )?,
+            )?)
+        }
+        "setCleanupCategoryChatsRemovalPlanned" => {
+            let params: CleanupCategoryChatsRemovalParams = parse_params(request)?;
+            let kind = match params.category.as_str() {
+                "all" => None,
+                "individual" => Some("direct"),
+                "group" => Some("group"),
+                "community" => Some("community"),
+                _ => anyhow::bail!("unsupported chat cleanup category"),
+            };
+            let chats = if session.catalog.chat_index_is_current()? {
+                session.catalog.indexed_chats_for_cleanup(kind)?
+            } else {
+                let mut chats = all_chats_for_cleanup(session)?;
+                if let Some(kind) = kind {
+                    chats.retain(|chat| chat.kind == kind);
+                }
+                chats
+            };
+            let request_id = request.id.clone();
+            let job_id = request.job_id.clone();
+            session.catalog.set_chats_removal_planned_reporting(
+                &chats,
+                params.planned,
+                "selected",
+                |progress| {
+                    write_cleanup_mutation_progress_values(
+                        output,
+                        &request_id,
+                        job_id.as_deref(),
+                        progress.phase,
+                        progress.processed_records,
+                        progress.total_records,
+                    )
+                },
+            )?;
+            Ok(serde_json::to_value(advanced_cleanup_report(session)?)?)
+        }
+        "planSafeAttachmentCleanup" => {
+            let request_id = request.id.clone();
+            let job_id = request.job_id.clone();
             Ok(serde_json::to_value(
                 session
                     .catalog
-                    .apply_cleanup_group_action(&params.group_key, &params.action)?,
+                    .plan_safe_attachment_cleanup_reporting(|progress| {
+                        write_cleanup_mutation_progress_values(
+                            output,
+                            &request_id,
+                            job_id.as_deref(),
+                            "寫入安全清理標記",
+                            progress.processed_records,
+                            progress.total_records,
+                        )
+                    })?,
             )?)
         }
-        "planSafeAttachmentCleanup" => Ok(serde_json::to_value(
-            session.catalog.plan_safe_attachment_cleanup()?,
-        )?),
         "advancedCleanupReport" => Ok(serde_json::to_value(advanced_cleanup_report(session)?)?),
         "setChatRemovalPlanned" => {
             let params: ChatRemovalParams = parse_params(request)?;
@@ -828,22 +968,51 @@ fn handle_request<W: Write>(
                     .chat_for_cleanup(params.chat_pk)?,
                 _ => anyhow::bail!("chat cleanup source must be `line` or `square`"),
             };
-            session
-                .catalog
-                .set_chat_removal_planned(&chat, params.planned, "selected")?;
+            let request_id = request.id.clone();
+            let job_id = request.job_id.clone();
+            session.catalog.set_chat_removal_planned_reporting(
+                &chat,
+                params.planned,
+                "selected",
+                |progress| {
+                    write_cleanup_mutation_progress_values(
+                        output,
+                        &request_id,
+                        job_id.as_deref(),
+                        "更新聊天室清理計畫",
+                        progress.processed_records,
+                        progress.total_records,
+                    )
+                },
+            )?;
             Ok(serde_json::to_value(advanced_cleanup_report(session)?)?)
         }
         "planAutomaticCleanup" => {
             let analysis = analyze_advanced_cleanup(session)?;
-            session
-                .catalog
-                .plan_automatic_cleanup(&analysis.chats, &analysis.orphan_messages)?;
+            let request_id = request.id.clone();
+            let job_id = request.job_id.clone();
+            session.catalog.plan_automatic_cleanup_reporting(
+                &analysis.chats,
+                &analysis.orphan_messages,
+                |progress| {
+                    write_cleanup_mutation_progress_values(
+                        output,
+                        &request_id,
+                        job_id.as_deref(),
+                        "更新自動清理計畫",
+                        progress.processed_records,
+                        progress.total_records,
+                    )
+                },
+            )?;
             Ok(serde_json::to_value(report_from_analysis(
                 session, &analysis,
             )?)?)
         }
         "clearAdvancedCleanupPlan" => {
+            write_cleanup_mutation_progress(output, request, "清除進階清理計畫", 0, 1)?;
             session.catalog.clear_advanced_cleanup_plan()?;
+            write_cleanup_mutation_progress(output, request, "清除進階清理計畫", 1, 1)?;
             Ok(serde_json::to_value(advanced_cleanup_report(session)?)?)
         }
         "hashDuplicateCandidates" => {
@@ -1208,6 +1377,18 @@ fn list_empty_attachment_chats(
     session: &NativeSession,
     params: &CleanupPageParams,
 ) -> Result<CleanupGroupPage> {
+    let chats = all_chats_for_cleanup(session)?;
+    session.catalog.list_empty_attachment_chats(
+        chats,
+        params.page,
+        params.page_size,
+        params.search.as_deref(),
+        &params.kind,
+        &params.sort,
+    )
+}
+
+fn all_chats_for_cleanup(session: &NativeSession) -> Result<Vec<Chat>> {
     let mut chats = session.database.all_chats_for_cleanup()?;
     session.database.enrich_chat_titles(
         &mut chats,
@@ -1217,14 +1398,7 @@ fn list_empty_attachment_chats(
     if let Some(square_database) = session.square_database.as_ref() {
         chats.extend(square_database.all_chats_for_cleanup()?);
     }
-    session.catalog.list_empty_attachment_chats(
-        chats,
-        params.page,
-        params.page_size,
-        params.search.as_deref(),
-        &params.kind,
-        &params.sort,
-    )
+    Ok(chats)
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(request: &Request) -> Result<T> {
@@ -1274,6 +1448,44 @@ fn default_cleanup_category() -> String {
 
 fn default_cleanup_sort() -> String {
     "size".to_string()
+}
+
+fn write_cleanup_mutation_progress<W: Write>(
+    output: &mut W,
+    request: &Request,
+    phase: &str,
+    processed_records: u64,
+    total_records: u64,
+) -> Result<()> {
+    write_cleanup_mutation_progress_values(
+        output,
+        &request.id,
+        request.job_id.as_deref(),
+        phase,
+        processed_records,
+        total_records,
+    )
+}
+
+fn write_cleanup_mutation_progress_values<W: Write>(
+    output: &mut W,
+    request_id: &str,
+    job_id: Option<&str>,
+    phase: &str,
+    processed_records: u64,
+    total_records: u64,
+) -> Result<()> {
+    write_json_line(
+        output,
+        &json!({
+            "event": "cleanupMutationProgress",
+            "requestId": request_id,
+            "jobId": job_id,
+            "phase": phase,
+            "processedRecords": processed_records,
+            "totalRecords": total_records,
+        }),
+    )
 }
 
 fn write_error<W: Write>(

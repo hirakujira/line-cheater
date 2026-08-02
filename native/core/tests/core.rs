@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 use line_backup_native::{
-    AttachmentKind, CandidateOptions, Catalog, ChatCursor, LineDatabase, LineSquareDatabase,
+    AttachmentKind, CandidateOptions, Catalog, Chat, ChatCursor, LineDatabase, LineSquareDatabase,
     MessageCursor, NativeSession, PreparePhase, SourceKind, UnifiedGroupDatabase, build_candidate,
     build_candidate_with_options, inspect_source, line_square_rebuild_required, prepare_source,
     prepare_source_reporting, serve,
@@ -991,7 +991,393 @@ fn indexes_attachment_contexts_in_large_bounded_batches() {
     assert_eq!(progress.referenced_files, 903);
     assert_eq!(progress.unreferenced_files, 0);
     assert_eq!(progress.unconfirmed_files, 0);
-    assert_eq!(progress_reports.len(), 4);
+    assert_eq!(progress_reports.len(), 5);
+    assert_eq!(progress_reports.last().unwrap().repair_total_files, 0);
+}
+
+#[test]
+fn repairs_unconfirmed_image_original_from_unique_referenced_thumbnail() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let work = temporary.path().join("repair-context-work");
+    let prepared = prepare_source(&source, &work).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let catalog_path = work.join("catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .index_attachment_contexts(&database, None, None, |_| {})
+        .unwrap();
+    drop(catalog);
+
+    let connection = Connection::open(&catalog_path).unwrap();
+    connection
+        .execute(
+            "UPDATE files SET
+                 message_pk = NULL, message_chat_pk = NULL, message_timestamp = NULL,
+                 message_sender_pk = NULL, message_sender_name = NULL,
+                 message_content_type = NULL, message_text = NULL, context_source = NULL,
+                 context_chat_id = NULL, context_chat_title = NULL, context_chat_kind = NULL,
+                 reference_status = 'unconfirmed'
+             WHERE attachment_kind = 'original' AND message_id = '12345678'",
+            [],
+        )
+        .unwrap();
+    connection.close().unwrap();
+
+    let catalog = Catalog::open(&catalog_path).unwrap();
+    assert_eq!(
+        catalog
+            .repair_image_contexts_from_unique_counterparts()
+            .unwrap(),
+        1
+    );
+    let groups = catalog
+        .list_cleanup_groups(1, 24, None, "all", "individual", "recent")
+        .unwrap();
+    assert_eq!(groups.items.len(), 1);
+    assert_eq!(groups.items[0].reference_status, "referenced");
+    assert_eq!(groups.items[0].thumbnail_backed_image_count, 1);
+}
+
+#[test]
+fn repairs_community_image_pair_across_container_roots_in_both_directions() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    add_square_fixture(&source);
+    let community_thumbnail = source.join(
+        "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test/Message Thumbnails/square-chat/23456789.thumb",
+    );
+    fs::create_dir_all(community_thumbnail.parent().unwrap()).unwrap();
+    fs::write(&community_thumbnail, b"community thumbnail").unwrap();
+
+    let work = temporary.path().join("community-repair-work");
+    let prepared = prepare_source(&source, &work).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let square_database =
+        LineSquareDatabase::open(prepared.square_database_path.as_deref().unwrap()).unwrap();
+    let catalog_path = work.join("catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .index_attachment_contexts(&database, Some(&square_database), None, |_| {})
+        .unwrap();
+    drop(catalog);
+
+    let clear_context = |kind: &str, status: &str| {
+        let connection = Connection::open(&catalog_path).unwrap();
+        connection
+            .execute(
+                "UPDATE files SET
+                     message_pk = NULL, message_chat_pk = NULL, message_timestamp = NULL,
+                     message_sender_pk = NULL, message_sender_name = NULL,
+                     message_content_type = NULL, message_text = NULL, context_source = NULL,
+                     context_chat_id = NULL, context_chat_title = NULL, context_chat_kind = NULL,
+                     reference_status = ?1
+                 WHERE attachment_kind = ?2 AND message_id = '23456789'",
+                params![status, kind],
+            )
+            .unwrap();
+        connection.close().unwrap();
+    };
+
+    clear_context("original", "unreferenced");
+    let catalog = Catalog::open(&catalog_path).unwrap();
+    assert_eq!(
+        catalog
+            .repair_image_contexts_from_unique_counterparts()
+            .unwrap(),
+        1
+    );
+    drop(catalog);
+
+    clear_context("thumbnail", "unconfirmed");
+    let catalog = Catalog::open(&catalog_path).unwrap();
+    assert_eq!(
+        catalog
+            .repair_image_contexts_from_unique_counterparts()
+            .unwrap(),
+        1
+    );
+    let communities = catalog
+        .list_cleanup_groups(1, 24, None, "all", "community", "recent")
+        .unwrap();
+    assert_eq!(communities.items.len(), 1);
+    assert_eq!(communities.items[0].chat_id, "square-chat");
+    assert_eq!(communities.items[0].thumbnail_backed_image_count, 1);
+}
+
+#[test]
+fn applies_category_actions_to_individual_group_and_community_files_with_progress() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    add_chat_title_fixtures(&source);
+    add_square_fixture(&source);
+    let private_store = source.join(
+        "Container/AppGroups/group.com.linecorp.line/Library/Application Support/PrivateStore/P_test",
+    );
+    let group_thumbnail = private_store.join("Message Thumbnails/g-unified/34567890.thumb");
+    fs::create_dir_all(group_thumbnail.parent().unwrap()).unwrap();
+    fs::write(&group_thumbnail, b"group thumbnail").unwrap();
+    let community_thumbnail = private_store.join("Message Thumbnails/square-chat/23456789.thumb");
+    fs::create_dir_all(community_thumbnail.parent().unwrap()).unwrap();
+    fs::write(&community_thumbnail, b"community thumbnail").unwrap();
+
+    let work = temporary.path().join("category-action-work");
+    let prepared = prepare_source(&source, &work).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let square_database =
+        LineSquareDatabase::open(prepared.square_database_path.as_deref().unwrap()).unwrap();
+    let mut catalog = Catalog::open(&work.join("catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .index_attachment_contexts(&database, Some(&square_database), None, |_| {})
+        .unwrap();
+
+    let mut community_progress = Vec::new();
+    catalog
+        .apply_cleanup_category_action("community", "keep_thumbnail", |progress| {
+            community_progress.push(progress);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(community_progress.first().unwrap().processed_records, 0);
+    assert_eq!(community_progress.last().unwrap().processed_records, 1);
+    assert_eq!(community_progress.last().unwrap().total_records, 1);
+
+    let mut all_progress = Vec::new();
+    let overview = catalog
+        .apply_cleanup_category_action("all", "keep_thumbnail", |progress| {
+            all_progress.push(progress);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(all_progress.first().unwrap().processed_records, 0);
+    assert_eq!(all_progress.last().unwrap().processed_records, 2);
+    assert_eq!(all_progress.last().unwrap().total_records, 2);
+    assert_eq!(overview.manual_marked_count, 3);
+
+    let group = catalog
+        .list_cleanup_groups(1, 24, None, "all", "group", "recent")
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|group| group.chat_id == "g-unified")
+        .unwrap();
+    assert!(group.keeping_thumbnails);
+
+    let community = catalog
+        .list_cleanup_groups(1, 24, None, "all", "community", "recent")
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|group| group.chat_id == "square-chat")
+        .unwrap();
+    assert!(community.keeping_thumbnails);
+    let all_action_state = catalog.cleanup_category_action_state("all").unwrap();
+    assert!(all_action_state.keeping_all_thumbnails);
+    assert!(!all_action_state.deleting_all_attachments);
+
+    let mut clear_thumbnail_progress = Vec::new();
+    let overview = catalog
+        .apply_cleanup_category_action("all", "clear_keep_thumbnail", |progress| {
+            clear_thumbnail_progress.push(progress);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        clear_thumbnail_progress.last().unwrap().processed_records,
+        3
+    );
+    assert_eq!(overview.manual_marked_count, 0);
+    assert!(
+        !catalog
+            .cleanup_category_action_state("all")
+            .unwrap()
+            .keeping_all_thumbnails
+    );
+
+    let mut delete_progress = Vec::new();
+    let overview = catalog
+        .apply_cleanup_category_action("community", "delete_all", |progress| {
+            delete_progress.push(progress);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(delete_progress.first().unwrap().processed_records, 0);
+    assert_eq!(delete_progress.last().unwrap().processed_records, 2);
+    assert_eq!(delete_progress.last().unwrap().total_records, 2);
+    assert_eq!(overview.manual_marked_count, 2);
+    assert!(
+        catalog
+            .cleanup_category_action_state("community")
+            .unwrap()
+            .deleting_all_attachments
+    );
+
+    let mut clear_attachment_progress = Vec::new();
+    let overview = catalog
+        .apply_cleanup_category_action("community", "clear_delete_all", |progress| {
+            clear_attachment_progress.push(progress);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        clear_attachment_progress.last().unwrap().processed_records,
+        2
+    );
+    assert_eq!(overview.manual_marked_count, 0);
+    assert!(
+        !catalog
+            .cleanup_category_action_state("community")
+            .unwrap()
+            .deleting_all_attachments
+    );
+
+    let community_chats = square_database.all_chats_for_cleanup().unwrap();
+    catalog.replace_chat_index(&community_chats).unwrap();
+    let mut chat_progress = Vec::new();
+    catalog
+        .set_chats_removal_planned_reporting(&community_chats, true, "selected", |progress| {
+            chat_progress.push(progress);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(chat_progress.first().unwrap().processed_records, 0);
+    assert_eq!(chat_progress.first().unwrap().phase, "整理並寫入聊天室");
+    assert_eq!(chat_progress.last().unwrap().phase, "掃描並寫入聊天室附件");
+    assert_eq!(
+        chat_progress.last().unwrap().processed_records,
+        chat_progress.last().unwrap().total_records
+    );
+    assert_eq!(
+        catalog
+            .advanced_cleanup_report(0, 0, true, 0, 0, 0)
+            .unwrap()
+            .planned_chats,
+        1
+    );
+    let community_action_state = catalog.cleanup_category_action_state("community").unwrap();
+    assert!(community_action_state.deleting_all_chats);
+    assert_eq!(community_action_state.chat_count, 1);
+
+    let mut clear_chat_progress = Vec::new();
+    catalog
+        .set_chats_removal_planned_reporting(&community_chats, false, "selected", |progress| {
+            clear_chat_progress.push(progress);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        clear_chat_progress.first().unwrap().phase,
+        "取消聊天室清理計畫"
+    );
+    assert_eq!(clear_chat_progress.last().unwrap().processed_records, 1);
+    assert!(
+        !catalog
+            .cleanup_category_action_state("community")
+            .unwrap()
+            .deleting_all_chats
+    );
+    assert_eq!(
+        catalog
+            .advanced_cleanup_report(0, 0, true, 0, 0, 0)
+            .unwrap()
+            .planned_chats,
+        0
+    );
+}
+
+#[test]
+fn bulk_chat_removal_reports_staged_progress_without_repeated_attachment_scans() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let prepared = prepare_source(&source, &temporary.path().join("work")).unwrap();
+    let database = LineDatabase::open(&prepared.database_path).unwrap();
+    let mut catalog = Catalog::open(&temporary.path().join("work/cleanup-catalog.sqlite")).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    catalog
+        .index_attachment_contexts(&database, None, None, |_| {})
+        .unwrap();
+
+    let chats = (0_i64..1_001)
+        .map(|index| Chat {
+            pk: 10_000 + index,
+            source: "line".to_string(),
+            id: format!("bulk-chat-{index}"),
+            chat_type: 1,
+            kind: "group".to_string(),
+            title: format!("大量測試聊天室 {index}"),
+            title_source: "fallback".to_string(),
+            message_count: index,
+            human_message_count: index,
+            last_updated: index,
+            last_message: String::new(),
+            planned_for_removal: false,
+        })
+        .collect::<Vec<_>>();
+    let mut progress = Vec::new();
+
+    catalog
+        .set_chats_removal_planned_reporting(&chats, true, "selected", |item| {
+            progress.push(item);
+            Ok(())
+        })
+        .unwrap();
+
+    let chat_progress = progress
+        .iter()
+        .filter(|item| item.phase == "整理並寫入聊天室")
+        .map(|item| item.processed_records)
+        .collect::<Vec<_>>();
+    assert_eq!(chat_progress, vec![0, 500, 1_000, 1_001]);
+
+    let attachment_progress = progress
+        .iter()
+        .filter(|item| item.phase == "掃描並寫入聊天室附件")
+        .collect::<Vec<_>>();
+    assert_eq!(attachment_progress.len(), 2);
+    assert_eq!(attachment_progress[0].processed_records, 0);
+    assert_eq!(
+        attachment_progress.last().unwrap().processed_records,
+        attachment_progress.last().unwrap().total_records
+    );
+    assert_eq!(
+        catalog
+            .advanced_cleanup_report(0, 0, true, 0, 0, 0)
+            .unwrap()
+            .planned_chats,
+        1_001
+    );
+
+    let mut clear_progress = Vec::new();
+    catalog
+        .set_chats_removal_planned_reporting(&chats, false, "selected", |item| {
+            clear_progress.push(item);
+            Ok(())
+        })
+        .unwrap();
+    let clear_chat_progress = clear_progress
+        .iter()
+        .filter(|item| item.phase == "取消聊天室清理計畫")
+        .map(|item| item.processed_records)
+        .collect::<Vec<_>>();
+    assert_eq!(clear_chat_progress, vec![0, 500, 1_000, 1_001]);
+    assert_eq!(
+        catalog
+            .advanced_cleanup_report(0, 0, true, 0, 0, 0)
+            .unwrap()
+            .planned_chats,
+        0
+    );
 }
 
 #[test]

@@ -34,7 +34,9 @@ const releaseBinary = path.join(
   "release",
   "line-cheater.exe"
 );
-const distRoot = path.join(electronRoot, "dist");
+const distRoot = process.env.LINE_CHEATER_DIST_ROOT
+  ? path.resolve(process.env.LINE_CHEATER_DIST_ROOT)
+  : path.join(electronRoot, "dist");
 const platformRoot = path.join(distRoot, "win-x64");
 const appPath = path.join(platformRoot, productName);
 const resourcesPath = path.join(appPath, "resources");

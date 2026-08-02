@@ -106,6 +106,7 @@ test("selects the platform-native desktop icon and packages Windows assets", () 
 });
 
 test("verifies the complete Windows package payload", () => {
+  assert.match(windowsPackager, /process\.env\.LINE_CHEATER_DIST_ROOT/);
   assert.match(windowsPackager, /const requiredPackageFiles = \[/);
   assert.match(windowsPackager, /required file: \$\{relativePath\}/);
   assert.match(windowsPackager, /verifiedMetadata\.productName !== productName/);
@@ -203,7 +204,9 @@ test("versions session cache and clears it after a successful candidate build", 
   assert.match(main, /prepareSessionCache\(/);
   assert.match(main, /app\.getVersion\(\)/);
   assert.match(sessionCache, /CACHE_VERSION_FILE = "\.line-cheater-cache-version"/);
-  assert.match(sessionCache, /cachedVersion\(workDir\) === version/);
+  assert.match(sessionCache, /previousVersion === version/);
+  assert.match(main, /SESSION_CACHE_COMPATIBLE_VERSIONS = \["0\.1\.23"\]/);
+  assert.match(sessionCache, /compatibleVersions\.includes\(previousVersion\)/);
   assert.match(sessionCache, /clearSessionCache\(userDataPath, workDir\)/);
   assert.match(main, /outputFallsInsideSession\(workDir, output\)/);
   assert.match(main, /const cacheResult = await closeCompletedSession\(client, workDir\)/);
@@ -315,8 +318,9 @@ test("keeps cleanup bounded while presenting a continuous month-sectioned album"
 test("reuses cleanup overview while paging groups", () => {
   assert.match(
     renderer,
-    /if \(cleanupOverview\) \{\s+page = await provider\.listCleanupGroups\(cleanupOptions\(\)\);/
+    /if \(cleanupOverview\) \{\s+\[page, cleanupCategoryActionState\] = await Promise\.all/
   );
+  assert.match(renderer, /provider\.listCleanupGroups\(cleanupOptions\(\)\)/);
   assert.match(renderer, /cleanupOverview = await provider\.applyCleanupGroupAction\(/);
   assert.match(renderer, /cleanupPage = cleanupOverview = null;/);
 });
@@ -329,6 +333,49 @@ test("exposes separate safe-automatic and manual cleanup controls", () => {
   assert.match(renderer, /removalReason === "automatic"/);
   assert.match(main, /"planSafeAttachmentCleanup"/);
   assert.match(main, /"clearManualAttachmentPlan"/);
+});
+
+test("requires confirmation before cancelling work or closing the app", () => {
+  assert.match(renderer, /確定取消載入與掃描？/);
+  assert.match(renderer, /確定取消建立瘦身檔？/);
+  assert.match(renderer, /確定取消重複附件掃描？/);
+  assert.match(renderer, /確定取消資料庫操作？/);
+  assert.match(html, /id="operation-modal-cancel"/);
+  assert.match(renderer, /requestRestoreChecklistCancellation/);
+  assert.match(renderer, /確定關閉建立結果？/);
+  assert.match(renderer, /確定關閉操作結果？/);
+  assert.match(renderer, /確定關閉圖片預覽？/);
+  assert.match(renderer, /requestModalClose\("package"\)/);
+  assert.match(renderer, /requestModalClose\("operation"\)/);
+  assert.match(renderer, /requestModalClose\("image"\)/);
+  assert.match(main, /mainWindow\.on\("close"/);
+  assert.match(main, /確認關閉 LINE Cheater/);
+  assert.match(main, /buttons: \["繼續使用", "確認關閉"\]/);
+});
+
+test("supports reversible category-wide actions with locked mutation progress", () => {
+  assert.match(html, /id="category-bulk-actions"/);
+  assert.match(html, /id="category-keep-thumbnails"/);
+  assert.match(html, /id="category-delete-attachments"/);
+  assert.match(html, /id="category-delete-chats"/);
+  assert.match(html, /id="operation-modal"[^>]*role="dialog"[^>]*aria-modal="true"/);
+  assert.match(renderer, /provider\.cleanupCategoryActionState\(requestedCategory\)/);
+  assert.match(renderer, /cancelling \? "clear_keep_thumbnail" : "keep_thumbnail"/);
+  assert.match(renderer, /cancelling \? "clear_delete_all" : "delete_all"/);
+  assert.match(renderer, /provider\.setCleanupCategoryChatsRemovalPlanned\(category, !cancelling\)/);
+  assert.match(renderer, /取消全部只保留縮圖/);
+  assert.match(renderer, /取消刪除分類所有附件/);
+  assert.match(renderer, /取消刪除分類所有聊天室/);
+  assert.match(renderer, /\["all", "individual", "group", "community"\]\.includes\(category\)/);
+  assert.match(renderer, /runCleanupMutation\(/);
+  assert.match(renderer, /bridge\.on\("cleanupMutationProgress"/);
+  assert.match(renderer, /processedRecords/);
+  assert.match(styles, /\.category-bulk-actions/);
+  assert.match(styles, /body\.operation-modal-open/);
+  assert.match(main, /"applyCleanupCategoryAction"/);
+  assert.match(main, /"cleanupCategoryActionState"/);
+  assert.match(main, /"setCleanupCategoryChatsRemovalPlanned"/);
+  assert.match(preload, /"cleanupMutationProgress"/);
 });
 
 test("uses an accessible shared modal for every confirmation", () => {
@@ -476,6 +523,8 @@ test("offers keep-thumbnail only for thumbnail-backed image originals", () => {
     /PDF、影片與無縮圖附件會保留/
   );
   assert.doesNotMatch(renderer, /group\.hasOriginal && group\.hasThumbnail/);
+  assert.match(renderer, /group\.chatKind === "community"/);
+  assert.match(renderer, /沒有可配對原圖/);
 });
 
 test("lists no-attachment chats only in advanced cleanup mode", () => {

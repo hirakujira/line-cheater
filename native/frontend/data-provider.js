@@ -242,6 +242,19 @@
     });
   };
 
+  NativeDataProvider.prototype.setCleanupCategoryChatsRemovalPlanned = function (category, planned) {
+    category = enumValue(
+      category,
+      "",
+      ["all", "individual", "group", "community"],
+      "Chat cleanup category"
+    );
+    return this.bridge.request("setCleanupCategoryChatsRemovalPlanned", {
+      category: category,
+      planned: Boolean(planned)
+    });
+  };
+
   NativeDataProvider.prototype.planAutomaticCleanup = function () {
     return this.bridge.request("planAutomaticCleanup", {});
   };
@@ -287,6 +300,41 @@
     });
   };
 
+  NativeDataProvider.prototype.cleanupCategoryActionState = function (category) {
+    category = enumValue(
+      category,
+      "",
+      ["all", "individual", "group", "community", "unreferenced", "unconfirmed"],
+      "Cleanup category action state"
+    );
+    return this.bridge.request("cleanupCategoryActionState", {
+      category: category
+    });
+  };
+
+  NativeDataProvider.prototype.applyCleanupCategoryAction = function (category, action) {
+    category = enumValue(
+      category,
+      "",
+      ["all", "individual", "group", "community", "unreferenced", "unconfirmed"],
+      "Cleanup category action"
+    );
+    action = enumValue(
+      action,
+      "",
+      ["keep_thumbnail", "clear_keep_thumbnail", "delete_all", "clear_delete_all"],
+      "Cleanup category action"
+    );
+    if (["keep_thumbnail", "clear_keep_thumbnail"].includes(action) &&
+        !["all", "individual", "group", "community"].includes(category)) {
+      throw new TypeError("Keep-thumbnail action requires a chat-backed cleanup category.");
+    }
+    return this.bridge.request("applyCleanupCategoryAction", {
+      category: category,
+      action: action
+    });
+  };
+
   NativeDataProvider.prototype.onCatalogProgress = function (handler) {
     if (typeof this.bridge.on !== "function") {
       throw new TypeError("The native bridge does not support event subscriptions.");
@@ -299,6 +347,13 @@
       throw new TypeError("The native bridge does not support event subscriptions.");
     }
     return this.bridge.on("catalogContextProgress", handler);
+  };
+
+  NativeDataProvider.prototype.onCleanupMutationProgress = function (handler) {
+    if (typeof this.bridge.on !== "function") {
+      throw new TypeError("The native bridge does not support event subscriptions.");
+    }
+    return this.bridge.on("cleanupMutationProgress", handler);
   };
 
   NativeDataProvider.prototype.onCandidateProgress = function (handler) {
