@@ -1,6 +1,6 @@
 # Native Core Architecture and Handoff
 
-Last updated: 2026-07-27
+Last updated: 2026-08-03
 
 This document is the durable handoff record for the bounded-memory desktop version
 of LINE Cheater. Keep it updated whenever the native implementation,
@@ -9,7 +9,7 @@ data contract, safety rules, or next steps change.
 ## Recent change summary
 
 The following summarizes the major native, desktop, and release changes from
-2026-07-24 through 2026-07-26. Release-only version bumps (`0.1.10` through
+2026-07-24 through 2026-08-02. Release-only version bumps (`0.1.10` through
 `0.1.14`) only synchronized Cargo/Electron metadata and lockfiles; they are
 grouped below rather than treated as separate feature changes.
 
@@ -73,8 +73,21 @@ grouped below rather than treated as separate feature changes.
   the Windows x64 download alongside them.
 - The cleanup chat list now supports direct page-number jumps and preserves the
   overview page when entering a chat detail and returning to the list.
-- `0192de2` (`v0.1.19`) is the current baseline after a fast-forward pull from
-  `origin/main`.
+- `0192de2` (`v0.1.19`) was the baseline before the subsequent PR38 and PR39
+  native changes.
+- PR38 (`d507813`, `c196740`) added explicit authorization for rebuilding a
+  corrupt `LineSquare.sqlite` as an empty community database. The fallback is
+  limited to confirmed SQLite corruption, preserves the readable schema when
+  possible, requires `quick_check=ok`, reports discarded community data, and
+  never applies to the primary `Line.sqlite` or modifies the source backup.
+- PR39 (`ad14556`, `b76620a`, `bc57e84`, `97c7aaf`) repaired unique
+  original/thumbnail context counterparts across Container paths, added
+  reversible category-wide attachment and chat actions, and changed large chat
+  deletion to one indexed selection plus a single transaction and bounded
+  progress updates. Cleanup mutations now expose cancellable progress with
+  rollback messaging, lock duplicate submissions, and require confirmation
+  before cancelling work or closing operation/app windows.
+- `ebd0a80` (`v0.1.25`) is the current release baseline after PR39.
 - Attachment cleanup plans now record `manual`, `automatic`, or `chat` evidence.
   Safe automatic attachment cleanup only marks referenced image originals with
   a matching non-empty thumbnail; it never marks PDFs, videos, missing-thumbnail
@@ -106,6 +119,11 @@ grouped below rather than treated as separate feature changes.
 - Candidate creation now opens a restore checklist asking the user to retain
   the original backup, test in a safe environment, and verify chats/images/
   SQLite after restore before the candidate writer starts.
+- Category actions expose their current state so the desktop can toggle
+  “keep thumbnails”, “delete all attachments”, and Advanced-mode “delete all
+  chats” into matching batch-cancel actions. Chat-backed categories support
+  thumbnail preservation; unreferenced and unconfirmed categories support only
+  attachment deletion.
 
 ## Goal
 
@@ -202,6 +220,10 @@ Verified implementation:
 - [x] Add streaming SHA-256, size pre-grouping, on-disk checkpoints, and
   duplicate-group/member pages.
 - [x] Add initial ZIP64/raw-copy candidate construction and validation.
+- [x] Require explicit authorization before replacing confirmed-corrupt
+  `LineSquare.sqlite` with an empty, schema-preserving (or minimal) database;
+  validate the rebuilt database with `quick_check`, report discarded community
+  data, and leave `Line.sqlite` and the source backup untouched.
 - [x] Add dependency-free renderer `NativeDataProvider` and tests.
 - [x] Add a runnable Electron 43.2.0 preview with a sandboxed preload,
   allowlisted IPC, native source/output dialogs, bounded sidecar parser, chat,
@@ -212,6 +234,16 @@ Verified implementation:
   selection, delete-all, and reversible keep-thumbnail actions. The provider
   default remains 24 rows; the fixed desktop viewport requests four group rows
   while detail mode streams 24-review virtual batches.
+- [x] Add catalog context repair from a unique, referenced original/thumbnail
+  counterpart, including cross-Container group/community paths, and surface
+  bounded repair progress during context indexing.
+- [x] Add reversible category-wide cleanup actions for all, individual, group,
+  community, unreferenced, and unconfirmed categories. Keep-thumbnail actions
+  only affect safe image originals; batch attachment cancellation clears manual
+  marks while preserving automatic and chat plans.
+- [x] Add category-wide Advanced chat deletion/cancellation using the current
+  chat index, one SQLite transaction, one attachment scan, 500-record batches,
+  and progress events.
 - [x] Correlate cleanup paths against both `Line.sqlite` and the same-store
   `LineSquare.sqlite`, including community titles and senders.
 - [x] Add a desktop-only advanced mode that plans full-chat deletion, attaches
@@ -269,6 +301,9 @@ Verified implementation:
   candidate creation. Cancellation terminates and recreates the sidecar,
   resumes committed directory-scan batches and duplicate-hash checkpoints,
   and removes partial candidate output.
+- [x] Add a locked cleanup-mutation modal with phase/count progress, explicit
+  rollback messaging on cancellation, and confirmation before cancelling
+  cleanup/database work or closing the main window and result dialogs.
 - [x] Add protocol-level `jobId` values and persisted active-job metadata for
   catalog, FTS index, duplicate hashing, and candidate jobs. Candidate output
   remains restart-from-zero because ZIP central-directory writes cannot be
@@ -566,13 +601,17 @@ Supported methods:
 - `stageAttachmentPreview`
 - `catalogStats`
 - `cleanupOverview`
+- `cleanupCategoryActionState`
 - `cleanupPreflight`
 - `cleanupPlanPreviews`
 - `cleanupAudit`
 - `clearManualAttachmentPlan`
+- `clearAllRemovalPlans`
 - `listCleanupGroups`
 - `listCleanupReviews`
 - `applyCleanupGroupAction`
+- `applyCleanupCategoryAction`
+- `setCleanupCategoryChatsRemovalPlanned`
 - `planSafeAttachmentCleanup`
 - `advancedCleanupReport`
 - `setChatRemovalPlanned`
@@ -589,8 +628,10 @@ may receive a top-level UUID `jobId`. Progress events echo both `requestId` and
 `jobId`; successful responses echo the job ID as well. `scanCatalog` may emit
 `catalogProgress` and `catalogContextProgress`, search-index construction emits
 `searchIndexProgress`, duplicate hashing emits `duplicateHashProgress`, and
-`buildCandidate` emits `candidateProgress`. Input lines larger than 1 MiB are
-rejected. Output pages remain subject to the 1,000-record core limit.
+`buildCandidate` emits `candidateProgress`; cleanup mutations emit
+`cleanupMutationProgress` with a phase and processed/total record counts. Input
+lines larger than 1 MiB are rejected. Output pages remain subject to the
+1,000-record core limit.
 
 Protocol v1 still processes one request at a time. Desktop cancellation kills
 the sidecar, then reopens the same source/work directory: committed directory
@@ -611,7 +652,7 @@ integration, no permissions, and no arbitrary navigation. A custom local
 protocol serves an allowlist of bundled assets and catalog-authorized preview
 tokens. The preload exposes only source selection, a one-use candidate-output
 token, a bounded attachment-preview request, allowlisted sidecar requests, and
-four progress event types. The main process validates the sender and caps
+six progress event types. The main process validates the sender and caps
 request/response lines before parsing.
 
 Development work directories are source-path-hashed subdirectories under the
@@ -681,9 +722,12 @@ committed batches and resumes after its last ordered path when the already
 cataloged content still matches. Duplicate hashes are committed every 100
 files and resume from rows whose hash is still null. If a source change is
 detected, cleanup plans and derived hashes are invalidated and a complete scan
-is required. Cleanup-context schema version 3 includes companion-database
-titles and the source database for every exact attachment context; older
-complete catalogs are reported as stale and reindexed automatically.
+is required. Cleanup-context schema version 5 includes companion-database
+titles, the source database for every exact attachment context, and repairs
+from a unique referenced original/thumbnail counterpart when one side is
+missing context. This repairs group/community attachments even when the two
+files use different Container roots. Older complete catalogs are reported as
+stale and reindexed automatically.
 
 Duplicate hashing first selects attachment rows whose positive byte size occurs
 more than once, then reads each candidate with one reusable 1 MiB buffer. If a
@@ -747,6 +791,15 @@ generated fixture tests:
   thumbnail for the same message ID and path chat. PDFs, videos, missing or
   empty thumbnails, and unconfirmed media remain untouched. Matching thumbnail
   marks are cleared; invoking it again restores those image originals.
+- Category-wide `keep_thumbnail` and `clear_keep_thumbnail` actions are limited
+  to `all`, `individual`, `group`, and `community`; they skip chats already
+  planned for deletion. Category-wide `delete_all` and `clear_delete_all` also
+  support `unreferenced` and `unconfirmed`, clear only manual attachment marks
+  when cancelled, and preserve automatic or chat-derived plans.
+- Category-wide chat deletion is limited to `all`, `individual`, `group`, and
+  `community`, uses the current catalog chat index when available, selects
+  chats once, scans attachments once, and commits the resulting chat and file
+  plan in one SQLite transaction with 500-record progress batches.
 - Manual attachment marks persist with `reason = manual`; safe automatic marks
   persist with `reason = automatic`; chat-removal-derived marks remain
   `reason = chat`. The overview and renderer expose these sources separately,
@@ -755,6 +808,9 @@ generated fixture tests:
   stale catalog, incomplete scan, incomplete context index, or writable source
   as a blocker. Unreferenced and unconfirmed attachments are warnings and are
   shown in balanced/aggressive previews as review-only items.
+- Every cleanup mutation reports `cleanupMutationProgress`; the desktop locks
+  related controls, asks for confirmation before cancellation or closing, and
+  reports that uncommitted SQLite changes were rolled back when cancelled.
 
 The UI filters `all/original/thumbnail/marked`, categories
 `all/individual/group/community/unreferenced/unconfirmed`, sorting
