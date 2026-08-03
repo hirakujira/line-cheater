@@ -378,6 +378,24 @@ test("supports reversible category-wide actions with locked mutation progress", 
   assert.match(preload, /"cleanupMutationProgress"/);
 });
 
+test("supports bounded image and attachment exports", () => {
+  assert.match(html, /id="export-chat-images"/);
+  assert.match(html, /id="export-chat-attachments"/);
+  assert.match(renderer, /function exportAttachmentSelection\(paths, options = \{\}\)/);
+  assert.match(renderer, /provider\.exportAttachments\(/);
+  assert.match(renderer, /匯出圖檔/);
+  assert.match(renderer, /匯出本則附件/);
+  assert.match(renderer, /bridge\.on\("exportProgress"/);
+  assert.match(renderer, /cancelCurrentOperation\(exportInProgress \? "export" : "cleanup"\)/);
+  assert.match(styles, /\.message-attachment-actions/);
+  assert.match(main, /"exportAttachments"/);
+  assert.match(main, /choose-export-output/);
+  assert.match(main, /exportOutputTokens/);
+  assert.match(main, /LINE-Cheater-Export-/);
+  assert.match(preload, /"exportProgress"/);
+  assert.match(preload, /chooseExportOutput()/);
+});
+
 test("uses an accessible shared modal for every confirmation", () => {
   assert.match(html, /id="confirmation-modal" class="confirmation-modal hidden" role="dialog" aria-modal="true"/);
   assert.match(html, /id="confirmation-modal-cancel"/);

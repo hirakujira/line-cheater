@@ -21,7 +21,8 @@ use crate::model::{
     CleanupCategoryActionState, CleanupCategoryTotal, CleanupGroup, CleanupGroupPage,
     CleanupOverview, CleanupPlanPreview, CleanupPlanSnapshot, CleanupReview, CleanupReviewPage,
     DuplicateGroup, DuplicateGroupCursor, DuplicateGroupPage, DuplicateHashProgress,
-    DuplicateMemberPage, Message, MessageAttachment, checked_page_size,
+    DuplicateMemberPage, ExportProgress, ExportReport, Message, MessageAttachment,
+    checked_page_size,
 };
 use crate::performance::system_performance_profile;
 use crate::source::SourceKind;
@@ -34,6 +35,8 @@ const CLEANUP_MUTATION_BATCH_SIZE: usize = 500;
 const MAX_CLEANUP_RESPONSE_FILES: usize = 1_000;
 const MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_STAGED_PREVIEWS: usize = 32;
+const EXPORT_BUFFER_BYTES: usize = 1024 * 1024;
+const MAX_EXPORT_PATHS: usize = 1_000;
 const CONTEXT_INDEX_VERSION: &str = "5";
 const CHAT_INDEX_VERSION: &str = "1";
 const CLEANUP_GROUP_EXPR: &str = "
@@ -144,6 +147,27 @@ pub struct BulkChatMutationProgress {
     pub phase: &'static str,
     pub processed_records: u64,
     pub total_records: u64,
+}
+
+pub enum ExportScope<'a> {
+    Paths(&'a [String]),
+    Chat { source: &'a str, chat_pk: i64 },
+}
+
+#[derive(Debug)]
+struct ExportItem {
+    path: String,
+    bytes: u64,
+    modified_ns: i64,
+    kind: AttachmentKind,
+    content_sha256: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ExportAccumulator {
+    progress: ExportProgress,
+    exported_bytes: u64,
+    skipped_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -523,6 +547,7 @@ impl Catalog {
         }
         self.clear_active_job("search")?;
         self.clear_active_job("candidate")?;
+        self.clear_active_job("export")?;
         Ok(())
     }
 
@@ -1043,6 +1068,502 @@ impl Catalog {
                 });
             }
         }
+        Ok(())
+    }
+
+    pub fn export_attachments<F>(
+        &self,
+        source: &Path,
+        source_kind: SourceKind,
+        scope: ExportScope<'_>,
+        output: &Path,
+        images_only: bool,
+        include_thumbnails: bool,
+        mut on_progress: F,
+    ) -> Result<ExportReport>
+    where
+        F: FnMut(ExportProgress),
+    {
+        if source_kind == SourceKind::Sqlite {
+            bail!("direct Line.sqlite sources do not contain exportable attachment files");
+        }
+        let source = source
+            .canonicalize()
+            .with_context(|| format!("source does not exist: {}", source.display()))?;
+        validate_bound_source(self, &source)?;
+        let output_parent = output
+            .parent()
+            .context("export output has no parent directory")?
+            .canonicalize()
+            .context("export output parent does not exist")?;
+        let output_name = output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+            .context("export output has an invalid directory name")?;
+        let output = output_parent.join(output_name);
+        if source_kind == SourceKind::Directory && output.starts_with(&source) {
+            bail!("export output cannot be inside the selected source");
+        }
+        if output.exists() {
+            bail!("export output directory already exists");
+        }
+        let partial = PathBuf::from(format!("{}.partial", output.display()));
+        if partial.exists() {
+            bail!("partial export output already exists; remove it before retrying");
+        }
+
+        let (total_files, total_bytes) = self.export_totals(&scope, include_thumbnails)?;
+        let mut accumulator = ExportAccumulator {
+            progress: ExportProgress {
+                total_files,
+                total_bytes,
+                ..ExportProgress::default()
+            },
+            ..ExportAccumulator::default()
+        };
+        on_progress(accumulator.progress);
+        fs::create_dir(&partial)
+            .with_context(|| format!("failed to create export directory: {}", partial.display()))?;
+
+        let result = match scope {
+            ExportScope::Paths(paths) => self.export_paths(
+                &source,
+                source_kind,
+                paths,
+                &partial,
+                images_only,
+                include_thumbnails,
+                &mut accumulator,
+                &mut on_progress,
+            ),
+            ExportScope::Chat {
+                source: chat_source,
+                chat_pk,
+            } => self.export_chat(
+                &source,
+                source_kind,
+                chat_source,
+                chat_pk,
+                &partial,
+                images_only,
+                include_thumbnails,
+                &mut accumulator,
+                &mut on_progress,
+            ),
+        };
+        let result = match result {
+            Ok(()) => {
+                fs::rename(&partial, &output).with_context(|| {
+                    format!("failed to finalize export directory: {}", output.display())
+                })?;
+                Ok(ExportReport {
+                    output_name: output_name.to_string(),
+                    exported_files: accumulator
+                        .progress
+                        .processed_files
+                        .saturating_sub(accumulator.progress.skipped_files),
+                    exported_bytes: accumulator.exported_bytes,
+                    skipped_files: accumulator.progress.skipped_files,
+                    skipped_bytes: accumulator.skipped_bytes,
+                })
+            }
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&partial);
+        }
+        result
+    }
+
+    fn export_totals(
+        &self,
+        scope: &ExportScope<'_>,
+        include_thumbnails: bool,
+    ) -> Result<(u64, u64)> {
+        match scope {
+            ExportScope::Paths(paths) => {
+                if paths.is_empty() {
+                    bail!("at least one attachment path is required");
+                }
+                if paths.len() > MAX_EXPORT_PATHS {
+                    bail!("export selection cannot contain more than {MAX_EXPORT_PATHS} files");
+                }
+                let mut total_files = 0_u64;
+                let mut total_bytes = 0_u64;
+                let mut seen = HashSet::new();
+                for path in *paths {
+                    if path.is_empty() || path.len() > 4_096 || !seen.insert(path.as_str()) {
+                        continue;
+                    }
+                    let (bytes, kind): (i64, String) = self.connection.query_row(
+                        "SELECT bytes, attachment_kind
+                         FROM files
+                         WHERE path = ?1 AND attachment_kind IS NOT NULL",
+                        [path],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    if !include_thumbnails && kind == "thumbnail" {
+                        continue;
+                    }
+                    total_files = total_files.saturating_add(1);
+                    total_bytes = total_bytes.saturating_add(bytes.max(0) as u64);
+                }
+                Ok((total_files, total_bytes))
+            }
+            ExportScope::Chat { source, chat_pk } => {
+                if !matches!(*source, "line" | "square") {
+                    bail!("chat export source must be `line` or `square`");
+                }
+                let sql = if include_thumbnails {
+                    "SELECT COUNT(*), COALESCE(SUM(bytes), 0)
+                     FROM files
+                     WHERE attachment_kind IS NOT NULL
+                       AND reference_status = 'referenced'
+                       AND context_source = ?1
+                       AND message_chat_pk = ?2"
+                } else {
+                    "SELECT COUNT(*), COALESCE(SUM(bytes), 0)
+                     FROM files
+                     WHERE attachment_kind = 'original'
+                       AND reference_status = 'referenced'
+                       AND context_source = ?1
+                       AND message_chat_pk = ?2"
+                };
+                let (files, bytes): (i64, i64) =
+                    self.connection
+                        .query_row(sql, params![source, chat_pk], |row| {
+                            Ok((row.get(0)?, row.get(1)?))
+                        })?;
+                Ok((files.max(0) as u64, bytes.max(0) as u64))
+            }
+        }
+    }
+
+    fn export_paths<F>(
+        &self,
+        source: &Path,
+        source_kind: SourceKind,
+        paths: &[String],
+        output: &Path,
+        images_only: bool,
+        include_thumbnails: bool,
+        accumulator: &mut ExportAccumulator,
+        on_progress: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(ExportProgress),
+    {
+        if paths.len() > MAX_EXPORT_PATHS {
+            bail!("export selection cannot contain more than {MAX_EXPORT_PATHS} files");
+        }
+        let mut items = Vec::new();
+        let mut seen = HashSet::new();
+        for path in paths {
+            if path.is_empty() || path.len() > 4_096 || !seen.insert(path.as_str()) {
+                continue;
+            }
+            let item = self.export_item(path)?;
+            if !include_thumbnails && item.kind == AttachmentKind::Thumbnail {
+                continue;
+            }
+            items.push(item);
+        }
+        match source_kind {
+            SourceKind::Directory => {
+                for item in items {
+                    self.export_directory_item(
+                        source,
+                        &item,
+                        output,
+                        images_only,
+                        accumulator,
+                        on_progress,
+                    )?;
+                }
+            }
+            SourceKind::ImazingArchive => {
+                let mut archive = ZipArchive::new(File::open(source)?)?;
+                for item in items {
+                    let mut entry = archive.by_name(&item.path).with_context(|| {
+                        format!("attachment is missing from archive: {}", item.path)
+                    })?;
+                    if entry.is_dir() || entry.size() != item.bytes {
+                        bail!("archive attachment metadata does not match the catalog");
+                    }
+                    self.export_reader(
+                        &mut entry,
+                        &item,
+                        output,
+                        images_only,
+                        accumulator,
+                        on_progress,
+                    )?;
+                }
+            }
+            SourceKind::Sqlite => unreachable!("SQLite exports are rejected before selection"),
+        }
+        Ok(())
+    }
+
+    fn export_chat<F>(
+        &self,
+        source: &Path,
+        source_kind: SourceKind,
+        chat_source: &str,
+        chat_pk: i64,
+        output: &Path,
+        images_only: bool,
+        include_thumbnails: bool,
+        accumulator: &mut ExportAccumulator,
+        on_progress: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(ExportProgress),
+    {
+        if !matches!(chat_source, "line" | "square") {
+            bail!("chat export source must be `line` or `square`");
+        }
+        let attachment_filter = if include_thumbnails {
+            "attachment_kind IS NOT NULL"
+        } else {
+            "attachment_kind = 'original'"
+        };
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT path, bytes, modified_ns, attachment_kind, content_sha256
+             FROM files
+             WHERE {attachment_filter}
+               AND reference_status = 'referenced'
+               AND context_source = ?1
+               AND message_chat_pk = ?2
+             ORDER BY id ASC"
+        ))?;
+        let rows = statement.query_map(params![chat_source, chat_pk], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?.max(0) as u64,
+                row.get(2)?,
+                row.get::<_, String>(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        match source_kind {
+            SourceKind::Directory => {
+                for row in rows {
+                    let (path, bytes, modified_ns, kind, content_sha256) = row?;
+                    let item = ExportItem {
+                        path,
+                        bytes,
+                        modified_ns,
+                        kind: kind.parse()?,
+                        content_sha256,
+                    };
+                    self.export_directory_item(
+                        source,
+                        &item,
+                        output,
+                        images_only,
+                        accumulator,
+                        on_progress,
+                    )?;
+                }
+            }
+            SourceKind::ImazingArchive => {
+                let mut archive = ZipArchive::new(File::open(source)?)?;
+                for row in rows {
+                    let (path, bytes, modified_ns, kind, content_sha256) = row?;
+                    let item = ExportItem {
+                        path,
+                        bytes,
+                        modified_ns,
+                        kind: kind.parse()?,
+                        content_sha256,
+                    };
+                    let mut entry = archive.by_name(&item.path).with_context(|| {
+                        format!("attachment is missing from archive: {}", item.path)
+                    })?;
+                    if entry.is_dir() || entry.size() != item.bytes {
+                        bail!("archive attachment metadata does not match the catalog");
+                    }
+                    self.export_reader(
+                        &mut entry,
+                        &item,
+                        output,
+                        images_only,
+                        accumulator,
+                        on_progress,
+                    )?;
+                }
+            }
+            SourceKind::Sqlite => unreachable!("SQLite exports are rejected before selection"),
+        }
+        Ok(())
+    }
+
+    fn export_item(&self, path: &str) -> Result<ExportItem> {
+        let (path, bytes, modified_ns, kind, content_sha256): (
+            String,
+            i64,
+            i64,
+            String,
+            Option<String>,
+        ) = self
+            .connection
+            .query_row(
+                "SELECT path, bytes, modified_ns, attachment_kind, content_sha256
+                 FROM files
+                 WHERE path = ?1 AND attachment_kind IS NOT NULL",
+                [path],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .context("selected attachment path is not present in this catalog")?;
+        Ok(ExportItem {
+            path,
+            bytes: bytes.max(0) as u64,
+            modified_ns,
+            kind: kind.parse()?,
+            content_sha256,
+        })
+    }
+
+    fn export_directory_item<F>(
+        &self,
+        source: &Path,
+        item: &ExportItem,
+        output: &Path,
+        images_only: bool,
+        accumulator: &mut ExportAccumulator,
+        on_progress: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(ExportProgress),
+    {
+        let candidate = source
+            .join(&item.path)
+            .canonicalize()
+            .with_context(|| format!("attachment does not exist in source: {}", item.path))?;
+        if !candidate.starts_with(source) || !candidate.is_file() {
+            bail!("attachment path escapes the selected source");
+        }
+        let metadata = fs::metadata(&candidate)?;
+        if metadata.len() != item.bytes || modified_ns(metadata.modified().ok()) != item.modified_ns
+        {
+            bail!("attachment changed since catalog scan: {}", item.path);
+        }
+        let mut file = File::open(&candidate)?;
+        self.export_reader(
+            &mut file,
+            item,
+            output,
+            images_only,
+            accumulator,
+            on_progress,
+        )?;
+        let after = fs::metadata(&candidate)?;
+        if after.len() != item.bytes || modified_ns(after.modified().ok()) != item.modified_ns {
+            bail!("attachment changed while exporting: {}", item.path);
+        }
+        Ok(())
+    }
+
+    fn export_reader<R, F>(
+        &self,
+        reader: &mut R,
+        item: &ExportItem,
+        output: &Path,
+        images_only: bool,
+        accumulator: &mut ExportAccumulator,
+        on_progress: &mut F,
+    ) -> Result<()>
+    where
+        R: Read,
+        F: FnMut(ExportProgress),
+    {
+        let mut header = [0_u8; 16];
+        let mut header_len = 0_usize;
+        let header_target =
+            usize::try_from(item.bytes.min(header.len() as u64)).unwrap_or(header.len());
+        while header_len < header_target {
+            let read = reader.read(&mut header[header_len..])?;
+            if read == 0 {
+                break;
+            }
+            header_len += read;
+        }
+        let is_image = detect_image_media_type_bytes(&header[..header_len]).is_some();
+        if images_only && !is_image {
+            accumulator.progress.processed_files =
+                accumulator.progress.processed_files.saturating_add(1);
+            accumulator.progress.processed_bytes = accumulator
+                .progress
+                .processed_bytes
+                .saturating_add(item.bytes);
+            accumulator.progress.skipped_files =
+                accumulator.progress.skipped_files.saturating_add(1);
+            accumulator.skipped_bytes = accumulator.skipped_bytes.saturating_add(item.bytes);
+            on_progress(accumulator.progress);
+            return Ok(());
+        }
+
+        let destination = unique_export_path(output, &item.path);
+        let temporary = PathBuf::from(format!("{}.part", destination.display()));
+        let mut writer = BufWriter::new(File::create(&temporary)?);
+        writer.write_all(&header[..header_len])?;
+        let mut copied = header_len as u64;
+        accumulator.progress.processed_bytes =
+            accumulator.progress.processed_bytes.saturating_add(copied);
+        let mut digest = Sha256::new();
+        digest.update(&header[..header_len]);
+        let mut buffer = [0_u8; EXPORT_BUFFER_BYTES];
+        while copied < item.bytes {
+            let remaining = item.bytes.saturating_sub(copied);
+            let target = remaining.min(buffer.len() as u64) as usize;
+            let read = reader.read(&mut buffer[..target])?;
+            if read == 0 {
+                let _ = fs::remove_file(&temporary);
+                bail!("attachment ended before its cataloged size: {}", item.path);
+            }
+            writer.write_all(&buffer[..read])?;
+            digest.update(&buffer[..read]);
+            copied = copied.saturating_add(read as u64);
+            accumulator.progress.processed_bytes = accumulator
+                .progress
+                .processed_bytes
+                .saturating_add(read as u64);
+            on_progress(accumulator.progress);
+        }
+        writer.flush()?;
+        if copied != item.bytes {
+            let _ = fs::remove_file(&temporary);
+            bail!(
+                "exported attachment size does not match the catalog: {}",
+                item.path
+            );
+        }
+        if let Some(expected) = &item.content_sha256 {
+            let actual = digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            if actual != *expected {
+                let _ = fs::remove_file(&temporary);
+                bail!("attachment changed while exporting: {}", item.path);
+            }
+        }
+        fs::rename(&temporary, &destination)?;
+        accumulator.progress.processed_files =
+            accumulator.progress.processed_files.saturating_add(1);
+        accumulator.exported_bytes = accumulator.exported_bytes.saturating_add(copied);
+        on_progress(accumulator.progress);
         Ok(())
     }
 
@@ -4264,7 +4785,10 @@ fn detect_image_media_type(path: &Path) -> Result<Option<&'static str>> {
     let mut file = File::open(path)?;
     let mut header = [0_u8; 16];
     let read = file.read(&mut header)?;
-    let header = &header[..read];
+    Ok(detect_image_media_type_bytes(&header[..read]))
+}
+
+fn detect_image_media_type_bytes(header: &[u8]) -> Option<&'static str> {
     let media_type = if header.starts_with(&[0xff, 0xd8, 0xff]) {
         Some("image/jpeg")
     } else if header.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -4283,7 +4807,47 @@ fn detect_image_media_type(path: &Path) -> Result<Option<&'static str>> {
     } else {
         None
     };
-    Ok(media_type)
+    media_type
+}
+
+fn unique_export_path(directory: &Path, source_path: &str) -> PathBuf {
+    let normalized = source_path.replace('\\', "/");
+    let basename = normalized
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty() && *value != "." && *value != "..")
+        .unwrap_or("attachment.bin");
+    let safe_name = basename
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '/' | '\\' | ':' | '*') {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let safe_name = if safe_name.is_empty() {
+        "attachment.bin".to_string()
+    } else {
+        safe_name
+    };
+    let mut candidate = directory.join(&safe_name);
+    let extension = Path::new(&safe_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| format!(".{value}"))
+        .unwrap_or_default();
+    let stem = safe_name
+        .strip_suffix(&extension)
+        .unwrap_or(&safe_name)
+        .to_string();
+    let mut suffix = 2_u64;
+    while candidate.exists() {
+        candidate = directory.join(format!("{stem} ({suffix}){extension}"));
+        suffix = suffix.saturating_add(1);
+    }
+    candidate
 }
 
 fn trim_preview_cache(directory: &Path, keep: usize) -> Result<()> {

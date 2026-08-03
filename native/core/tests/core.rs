@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 use line_backup_native::{
-    AttachmentKind, CandidateOptions, Catalog, Chat, ChatCursor, LineDatabase, LineSquareDatabase,
-    MessageCursor, NativeSession, PreparePhase, SourceKind, UnifiedGroupDatabase, build_candidate,
-    build_candidate_with_options, inspect_source, line_square_rebuild_required, prepare_source,
-    prepare_source_reporting, serve,
+    AttachmentKind, CandidateOptions, Catalog, Chat, ChatCursor, ExportScope, LineDatabase,
+    LineSquareDatabase, MessageCursor, NativeSession, PreparePhase, SourceKind,
+    UnifiedGroupDatabase, build_candidate, build_candidate_with_options, inspect_source,
+    line_square_rebuild_required, prepare_source, prepare_source_reporting, serve,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -1908,6 +1908,121 @@ fn stages_bounded_image_previews_from_directory_and_archive() {
             .unwrap()
             .ends_with("preview-cache")
     );
+}
+
+#[test]
+fn exports_selected_images_from_directory_and_archive_without_overwriting_source() {
+    let temporary = TempDir::new().unwrap();
+    let source = make_fixture(temporary.path());
+    let catalog_path = temporary.path().join("directory-export/catalog.sqlite");
+    let mut catalog = Catalog::open(&catalog_path).unwrap();
+    catalog
+        .scan_source(&source, SourceKind::Directory, |_| {})
+        .unwrap();
+    let attachments = catalog
+        .list_attachments(None, 10, None, None)
+        .unwrap()
+        .items;
+    let paths = attachments
+        .iter()
+        .map(|attachment| attachment.path.clone())
+        .collect::<Vec<_>>();
+    let export_root = temporary.path().join("exports");
+    fs::create_dir_all(&export_root).unwrap();
+    let output = export_root.join("LINE-Cheater-Export");
+    let mut progress = Vec::new();
+    let report = catalog
+        .export_attachments(
+            &source,
+            SourceKind::Directory,
+            ExportScope::Paths(&paths),
+            &output,
+            true,
+            true,
+            |value| progress.push(value),
+        )
+        .unwrap();
+    assert_eq!(report.exported_files, 2);
+    assert_eq!(report.skipped_files, 0);
+    assert!(output.join("12345678.jpg").is_file());
+    assert!(output.join("12345678.thumb").is_file());
+    assert_eq!(
+        fs::read(output.join("12345678.jpg")).unwrap(),
+        b"\xff\xd8\xffimage123"
+    );
+    assert_eq!(
+        fs::read(output.join("12345678.thumb")).unwrap(),
+        b"\x89PNG\r\n\x1a\n"
+    );
+    assert!(!output.with_extension("partial").exists());
+    assert_eq!(progress.last().unwrap().processed_files, 2);
+
+    let inside_source = source.join("export-inside");
+    assert!(
+        catalog
+            .export_attachments(
+                &source,
+                SourceKind::Directory,
+                ExportScope::Paths(&paths),
+                &inside_source,
+                false,
+                false,
+                |_| {},
+            )
+            .is_err()
+    );
+    assert!(
+        catalog
+            .export_attachments(
+                &source,
+                SourceKind::Sqlite,
+                ExportScope::Paths(&paths),
+                &export_root.join("sqlite-export"),
+                false,
+                false,
+                |_| {},
+            )
+            .is_err()
+    );
+
+    let database = inspect_source(&source).unwrap().database_path;
+    let archive_path = temporary.path().join("LINE-export.imazingapp");
+    let archive_file = fs::File::create(&archive_path).unwrap();
+    let mut archive = zip::ZipWriter::new(archive_file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    archive.start_file(&database, options).unwrap();
+    archive
+        .write_all(&fs::read(source.join(&database)).unwrap())
+        .unwrap();
+    for path in &paths {
+        archive.start_file(path, options).unwrap();
+        archive
+            .write_all(&fs::read(source.join(path)).unwrap())
+            .unwrap();
+    }
+    archive.finish().unwrap();
+
+    let archive_catalog_path = temporary.path().join("archive-export/catalog.sqlite");
+    let mut archive_catalog = Catalog::open(&archive_catalog_path).unwrap();
+    archive_catalog
+        .scan_source(&archive_path, SourceKind::ImazingArchive, |_| {})
+        .unwrap();
+    let archive_output = export_root.join("archive-export");
+    let archive_report = archive_catalog
+        .export_attachments(
+            &archive_path,
+            SourceKind::ImazingArchive,
+            ExportScope::Paths(&paths),
+            &archive_output,
+            true,
+            false,
+            |_| {},
+        )
+        .unwrap();
+    assert_eq!(archive_report.exported_files, 1);
+    assert!(archive_output.join("12345678.jpg").is_file());
+    assert!(!archive_output.join("12345678.thumb").exists());
+    assert!(source.join(&database).is_file());
 }
 
 #[test]

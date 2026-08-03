@@ -158,6 +158,40 @@
     return assertPage(page, "listAttachments");
   };
 
+  NativeDataProvider.prototype.exportAttachments = function (options) {
+    options = options || {};
+    if (!options.output || typeof options.output !== "string") {
+      throw new TypeError("An export destination token is required.");
+    }
+    var paths = Array.isArray(options.paths) ? options.paths.slice() : [];
+    if (paths.length > 1000 || paths.some((path) => typeof path !== "string" || !path || path.length > 4096)) {
+      throw new RangeError("Export selections must contain at most 1,000 valid paths.");
+    }
+    var source = options.source === undefined || options.source === null
+      ? null
+      : boundedMessageSource(options.source);
+    var chatPk = options.chatPk === undefined || options.chatPk === null
+      ? null
+      : Number(options.chatPk);
+    if (chatPk !== null && !Number.isInteger(chatPk)) {
+      throw new TypeError("chatPk must be an integer.");
+    }
+    if (!paths.length && (source === null || chatPk === null)) {
+      throw new TypeError("Export paths or a source/chat scope is required.");
+    }
+    if (paths.length && (source !== null || chatPk !== null)) {
+      throw new TypeError("Export paths cannot be combined with a chat scope.");
+    }
+    return this.bridge.request("exportAttachments", {
+      output: options.output,
+      paths: paths,
+      source: source,
+      chatPk: chatPk,
+      imagesOnly: Boolean(options.imagesOnly),
+      includeThumbnails: Boolean(options.includeThumbnails)
+    });
+  };
+
   NativeDataProvider.prototype.setAttachmentMarked = function (path, marked) {
     if (!path || typeof path !== "string") throw new TypeError("Attachment path is required.");
     return this.bridge.request("setAttachmentMarked", {

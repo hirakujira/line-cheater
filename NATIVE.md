@@ -88,6 +88,19 @@ grouped below rather than treated as separate feature changes.
   rollback messaging, lock duplicate submissions, and require confirmation
   before cancelling work or closing operation/app windows.
 - `ebd0a80` (`v0.1.25`) is the current release baseline after PR39.
+- The current attachment-export flow adds a bounded `exportAttachments`
+  sidecar method. It exports selected catalog-authorized paths or one chat's
+  referenced attachments from a directory or `.imazingapp`, streams through a
+  fixed 1 MiB buffer, verifies cataloged size/mtime and available SHA-256
+  content digests, and commits a new output directory only after all files are
+  complete. Image-only mode detects common image signatures and reports skipped
+  files; originals and thumbnails can be selected independently.
+- Export destinations are selected through a one-use Electron token. The main
+  process resolves the token to a user-chosen directory, creates a unique
+  `LINE-Cheater-Export-*` child, rejects the private session directory, and
+  removes the Rust-owned `.partial` output when cancellation or failure
+  restarts the sidecar. Direct `Line.sqlite` sources remain export-disabled
+  because they contain message metadata but no attachment files.
 - Attachment cleanup plans now record `manual`, `automatic`, or `chat` evidence.
   Safe automatic attachment cleanup only marks referenced image originals with
   a matching non-empty thumbnail; it never marks PDFs, videos, missing-thumbnail
@@ -253,6 +266,12 @@ Verified implementation:
 - [x] Add bounded local image previews. A preview is catalog-authorized, capped
   at 16 MiB, delivered through a tokenized local protocol, and never serialized
   into JSON. Archive previews are streamed on demand into a 32-file LRU cache.
+- [x] Add bounded attachment export for directory and `.imazingapp` sources.
+  Explicit catalog paths and source-aware chat scopes stream originals or
+  original/thumbnail pairs into a new destination directory; image-only export
+  skips non-image files, basename collisions receive deterministic suffixes,
+  and progress reports processed files/bytes without sending file contents over
+  JSON. Direct `Line.sqlite` export is rejected.
 - [x] Match the web chat-name evidence order with `ZUSER`, `LineSquare.sqlite`,
   `UnifiedGroup.sqlite`, `ZGROUP`, and inferred rename-message fallbacks. Chats
   with at least one stored message are shown like the web implementation;
@@ -343,6 +362,18 @@ Verified implementation:
   dedicated sparse-file runner.
 
 ### Latest verification record
+
+2026-08-03:
+
+- The attachment export fixture passed for both an unpacked directory and a
+  `.imazingapp` archive. It exported image content without changing the
+  read-only source, omitted thumbnails when requested, and left no `.partial`
+  directory after success.
+- Native tests: 41 passed (2 unit, 39 integration); Electron/provider/shell
+  tests: 71 passed. `cargo fmt --all --check`, `cargo check --workspace`, and
+  JavaScript syntax checks passed. The test suite covers bounded export input
+  validation, destination-token wiring, progress/cancellation UI wiring, and
+  directory/archive export behavior. No personal backup contents were logged.
 
 2026-07-27:
 
@@ -597,6 +628,7 @@ Supported methods:
 - `searchMessages`
 - `scanCatalog`
 - `listAttachments`
+- `exportAttachments`
 - `setAttachmentMarked`
 - `stageAttachmentPreview`
 - `catalogStats`
@@ -623,15 +655,17 @@ Supported methods:
 - `buildCandidate`
 - `shutdown`
 
-`scanCatalog`, `searchMessages`, `hashDuplicateCandidates`, and `buildCandidate`
+`scanCatalog`, `searchMessages`, `hashDuplicateCandidates`, `buildCandidate`,
+and `exportAttachments`
 may receive a top-level UUID `jobId`. Progress events echo both `requestId` and
 `jobId`; successful responses echo the job ID as well. `scanCatalog` may emit
 `catalogProgress` and `catalogContextProgress`, search-index construction emits
 `searchIndexProgress`, duplicate hashing emits `duplicateHashProgress`, and
 `buildCandidate` emits `candidateProgress`; cleanup mutations emit
-`cleanupMutationProgress` with a phase and processed/total record counts. Input
-lines larger than 1 MiB are rejected. Output pages remain subject to the
-1,000-record core limit.
+`cleanupMutationProgress` with a phase and processed/total record counts;
+`exportAttachments` emits `exportProgress` with processed/total files and
+bytes. Input lines larger than 1 MiB are rejected. Output pages remain subject
+to the 1,000-record core limit.
 
 Protocol v1 still processes one request at a time. Desktop cancellation kills
 the sidecar, then reopens the same source/work directory: committed directory
@@ -650,10 +684,10 @@ handoff gaps.
 The Electron renderer runs with context isolation, sandboxing, no Node
 integration, no permissions, and no arbitrary navigation. A custom local
 protocol serves an allowlist of bundled assets and catalog-authorized preview
-tokens. The preload exposes only source selection, a one-use candidate-output
-token, a bounded attachment-preview request, allowlisted sidecar requests, and
-six progress event types. The main process validates the sender and caps
-request/response lines before parsing.
+tokens. The preload exposes only source selection, one-use candidate/export
+destination tokens, bounded attachment-preview requests, allowlisted sidecar
+requests, and allowlisted progress event types. The main process validates the
+sender and caps request/response lines before parsing.
 
 Development work directories are source-path-hashed subdirectories under the
 Electron `userData/sessions` directory. They may contain staged SQLite and chat
@@ -679,7 +713,8 @@ These rules are part of the product contract:
 5. Batch catalog writes. The initial batch size is 1,000.
 6. Hash files with a reusable fixed-size buffer and bounded concurrency.
 7. Write output to a new `.partial` file and rename only after validation.
-8. The original source is read-only and is never the output destination.
+8. Attachment exports and candidate builds write to a new output path; the
+   original source is read-only and is never the output destination.
 9. If WAL/SHM are present, preserve and stage them with `Line.sqlite`. Do not use
    SQLite `immutable=1` unless the snapshot has been proven frozen.
 10. Do not add indexes or FTS tables to the source database. Put derived indexes

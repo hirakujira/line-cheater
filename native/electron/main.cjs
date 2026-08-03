@@ -33,6 +33,7 @@ const allowedMethods = new Set([
   "searchMessages",
   "scanCatalog",
   "listAttachments",
+  "exportAttachments",
   "setAttachmentMarked",
   "clearManualAttachmentPlan",
   "clearAllRemovalPlans",
@@ -71,7 +72,8 @@ const jobMethods = new Set([
   "planSafeAttachmentCleanup",
   "setChatRemovalPlanned",
   "planAutomaticCleanup",
-  "clearAdvancedCleanupPlan"
+  "clearAdvancedCleanupPlan",
+  "exportAttachments"
 ]);
 const assetFiles = new Map([
   ["/assets/icon.png", path.join("assets", "icon.png")],
@@ -94,6 +96,7 @@ let updateCheckStarted = false;
 let closeConfirmationOpen = false;
 let closeConfirmed = false;
 const outputTokens = new Map();
+const exportOutputTokens = new Map();
 const previewTokens = new Map();
 const MAX_PREVIEW_TOKENS = 128;
 const MAX_PREVIEW_BYTES = 16 * 1024 * 1024;
@@ -187,6 +190,7 @@ async function replaceSidecar(source) {
     await previous.dispose();
   }
   outputTokens.clear();
+  exportOutputTokens.clear();
   previewTokens.clear();
   activeSource = path.resolve(source);
   const userDataPath = app.getPath("userData");
@@ -234,6 +238,7 @@ async function closeCompletedSession(client, workDir) {
   if (sidecar === client) sidecar = null;
   activeSource = null;
   outputTokens.clear();
+  exportOutputTokens.clear();
   previewTokens.clear();
   const warnings = [];
   try {
@@ -267,6 +272,14 @@ function cleanCancelledOperation(operation) {
   try {
     if (operation.method === "buildCandidate" && operation.output) {
       fs.rmSync(`${operation.output}.partial`, {
+        force: true,
+        maxRetries: 10,
+        retryDelay: 100
+      });
+    }
+    if (operation.method === "exportAttachments" && operation.output) {
+      fs.rmSync(`${operation.output}.partial`, {
+        recursive: true,
         force: true,
         maxRetries: 10,
         retryDelay: 100
@@ -309,6 +322,24 @@ async function registerIpc() {
     const token = crypto.randomUUID();
     outputTokens.set(token, result.filePath);
     return { token, displayName: path.basename(result.filePath) };
+  });
+
+  ipcMain.handle("line-native:choose-export-output", async (event) => {
+    assertTrustedSender(event);
+    if (!sidecar || !activeSource) throw new Error("請先開啟並掃描備份。");
+    const workDir = sessionWorkDir(app.getPath("userData"), activeSource);
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: "選擇附件匯出目的地資料夾",
+      properties: ["openDirectory", "createDirectory"]
+    });
+    if (result.canceled || result.filePaths.length !== 1) return null;
+    const directory = path.resolve(result.filePaths[0]);
+    if (outputFallsInsideSession(workDir, directory)) {
+      throw new Error("匯出目的地不能位於 LINE Cheater 的本機快取內。");
+    }
+    const token = crypto.randomUUID();
+    exportOutputTokens.set(token, directory);
+    return { token, displayName: path.basename(directory) || directory };
   });
 
   ipcMain.handle("line-native:discard-candidate-output", async (event, token) => {
@@ -403,6 +434,7 @@ async function registerIpc() {
     const userDataPath = app.getPath("userData");
     const workDir = sessionWorkDir(userDataPath, activeSource);
     let candidateOutputToken = null;
+    let exportOutputToken = null;
     if (method === "buildCandidate") {
       const token = String(safeParams.output || "");
       const output = outputTokens.get(token);
@@ -413,6 +445,20 @@ async function registerIpc() {
       }
       candidateOutputToken = token;
       safeParams.output = output;
+    }
+    if (method === "exportAttachments") {
+      const token = String(safeParams.output || "");
+      const baseDirectory = exportOutputTokens.get(token);
+      if (!baseDirectory) throw new Error("附件匯出目的地授權已失效，請重新選擇資料夾。");
+      if (outputFallsInsideSession(workDir, baseDirectory)) {
+        exportOutputTokens.delete(token);
+        throw new Error("匯出目的地不能位於 LINE Cheater 的本機快取內。");
+      }
+      exportOutputToken = token;
+      safeParams.output = path.join(
+        baseDirectory,
+        `LINE-Cheater-Export-${crypto.randomUUID()}`
+      );
     }
     const client = sidecar;
     const jobId = jobMethods.has(method) ? crypto.randomUUID() : null;
@@ -427,6 +473,10 @@ async function registerIpc() {
     }
     try {
       const result = await client.request(method, safeParams, { jobId });
+      if (method === "exportAttachments") {
+        exportOutputTokens.delete(exportOutputToken);
+        return result;
+      }
       if (method !== "buildCandidate") return result;
       if (result && result.lineSquareRebuildRequired === true) return result;
       outputTokens.delete(candidateOutputToken);
@@ -434,6 +484,7 @@ async function registerIpc() {
       return { ...result, ...cacheResult };
     } catch (error) {
       if (candidateOutputToken) outputTokens.delete(candidateOutputToken);
+      if (exportOutputToken) exportOutputTokens.delete(exportOutputToken);
       throw error;
     } finally {
       if (activeOperation === operation) activeOperation = null;

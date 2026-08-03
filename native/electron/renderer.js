@@ -26,6 +26,7 @@ let sourceGeneration = 0;
 let messageRenderGeneration = 0;
 let packageInProgress = false;
 let cleanupMutationInProgress = false;
+let exportInProgress = false;
 let cancelInProgress = false;
 let restoreChecklistResolve = null;
 let duplicateLoading = false;
@@ -112,6 +113,8 @@ const elements = {
   messages: document.querySelector("#messages"),
   selectedChatTitle: document.querySelector("#selected-chat-title"),
   selectedChatMeta: document.querySelector("#selected-chat-meta"),
+  exportChatImages: document.querySelector("#export-chat-images"),
+  exportChatAttachments: document.querySelector("#export-chat-attachments"),
   messageStatus: document.querySelector("#message-status"),
   chatPageInfo: document.querySelector("#chat-page-info"),
   previousChats: document.querySelector("#previous-chats"),
@@ -601,15 +604,17 @@ function showOperationModal(title, message) {
   window.requestAnimationFrame(() => elements.operationModalCard.focus());
 }
 
-function updateOperationModalProgress(processed, total, phase) {
+function updateOperationModalProgress(processed, total, phase, unit = "筆資料") {
   const safeTotal = Math.max(0, Number(total) || 0);
   const safeProcessed = Math.max(0, Math.min(Number(processed) || 0, safeTotal || Infinity));
   const progress = safeTotal ? Math.round((safeProcessed / safeTotal) * 100) : 0;
   elements.operationModal.classList.toggle("is-indeterminate", safeTotal === 0);
   elements.operationModalProgress.style.width = safeTotal ? `${progress}%` : "34%";
   elements.operationModalProgress.setAttribute("aria-valuenow", String(progress));
+  const processedLabel = unit === "bytes" ? formatBytes(safeProcessed) : safeProcessed.toLocaleString();
+  const totalLabel = unit === "bytes" ? formatBytes(safeTotal) : total.toLocaleString();
   elements.operationModalProgressLabel.textContent = safeTotal
-    ? `${phase || "寫入中"} ${safeProcessed.toLocaleString()} / ${safeTotal.toLocaleString()} 筆資料 · ${progress}%`
+    ? `${phase || "寫入中"} ${processedLabel} / ${totalLabel} ${unit === "bytes" ? "" : unit} · ${progress}%`
     : `${phase || "準備中"}…`;
 }
 
@@ -626,7 +631,7 @@ function completeOperationModal(error, message) {
 }
 
 function closeOperationModal() {
-  if (cleanupMutationInProgress) return;
+  if (cleanupMutationInProgress || exportInProgress) return;
   elements.operationModal.classList.add("hidden");
   elements.operationModal.setAttribute("aria-hidden", "true");
   syncModalBusy();
@@ -663,6 +668,78 @@ async function runCleanupMutation(options, task) {
     completeOperationModal(true, error.message);
     throw error;
   }
+}
+
+async function runExportJob(options, task) {
+  if (cleanupMutationInProgress || exportInProgress) {
+    throw new Error("已有操作正在進行，請等待目前操作完成。");
+  }
+  exportInProgress = true;
+  showOperationModal(options.title, options.message);
+  await waitForUiPaint();
+  try {
+    const result = await task();
+    updateOperationModalProgress(1, 1, "完成");
+    completeOperationModal(false, options.successMessage || "附件匯出完成。");
+    await new Promise((resolve) => window.setTimeout(resolve, 180));
+    exportInProgress = false;
+    closeOperationModal();
+    return result;
+  } catch (error) {
+    exportInProgress = false;
+    if (isOperationCancelled(error)) {
+      completeOperationModal(false, "匯出已取消；未完成的暫存輸出已清理。");
+      elements.operationModalClose.classList.remove("hidden");
+      elements.operationModalClose.focus();
+      throw error;
+    }
+    completeOperationModal(true, error.message);
+    throw error;
+  }
+}
+
+async function exportAttachmentSelection(paths, options = {}) {
+  if (!provider) {
+    setStatus("請先開啟備份。", true);
+    return;
+  }
+  if (selectedSourceKind === "sqlite") {
+    setStatus("直接 Line.sqlite 來源沒有可匯出的附件檔案。", true);
+    return;
+  }
+  const output = await bridge.chooseExportOutput();
+  if (!output) return;
+  try {
+    const result = await runExportJob({
+      title: options.imagesOnly ? "正在匯出圖檔" : "正在匯出附件",
+      message: "正在將附件串流複製到新的匯出資料夾，請勿重複操作。",
+      successMessage: options.imagesOnly ? "圖檔匯出完成。" : "附件匯出完成。"
+    }, () => provider.exportAttachments({
+      output: output.token,
+      paths,
+      source: options.source,
+      chatPk: options.chatPk,
+      imagesOnly: Boolean(options.imagesOnly),
+      includeThumbnails: Boolean(options.includeThumbnails)
+    }));
+    const skipped = Number(result.skippedFiles) || 0;
+    const detail = skipped
+      ? `已匯出 ${Number(result.exportedFiles || 0).toLocaleString()} 個檔案，略過 ${skipped.toLocaleString()} 個非圖檔。`
+      : `已匯出 ${Number(result.exportedFiles || 0).toLocaleString()} 個檔案。`;
+    setStatus(`${detail} 位置：${result.outputName || "新資料夾"}`, false);
+  } catch (error) {
+    reportCleanupMutationError(error);
+  }
+}
+
+function exportCurrentChat(imagesOnly) {
+  if (!selectedChat || selectedChatPk === null) return;
+  return exportAttachmentSelection([], {
+    imagesOnly,
+    includeThumbnails: !imagesOnly,
+    source: selectedChat.source || "line",
+    chatPk: selectedChatPk
+  });
 }
 
 function closeRestoreChecklist(confirmed) {
@@ -732,6 +809,11 @@ async function cancelCurrentOperation(kind) {
       title: "確定取消資料庫操作？",
       message: "取消後會停止目前的批次工作；尚未提交的聊天室與附件清理計畫將全部回滾。",
       confirmLabel: "確認取消操作"
+    },
+    export: {
+      title: "確定取消附件匯出？",
+      message: "取消後會停止目前的串流匯出，尚未完成的暫存輸出會被清理。",
+      confirmLabel: "確認取消匯出"
     }
   }[kind];
   if (!cancellation || !await requestConfirmation({
@@ -741,12 +823,12 @@ async function cancelCurrentOperation(kind) {
   })) return;
   cancelInProgress = true;
   const button = kind === "load"
-    ? elements.loadModalCancel
-    : kind === "package"
-      ? elements.packageModalCancel
-      : kind === "cleanup"
-        ? elements.operationModalCancel
-        : elements.cancelDuplicateScan;
+      ? elements.loadModalCancel
+      : kind === "package"
+        ? elements.packageModalCancel
+        : ["cleanup", "export"].includes(kind)
+          ? elements.operationModalCancel
+          : elements.cancelDuplicateScan;
   button.disabled = true;
   button.textContent = "取消中…";
   try {
@@ -771,7 +853,7 @@ async function cancelCurrentOperation(kind) {
       ? "取消"
       : kind === "package"
         ? "取消建立"
-        : kind === "cleanup"
+        : ["cleanup", "export"].includes(kind)
           ? "取消操作"
           : "取消掃描";
     setStatus(`取消工作失敗：${error.message}`, true);
@@ -993,6 +1075,9 @@ function setMessagePanelBusy(isBusy) {
   elements.nextMessages.disabled = isBusy || !messageCursor;
   elements.searchButton.disabled = isBusy || !selectedChat;
   elements.clearSearch.disabled = isBusy || !activeSearch;
+  const exportDisabled = isBusy || !selectedChat || selectedSourceKind === "sqlite" || exportInProgress;
+  elements.exportChatImages.disabled = exportDisabled;
+  elements.exportChatAttachments.disabled = exportDisabled;
 }
 
 function renderChatLoadError() {
@@ -1102,6 +1187,8 @@ async function openSource(kind) {
     elements.clearSearch.disabled = true;
     elements.previousMessages.disabled = true;
     elements.nextMessages.disabled = true;
+    elements.exportChatImages.disabled = true;
+    elements.exportChatAttachments.disabled = true;
     const info = await provider.sessionInfo();
     activeSourceBytes = Number(info.source.sourceBytes) || 0;
     const sourceName = sourceDisplayName(info.source.sourcePath, info.source.kind);
@@ -1305,6 +1392,8 @@ async function selectChat(chat) {
   elements.clearSearch.disabled = true;
   elements.previousMessages.disabled = true;
   elements.nextMessages.disabled = true;
+  elements.exportChatImages.disabled = !selectedChat || selectedSourceKind === "sqlite";
+  elements.exportChatAttachments.disabled = !selectedChat || selectedSourceKind === "sqlite";
   await loadMessages("initial", selectionGeneration);
 }
 
@@ -1572,6 +1661,31 @@ function renderMessage(message) {
     card.append(media);
   }
   if (attachments.length) {
+    const attachmentActions = document.createElement("div");
+    attachmentActions.className = "message-attachment-actions";
+    const imagePaths = attachments.map((attachment) => attachment.path);
+    const exportImages = document.createElement("button");
+    exportImages.type = "button";
+    exportImages.className = "secondary-button compact-button";
+    exportImages.textContent = "匯出圖檔";
+    exportImages.addEventListener("click", () => {
+      void exportAttachmentSelection(imagePaths, {
+        imagesOnly: true,
+        includeThumbnails: true
+      });
+    });
+    const exportAttachments = document.createElement("button");
+    exportAttachments.type = "button";
+    exportAttachments.className = "secondary-button compact-button";
+    exportAttachments.textContent = "匯出本則附件";
+    exportAttachments.addEventListener("click", () => {
+      void exportAttachmentSelection(attachments.map((attachment) => attachment.path), {
+        imagesOnly: false,
+        includeThumbnails: true
+      });
+    });
+    attachmentActions.append(exportImages, exportAttachments);
+    card.append(attachmentActions);
     const list = document.createElement("ul");
     list.className = "message-attachments";
     for (const attachment of attachments) {
@@ -3867,7 +3981,9 @@ elements.buildCandidate.addEventListener("click", () => void buildCandidate());
 elements.advancedBuildCandidate.addEventListener("click", () => void buildCandidate());
 elements.loadModalCancel.addEventListener("click", () => void cancelCurrentOperation("load"));
 elements.packageModalCancel.addEventListener("click", () => void cancelCurrentOperation("package"));
-elements.operationModalCancel.addEventListener("click", () => void cancelCurrentOperation("cleanup"));
+elements.operationModalCancel.addEventListener("click", () => {
+  void cancelCurrentOperation(exportInProgress ? "export" : "cleanup");
+});
 elements.packageModalClose.addEventListener("click", () => void requestModalClose("package"));
 elements.operationModalClose.addEventListener("click", () => void requestModalClose("operation"));
 elements.restoreCheckOriginal.addEventListener("change", updateRestoreChecklistState);
@@ -3908,7 +4024,8 @@ document.addEventListener("keydown", (event) => {
   if (openModal === elements.confirmationModal) closeConfirmationModal(false);
   else if (openModal === elements.imageModal) void requestModalClose("image");
   else if (openModal === elements.restoreChecklistModal) void requestRestoreChecklistCancellation();
-  else if (openModal === elements.operationModal && !cleanupMutationInProgress) {
+  else if (openModal === elements.operationModal &&
+           !cleanupMutationInProgress && !exportInProgress) {
     void requestModalClose("operation");
   } else if (openModal === elements.packageModal && !packageInProgress) {
     void requestModalClose("package");
@@ -3934,6 +4051,8 @@ elements.clearSearch.addEventListener("click", () => {
   messagePageNumber = 1;
   void loadMessages("initial");
 });
+elements.exportChatImages.addEventListener("click", () => void exportCurrentChat(true));
+elements.exportChatAttachments.addEventListener("click", () => void exportCurrentChat(false));
 elements.cleanupKind.addEventListener("change", updateCleanupFilter);
 elements.cleanupCategory.addEventListener("change", updateCleanupFilter);
 elements.cleanupSort.addEventListener("change", updateCleanupFilter);
@@ -4106,6 +4225,15 @@ bridge.on("cleanupMutationProgress", (event) => {
     Number(event.processedRecords) || 0,
     Number(event.totalRecords) || 0,
     event.phase || "寫入中"
+  );
+});
+bridge.on("exportProgress", (event) => {
+  if (elements.operationModal.classList.contains("hidden")) return;
+  updateOperationModalProgress(
+    Number(event.processedBytes) || 0,
+    Number(event.totalBytes) || 0,
+    event.phase || "匯出中",
+    "bytes"
   );
 });
 bridge.on("searchIndexProgress", (event) => {

@@ -202,6 +202,7 @@ h3 { margin: 0; font-size: 1rem; }
 .primary-button:hover:not(:disabled) { border-color: var(--accent-strong); color: white; background: var(--accent-strong); }
 .secondary-button { color: #475569; background: #f8fafc; }
 .secondary-button:hover:not(:disabled) { color: #334155; background: #f1f5f9; }
+.compact-button { min-height: 30px; padding: 5px 9px; font-size: 0.72rem; }
 
 .workspace-screen {
   display: grid;
@@ -471,6 +472,7 @@ progress { width: 100%; height: 8px; }
 .message-image img { display: block; width: 100%; max-width: 520px; max-height: 520px; margin: auto; object-fit: contain; }
 .message-image figcaption { margin-top: 4px; color: var(--muted); font-size: 0.72rem; }
 .message-image.preview-error { display: none; }
+.message-attachment-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 10px; }
 .message-attachments { margin: 9px 0 0; padding-left: 20px; color: var(--accent-strong); font-size: 0.8rem; }
 .message-attachments span { color: var(--muted); }
 
