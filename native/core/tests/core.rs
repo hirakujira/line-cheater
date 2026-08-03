@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::anyhow;
 use line_backup_native::{
-    AttachmentKind, CandidateOptions, Catalog, Chat, ChatCursor, ExportScope, LineDatabase,
-    LineSquareDatabase, MessageCursor, NativeSession, PreparePhase, SourceKind,
+    AttachmentKind, CandidateOptions, Catalog, Chat, ChatCursor, ExportOptions, ExportScope,
+    LineDatabase, LineSquareDatabase, MessageCursor, NativeSession, PreparePhase, SourceKind,
     UnifiedGroupDatabase, build_candidate, build_candidate_with_options, inspect_source,
     line_square_rebuild_required, prepare_source, prepare_source_reporting, serve,
 };
@@ -1937,8 +1937,10 @@ fn exports_selected_images_from_directory_and_archive_without_overwriting_source
             SourceKind::Directory,
             ExportScope::Paths(&paths),
             &output,
-            true,
-            true,
+            ExportOptions {
+                images_only: true,
+                include_thumbnails: true,
+            },
             |value| progress.push(value),
         )
         .unwrap();
@@ -1965,8 +1967,10 @@ fn exports_selected_images_from_directory_and_archive_without_overwriting_source
                 SourceKind::Directory,
                 ExportScope::Paths(&paths),
                 &inside_source,
-                false,
-                false,
+                ExportOptions {
+                    images_only: false,
+                    include_thumbnails: false,
+                },
                 |_| {},
             )
             .is_err()
@@ -1978,8 +1982,10 @@ fn exports_selected_images_from_directory_and_archive_without_overwriting_source
                 SourceKind::Sqlite,
                 ExportScope::Paths(&paths),
                 &export_root.join("sqlite-export"),
-                false,
-                false,
+                ExportOptions {
+                    images_only: false,
+                    include_thumbnails: false,
+                },
                 |_| {},
             )
             .is_err()
@@ -2014,8 +2020,10 @@ fn exports_selected_images_from_directory_and_archive_without_overwriting_source
             SourceKind::ImazingArchive,
             ExportScope::Paths(&paths),
             &archive_output,
-            true,
-            false,
+            ExportOptions {
+                images_only: true,
+                include_thumbnails: false,
+            },
             |_| {},
         )
         .unwrap();

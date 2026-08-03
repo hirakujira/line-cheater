@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::candidate::{
     CandidateOptions, build_candidate_with_options, line_square_rebuild_required,
 };
-use crate::catalog::{Catalog, ExportScope};
+use crate::catalog::{Catalog, ExportOptions, ExportScope};
 use crate::database::{
     Fts5MessageIndex, LineDatabase, LineSquareDatabase, OrphanMessage, UnifiedGroupDatabase,
 };
@@ -812,8 +812,10 @@ fn handle_request<W: Write>(
                 session.prepared.report.kind,
                 scope,
                 &params.output,
-                params.images_only,
-                params.include_thumbnails,
+                ExportOptions {
+                    images_only: params.images_only,
+                    include_thumbnails: params.include_thumbnails,
+                },
                 |progress| {
                     let _ = write_export_progress(
                         output,

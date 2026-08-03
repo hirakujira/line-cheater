@@ -12,7 +12,7 @@ pub use candidate::{
 };
 pub use catalog::{
     BulkChatMutationProgress, Catalog, CatalogContextProgress, CatalogScanProgress,
-    CleanupMutationProgress, ExportScope,
+    CleanupMutationProgress, ExportOptions, ExportScope,
 };
 pub use database::{LineDatabase, LineSquareDatabase, UnifiedGroupDatabase};
 pub use model::{

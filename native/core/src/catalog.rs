@@ -154,6 +154,24 @@ pub enum ExportScope<'a> {
     Chat { source: &'a str, chat_pk: i64 },
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ExportOptions {
+    pub images_only: bool,
+    pub include_thumbnails: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExportSource<'a> {
+    path: &'a Path,
+    kind: SourceKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExportChatScope<'a> {
+    source: &'a str,
+    chat_pk: i64,
+}
+
 #[derive(Debug)]
 struct ExportItem {
     path: String,
@@ -1077,8 +1095,7 @@ impl Catalog {
         source_kind: SourceKind,
         scope: ExportScope<'_>,
         output: &Path,
-        images_only: bool,
-        include_thumbnails: bool,
+        options: ExportOptions,
         mut on_progress: F,
     ) -> Result<ExportReport>
     where
@@ -1113,7 +1130,7 @@ impl Catalog {
             bail!("partial export output already exists; remove it before retrying");
         }
 
-        let (total_files, total_bytes) = self.export_totals(&scope, include_thumbnails)?;
+        let (total_files, total_bytes) = self.export_totals(&scope, options.include_thumbnails)?;
         let mut accumulator = ExportAccumulator {
             progress: ExportProgress {
                 total_files,
@@ -1128,12 +1145,13 @@ impl Catalog {
 
         let result = match scope {
             ExportScope::Paths(paths) => self.export_paths(
-                &source,
-                source_kind,
+                ExportSource {
+                    path: &source,
+                    kind: source_kind,
+                },
                 paths,
                 &partial,
-                images_only,
-                include_thumbnails,
+                options,
                 &mut accumulator,
                 &mut on_progress,
             ),
@@ -1141,13 +1159,16 @@ impl Catalog {
                 source: chat_source,
                 chat_pk,
             } => self.export_chat(
-                &source,
-                source_kind,
-                chat_source,
-                chat_pk,
+                ExportSource {
+                    path: &source,
+                    kind: source_kind,
+                },
+                ExportChatScope {
+                    source: chat_source,
+                    chat_pk,
+                },
                 &partial,
-                images_only,
-                include_thumbnails,
+                options,
                 &mut accumulator,
                 &mut on_progress,
             ),
@@ -1242,12 +1263,10 @@ impl Catalog {
 
     fn export_paths<F>(
         &self,
-        source: &Path,
-        source_kind: SourceKind,
+        source: ExportSource<'_>,
         paths: &[String],
         output: &Path,
-        images_only: bool,
-        include_thumbnails: bool,
+        options: ExportOptions,
         accumulator: &mut ExportAccumulator,
         on_progress: &mut F,
     ) -> Result<()>
@@ -1264,26 +1283,26 @@ impl Catalog {
                 continue;
             }
             let item = self.export_item(path)?;
-            if !include_thumbnails && item.kind == AttachmentKind::Thumbnail {
+            if !options.include_thumbnails && item.kind == AttachmentKind::Thumbnail {
                 continue;
             }
             items.push(item);
         }
-        match source_kind {
+        match source.kind {
             SourceKind::Directory => {
                 for item in items {
                     self.export_directory_item(
-                        source,
+                        source.path,
                         &item,
                         output,
-                        images_only,
+                        options.images_only,
                         accumulator,
                         on_progress,
                     )?;
                 }
             }
             SourceKind::ImazingArchive => {
-                let mut archive = ZipArchive::new(File::open(source)?)?;
+                let mut archive = ZipArchive::new(File::open(source.path)?)?;
                 for item in items {
                     let mut entry = archive.by_name(&item.path).with_context(|| {
                         format!("attachment is missing from archive: {}", item.path)
@@ -1295,7 +1314,7 @@ impl Catalog {
                         &mut entry,
                         &item,
                         output,
-                        images_only,
+                        options.images_only,
                         accumulator,
                         on_progress,
                     )?;
@@ -1308,23 +1327,20 @@ impl Catalog {
 
     fn export_chat<F>(
         &self,
-        source: &Path,
-        source_kind: SourceKind,
-        chat_source: &str,
-        chat_pk: i64,
+        source: ExportSource<'_>,
+        chat: ExportChatScope<'_>,
         output: &Path,
-        images_only: bool,
-        include_thumbnails: bool,
+        options: ExportOptions,
         accumulator: &mut ExportAccumulator,
         on_progress: &mut F,
     ) -> Result<()>
     where
         F: FnMut(ExportProgress),
     {
-        if !matches!(chat_source, "line" | "square") {
+        if !matches!(chat.source, "line" | "square") {
             bail!("chat export source must be `line` or `square`");
         }
-        let attachment_filter = if include_thumbnails {
+        let attachment_filter = if options.include_thumbnails {
             "attachment_kind IS NOT NULL"
         } else {
             "attachment_kind = 'original'"
@@ -1338,7 +1354,7 @@ impl Catalog {
                AND message_chat_pk = ?2
              ORDER BY id ASC"
         ))?;
-        let rows = statement.query_map(params![chat_source, chat_pk], |row| {
+        let rows = statement.query_map(params![chat.source, chat.chat_pk], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?.max(0) as u64,
@@ -1347,7 +1363,7 @@ impl Catalog {
                 row.get(4)?,
             ))
         })?;
-        match source_kind {
+        match source.kind {
             SourceKind::Directory => {
                 for row in rows {
                     let (path, bytes, modified_ns, kind, content_sha256) = row?;
@@ -1359,17 +1375,17 @@ impl Catalog {
                         content_sha256,
                     };
                     self.export_directory_item(
-                        source,
+                        source.path,
                         &item,
                         output,
-                        images_only,
+                        options.images_only,
                         accumulator,
                         on_progress,
                     )?;
                 }
             }
             SourceKind::ImazingArchive => {
-                let mut archive = ZipArchive::new(File::open(source)?)?;
+                let mut archive = ZipArchive::new(File::open(source.path)?)?;
                 for row in rows {
                     let (path, bytes, modified_ns, kind, content_sha256) = row?;
                     let item = ExportItem {
@@ -1389,7 +1405,7 @@ impl Catalog {
                         &mut entry,
                         &item,
                         output,
-                        images_only,
+                        options.images_only,
                         accumulator,
                         on_progress,
                     )?;
@@ -4789,7 +4805,7 @@ fn detect_image_media_type(path: &Path) -> Result<Option<&'static str>> {
 }
 
 fn detect_image_media_type_bytes(header: &[u8]) -> Option<&'static str> {
-    let media_type = if header.starts_with(&[0xff, 0xd8, 0xff]) {
+    if header.starts_with(&[0xff, 0xd8, 0xff]) {
         Some("image/jpeg")
     } else if header.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")
@@ -4806,8 +4822,7 @@ fn detect_image_media_type_bytes(header: &[u8]) -> Option<&'static str> {
         Some("image/avif")
     } else {
         None
-    };
-    media_type
+    }
 }
 
 fn unique_export_path(directory: &Path, source_path: &str) -> PathBuf {
