@@ -382,6 +382,7 @@ test("supports bounded image and attachment exports", () => {
   assert.match(html, /id="export-chat-images"/);
   assert.match(html, /id="export-chat-attachments"/);
   assert.match(renderer, /function exportAttachmentSelection\(paths, options = \{\}\)/);
+  assert.match(renderer, /if \(succeeded\) \{\s+setMessagePanelBusy\(false\);/);
   assert.match(renderer, /provider\.exportAttachments\(/);
   assert.match(renderer, /匯出圖檔/);
   assert.match(renderer, /匯出本則附件/);

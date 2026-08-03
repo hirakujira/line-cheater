@@ -1456,7 +1456,9 @@ async function loadMessages(direction = "initial", requestedSelectionGeneration 
     if (requestGeneration === messageRequestGeneration) {
       messageLoading = false;
       elements.messages.removeAttribute("aria-busy");
-      if (!succeeded) {
+      if (succeeded) {
+        setMessagePanelBusy(false);
+      } else {
         elements.previousMessages.disabled = true;
         elements.nextMessages.disabled = true;
         elements.searchButton.disabled = !selectedChat;
