@@ -167,6 +167,26 @@ pub struct AttachmentPreview {
     pub bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportProgress {
+    pub processed_files: u64,
+    pub total_files: u64,
+    pub processed_bytes: u64,
+    pub total_bytes: u64,
+    pub skipped_files: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportReport {
+    pub output_name: String,
+    pub exported_files: u64,
+    pub exported_bytes: u64,
+    pub skipped_files: u64,
+    pub skipped_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CatalogStats {

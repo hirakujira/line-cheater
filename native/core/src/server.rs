@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::candidate::{
     CandidateOptions, build_candidate_with_options, line_square_rebuild_required,
 };
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, ExportOptions, ExportScope};
 use crate::database::{
     Fts5MessageIndex, LineDatabase, LineSquareDatabase, OrphanMessage, UnifiedGroupDatabase,
 };
@@ -287,6 +287,22 @@ struct BuildCandidateParams {
     link_duplicates: bool,
     #[serde(default)]
     allow_line_square_rebuild: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExportAttachmentsParams {
+    output: PathBuf,
+    #[serde(default)]
+    paths: Vec<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    chat_pk: Option<i64>,
+    #[serde(default)]
+    images_only: bool,
+    #[serde(default)]
+    include_thumbnails: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -751,6 +767,67 @@ fn handle_request<W: Write>(
                 params.search.as_deref(),
             )?;
             Ok(serde_json::to_value(page)?)
+        }
+        "exportAttachments" => {
+            let params: ExportAttachmentsParams = parse_params(request)?;
+            let scope = if !params.paths.is_empty() {
+                if params.source.is_some() || params.chat_pk.is_some() {
+                    anyhow::bail!("path export cannot also specify a chat scope");
+                }
+                ExportScope::Paths(&params.paths)
+            } else {
+                let source = params
+                    .source
+                    .as_deref()
+                    .context("export requires attachment paths or a chat scope")?;
+                let chat_pk = params.chat_pk.context("chat export requires chatPk")?;
+                ExportScope::Chat { source, chat_pk }
+            };
+            let request_id = request.id.clone();
+            let job_id = request.job_id.clone();
+            if !session.catalog_source_verified {
+                write_export_progress(
+                    output,
+                    &request_id,
+                    job_id.as_deref(),
+                    "驗證來源備份",
+                    crate::model::ExportProgress::default(),
+                )?;
+                let current = session.catalog.source_matches_current(
+                    &session.prepared.original_path,
+                    session.prepared.report.kind,
+                )?;
+                session.catalog_source_verified = current;
+                if !current {
+                    anyhow::bail!(
+                        "source changed since the last catalog scan; rescan the backup before exporting"
+                    );
+                }
+            }
+            session
+                .catalog
+                .set_active_job("export", request.job_id.as_deref())?;
+            let result = session.catalog.export_attachments(
+                &session.prepared.original_path,
+                session.prepared.report.kind,
+                scope,
+                &params.output,
+                ExportOptions {
+                    images_only: params.images_only,
+                    include_thumbnails: params.include_thumbnails,
+                },
+                |progress| {
+                    let _ = write_export_progress(
+                        output,
+                        &request_id,
+                        job_id.as_deref(),
+                        "匯出附件",
+                        progress,
+                    );
+                },
+            );
+            session.catalog.clear_active_job("export")?;
+            Ok(serde_json::to_value(result?)?)
         }
         "setAttachmentMarked" => {
             let params: MarkParams = parse_params(request)?;
@@ -1484,6 +1561,29 @@ fn write_cleanup_mutation_progress_values<W: Write>(
             "phase": phase,
             "processedRecords": processed_records,
             "totalRecords": total_records,
+        }),
+    )
+}
+
+fn write_export_progress<W: Write>(
+    output: &mut W,
+    request_id: &str,
+    job_id: Option<&str>,
+    phase: &str,
+    progress: crate::model::ExportProgress,
+) -> Result<()> {
+    write_json_line(
+        output,
+        &json!({
+            "event": "exportProgress",
+            "requestId": request_id,
+            "jobId": job_id,
+            "phase": phase,
+            "processedFiles": progress.processed_files,
+            "totalFiles": progress.total_files,
+            "processedBytes": progress.processed_bytes,
+            "totalBytes": progress.total_bytes,
+            "skippedFiles": progress.skipped_files,
         }),
     )
 }

@@ -10,6 +10,7 @@ const eventNames = new Set([
   "catalogProgress",
   "catalogContextProgress",
   "cleanupMutationProgress",
+  "exportProgress",
   "duplicateHashProgress",
   "candidateProgress"
 ]);
@@ -21,6 +22,9 @@ contextBridge.exposeInMainWorld("lineNativeBridge", Object.freeze({
   },
   chooseCandidateOutput() {
     return ipcRenderer.invoke("line-native:choose-candidate-output");
+  },
+  chooseExportOutput() {
+    return ipcRenderer.invoke("line-native:choose-export-output");
   },
   discardCandidateOutput(token) {
     if (typeof token !== "string" || !token) {

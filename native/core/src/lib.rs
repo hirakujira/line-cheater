@@ -12,7 +12,7 @@ pub use candidate::{
 };
 pub use catalog::{
     BulkChatMutationProgress, Catalog, CatalogContextProgress, CatalogScanProgress,
-    CleanupMutationProgress,
+    CleanupMutationProgress, ExportOptions, ExportScope,
 };
 pub use database::{LineDatabase, LineSquareDatabase, UnifiedGroupDatabase};
 pub use model::{
@@ -21,8 +21,8 @@ pub use model::{
     CleanupAuditReport, CleanupCategoryActionState, CleanupCategoryTotal, CleanupGroup,
     CleanupGroupPage, CleanupOverview, CleanupPlanPreview, CleanupPlanSnapshot,
     CleanupPreflightReport, CleanupReview, CleanupReviewPage, CleanupRisk, DuplicateGroup,
-    DuplicateGroupCursor, DuplicateGroupPage, DuplicateHashProgress, DuplicateMemberPage, Message,
-    MessageAttachment, MessageCursor, MessagePage,
+    DuplicateGroupCursor, DuplicateGroupPage, DuplicateHashProgress, DuplicateMemberPage,
+    ExportProgress, ExportReport, Message, MessageAttachment, MessageCursor, MessagePage,
 };
 pub use performance::{PerformanceProfile, system_performance_profile};
 pub use server::{NativeSession, serve};

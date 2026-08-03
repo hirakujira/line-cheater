@@ -73,6 +73,52 @@ test("rejects an oversized response even if a bridge is compromised", async () =
   await assert.rejects(() => provider.listAttachments(), RangeError);
 });
 
+test("validates and forwards bounded attachment exports", async () => {
+  const calls = [];
+  const provider = new NativeDataProvider({
+    request: async (method, params) => {
+      calls.push({ method, params });
+      return { outputName: "LINE-Cheater-Export", exportedFiles: 1 };
+    }
+  });
+  await provider.exportAttachments({
+    output: "export-token",
+    paths: ["Container/Message Attachments/u1/123.jpg"],
+    imagesOnly: true,
+    includeThumbnails: false
+  });
+  assert.deepEqual(calls[0], {
+    method: "exportAttachments",
+    params: {
+      output: "export-token",
+      paths: ["Container/Message Attachments/u1/123.jpg"],
+      source: null,
+      chatPk: null,
+      imagesOnly: true,
+      includeThumbnails: false
+    }
+  });
+  await provider.exportAttachments({
+    output: "export-token",
+    source: "square",
+    chatPk: 8,
+    includeThumbnails: true
+  });
+  assert.equal(calls[1].params.source, "square");
+  assert.equal(calls[1].params.chatPk, 8);
+  assert.throws(() => provider.exportAttachments({ output: "x" }), TypeError);
+  assert.throws(() => provider.exportAttachments({
+    output: "x",
+    paths: new Array(1001).fill("attachment")
+  }), RangeError);
+  assert.throws(() => provider.exportAttachments({
+    output: "x",
+    paths: ["one"],
+    source: "line",
+    chatPk: 7
+  }), TypeError);
+});
+
 test("normalizes duplicate digest requests", async () => {
   const calls = [];
   const provider = new NativeDataProvider({
