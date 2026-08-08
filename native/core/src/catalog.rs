@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::{self, File, FileTimes, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::sync_channel;
@@ -12,8 +12,10 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
-use zip::ZipArchive;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use crate::conversation::attachment_entry_name;
 use crate::database::{LineDatabase, LineSquareDatabase, OrphanMessage, UnifiedGroupDatabase};
 use crate::model::{
     AdvancedCleanupReport, AttachmentContext, AttachmentCursor, AttachmentItem, AttachmentKind,
@@ -1195,6 +1197,129 @@ impl Catalog {
             let _ = fs::remove_dir_all(&partial);
         }
         result
+    }
+
+    pub(crate) fn write_conversation_attachments<W, F>(
+        &self,
+        source: &Path,
+        source_kind: SourceKind,
+        chat_source: &str,
+        chat_pk: i64,
+        writer: &mut ZipWriter<W>,
+        mut on_progress: F,
+    ) -> Result<ExportProgress>
+    where
+        W: Write + Seek,
+        F: FnMut(ExportProgress),
+    {
+        if source_kind == SourceKind::Sqlite {
+            return Ok(ExportProgress::default());
+        }
+        if !matches!(chat_source, "line" | "square") {
+            bail!("conversation source must be `line` or `square`");
+        }
+        let source = source
+            .canonicalize()
+            .with_context(|| format!("source does not exist: {}", source.display()))?;
+        validate_bound_source(self, &source)?;
+        let (total_files, total_bytes): (i64, i64) = self.connection.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(bytes), 0)
+             FROM files
+             WHERE attachment_kind IS NOT NULL
+               AND reference_status = 'referenced'
+               AND context_source = ?1
+               AND message_chat_pk = ?2",
+            params![chat_source, chat_pk],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let mut progress = ExportProgress {
+            total_files: total_files.max(0) as u64,
+            total_bytes: total_bytes.max(0) as u64,
+            ..ExportProgress::default()
+        };
+        on_progress(progress);
+        let mut statement = self.connection.prepare(
+            "SELECT path, bytes, modified_ns, attachment_kind, content_sha256
+             FROM files
+             WHERE attachment_kind IS NOT NULL
+               AND reference_status = 'referenced'
+               AND context_source = ?1
+               AND message_chat_pk = ?2
+             ORDER BY id ASC",
+        )?;
+        let rows = statement.query_map(params![chat_source, chat_pk], |row| {
+            Ok(ExportItem {
+                path: row.get(0)?,
+                bytes: row.get::<_, i64>(1)?.max(0) as u64,
+                modified_ns: row.get(2)?,
+                kind: row
+                    .get::<_, String>(3)?
+                    .parse()
+                    .map_err(|error: anyhow::Error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            3,
+                            rusqlite::types::Type::Text,
+                            error.into(),
+                        )
+                    })?,
+                content_sha256: row.get(4)?,
+            })
+        })?;
+
+        match source_kind {
+            SourceKind::Directory => {
+                for row in rows {
+                    let item = row?;
+                    let candidate = source.join(&item.path).canonicalize().with_context(|| {
+                        format!("attachment does not exist in source: {}", item.path)
+                    })?;
+                    if !candidate.starts_with(&source) || !candidate.is_file() {
+                        bail!("attachment path escapes the selected source");
+                    }
+                    let metadata = fs::metadata(&candidate)?;
+                    if metadata.len() != item.bytes
+                        || modified_ns(metadata.modified().ok()) != item.modified_ns
+                    {
+                        bail!("attachment changed since catalog scan: {}", item.path);
+                    }
+                    let mut file = File::open(&candidate)?;
+                    write_conversation_attachment_reader(
+                        &mut file,
+                        &item,
+                        writer,
+                        &mut progress,
+                        &mut on_progress,
+                    )?;
+                    let after = fs::metadata(&candidate)?;
+                    if after.len() != item.bytes
+                        || modified_ns(after.modified().ok()) != item.modified_ns
+                    {
+                        bail!("attachment changed while exporting: {}", item.path);
+                    }
+                }
+            }
+            SourceKind::ImazingArchive => {
+                let mut archive = ZipArchive::new(File::open(&source)?)?;
+                for row in rows {
+                    let item = row?;
+                    let mut entry = archive.by_name(&item.path).with_context(|| {
+                        format!("attachment is missing from archive: {}", item.path)
+                    })?;
+                    if entry.is_dir() || entry.size() != item.bytes {
+                        bail!("archive attachment metadata does not match the catalog");
+                    }
+                    write_conversation_attachment_reader(
+                        &mut entry,
+                        &item,
+                        writer,
+                        &mut progress,
+                        &mut on_progress,
+                    )?;
+                }
+            }
+            SourceKind::Sqlite => unreachable!("SQLite exports return before catalog access"),
+        }
+        Ok(progress)
     }
 
     fn export_totals(
@@ -4795,6 +4920,54 @@ fn cleanup_group_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(CleanupG
         },
         row.get::<_, i64>(16)?.max(0) as u64,
     ))
+}
+
+fn write_conversation_attachment_reader<R, W, F>(
+    reader: &mut R,
+    item: &ExportItem,
+    writer: &mut ZipWriter<W>,
+    progress: &mut ExportProgress,
+    on_progress: &mut F,
+) -> Result<()>
+where
+    R: Read,
+    W: Write + Seek,
+    F: FnMut(ExportProgress),
+{
+    let entry_name = attachment_entry_name(&item.path);
+    writer.start_file(
+        entry_name,
+        SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+    )?;
+    let mut digest = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; EXPORT_BUFFER_BYTES];
+    while copied < item.bytes {
+        let remaining = item.bytes.saturating_sub(copied);
+        let target = remaining.min(buffer.len() as u64) as usize;
+        let read = reader.read(&mut buffer[..target])?;
+        if read == 0 {
+            bail!("attachment ended before its cataloged size: {}", item.path);
+        }
+        writer.write_all(&buffer[..read])?;
+        digest.update(&buffer[..read]);
+        copied = copied.saturating_add(read as u64);
+        progress.processed_bytes = progress.processed_bytes.saturating_add(read as u64);
+        on_progress(*progress);
+    }
+    if let Some(expected) = &item.content_sha256 {
+        let actual = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if actual != *expected {
+            bail!("attachment changed while exporting: {}", item.path);
+        }
+    }
+    progress.processed_files = progress.processed_files.saturating_add(1);
+    on_progress(*progress);
+    Ok(())
 }
 
 fn detect_image_media_type(path: &Path) -> Result<Option<&'static str>> {

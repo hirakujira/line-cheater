@@ -101,6 +101,13 @@ grouped below rather than treated as separate feature changes.
   removes the Rust-owned `.partial` output when cancellation or failure
   restarts the sidecar. Direct `Line.sqlite` sources remain export-disabled
   because they contain message metadata but no attachment files.
+- `exportConversation` writes the selected chat from its first message through
+  its final message into a portable ZIP containing `index.html` and an
+  `attachments/` directory. Messages are read with 1,000-row keyset pages and
+  the HTML/attachment bytes are streamed directly into the ZIP. Attachment
+  size/mtime and available SHA-256 evidence are revalidated; HTML escapes chat,
+  sender, and message content. Direct `Line.sqlite` sources produce the same
+  complete HTML without attachment files.
 - Attachment cleanup plans now record `manual`, `automatic`, or `chat` evidence.
   Safe automatic attachment cleanup only marks referenced image originals with
   a matching non-empty thumbnail; it never marks PDFs, videos, missing-thumbnail
@@ -629,6 +636,7 @@ Supported methods:
 - `scanCatalog`
 - `listAttachments`
 - `exportAttachments`
+- `exportConversation`
 - `setAttachmentMarked`
 - `stageAttachmentPreview`
 - `catalogStats`
@@ -656,7 +664,7 @@ Supported methods:
 - `shutdown`
 
 `scanCatalog`, `searchMessages`, `hashDuplicateCandidates`, `buildCandidate`,
-and `exportAttachments`
+`exportAttachments`, and `exportConversation`
 may receive a top-level UUID `jobId`. Progress events echo both `requestId` and
 `jobId`; successful responses echo the job ID as well. `scanCatalog` may emit
 `catalogProgress` and `catalogContextProgress`, search-index construction emits
@@ -664,8 +672,9 @@ may receive a top-level UUID `jobId`. Progress events echo both `requestId` and
 `buildCandidate` emits `candidateProgress`; cleanup mutations emit
 `cleanupMutationProgress` with a phase and processed/total record counts;
 `exportAttachments` emits `exportProgress` with processed/total files and
-bytes. Input lines larger than 1 MiB are rejected. Output pages remain subject
-to the 1,000-record core limit.
+bytes. `exportConversation` emits `conversationExportProgress` with separate
+message, attachment, and byte totals. Input lines larger than 1 MiB are
+rejected. Output pages remain subject to the 1,000-record core limit.
 
 Protocol v1 still processes one request at a time. Desktop cancellation kills
 the sidecar, then reopens the same source/work directory: committed directory

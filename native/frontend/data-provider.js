@@ -192,6 +192,20 @@
     });
   };
 
+  NativeDataProvider.prototype.exportConversation = function (options) {
+    options = options || {};
+    if (!options.output || typeof options.output !== "string") {
+      throw new TypeError("A conversation output token is required.");
+    }
+    var chatPk = Number(options.chatPk);
+    if (!Number.isInteger(chatPk)) throw new TypeError("chatPk must be an integer.");
+    return this.bridge.request("exportConversation", {
+      output: options.output,
+      source: boundedMessageSource(options.source),
+      chatPk: chatPk
+    });
+  };
+
   NativeDataProvider.prototype.setAttachmentMarked = function (path, marked) {
     if (!path || typeof path !== "string") throw new TypeError("Attachment path is required.");
     return this.bridge.request("setAttachmentMarked", {

@@ -113,6 +113,7 @@ const elements = {
   messages: document.querySelector("#messages"),
   selectedChatTitle: document.querySelector("#selected-chat-title"),
   selectedChatMeta: document.querySelector("#selected-chat-meta"),
+  exportChatConversation: document.querySelector("#export-chat-conversation"),
   exportChatImages: document.querySelector("#export-chat-images"),
   exportChatAttachments: document.querySelector("#export-chat-attachments"),
   messageStatus: document.querySelector("#message-status"),
@@ -742,6 +743,31 @@ function exportCurrentChat(imagesOnly) {
   });
 }
 
+async function exportCurrentConversation() {
+  if (!provider || !selectedChat || selectedChatPk === null) return;
+  try {
+    const output = await bridge.chooseConversationOutput();
+    if (!output) return;
+    const result = await runExportJob({
+      title: "正在輸出完整討論串",
+      message: "正在從最早一則開始讀取全部訊息，並將 HTML 與附件寫入 ZIP。",
+      successMessage: "完整討論串輸出完成。"
+    }, () => provider.exportConversation({
+      output: output.token,
+      source: selectedChat.source || "line",
+      chatPk: selectedChatPk
+    }));
+    setStatus(
+      `已輸出 ${Number(result.messages || 0).toLocaleString()} 則訊息與 ` +
+      `${Number(result.attachments || 0).toLocaleString()} 個附件。` +
+      `檔案：${result.outputName || output.displayName}`,
+      false
+    );
+  } catch (error) {
+    reportCleanupMutationError(error);
+  }
+}
+
 function closeRestoreChecklist(confirmed) {
   if (!restoreChecklistResolve) return;
   const resolve = restoreChecklistResolve;
@@ -1078,6 +1104,7 @@ function setMessagePanelBusy(isBusy) {
   const exportDisabled = isBusy || !selectedChat || selectedSourceKind === "sqlite" || exportInProgress;
   elements.exportChatImages.disabled = exportDisabled;
   elements.exportChatAttachments.disabled = exportDisabled;
+  elements.exportChatConversation.disabled = isBusy || !selectedChat || exportInProgress;
 }
 
 function renderChatLoadError() {
@@ -1189,6 +1216,7 @@ async function openSource(kind) {
     elements.nextMessages.disabled = true;
     elements.exportChatImages.disabled = true;
     elements.exportChatAttachments.disabled = true;
+    elements.exportChatConversation.disabled = true;
     const info = await provider.sessionInfo();
     activeSourceBytes = Number(info.source.sourceBytes) || 0;
     const sourceName = sourceDisplayName(info.source.sourcePath, info.source.kind);
@@ -1394,6 +1422,7 @@ async function selectChat(chat) {
   elements.nextMessages.disabled = true;
   elements.exportChatImages.disabled = !selectedChat || selectedSourceKind === "sqlite";
   elements.exportChatAttachments.disabled = !selectedChat || selectedSourceKind === "sqlite";
+  elements.exportChatConversation.disabled = !selectedChat;
   await loadMessages("initial", selectionGeneration);
 }
 
@@ -4055,6 +4084,7 @@ elements.clearSearch.addEventListener("click", () => {
 });
 elements.exportChatImages.addEventListener("click", () => void exportCurrentChat(true));
 elements.exportChatAttachments.addEventListener("click", () => void exportCurrentChat(false));
+elements.exportChatConversation.addEventListener("click", () => void exportCurrentConversation());
 elements.cleanupKind.addEventListener("change", updateCleanupFilter);
 elements.cleanupCategory.addEventListener("change", updateCleanupFilter);
 elements.cleanupSort.addEventListener("change", updateCleanupFilter);
@@ -4236,6 +4266,17 @@ bridge.on("exportProgress", (event) => {
     Number(event.totalBytes) || 0,
     event.phase || "匯出中",
     "bytes"
+  );
+});
+bridge.on("conversationExportProgress", (event) => {
+  if (elements.operationModal.classList.contains("hidden")) return;
+  const attachmentsPending = Number(event.totalAttachments) > 0 &&
+    Number(event.processedAttachments) < Number(event.totalAttachments);
+  updateOperationModalProgress(
+    attachmentsPending ? Number(event.processedBytes) || 0 : Number(event.processedMessages) || 0,
+    attachmentsPending ? Number(event.totalBytes) || 0 : Number(event.totalMessages) || 0,
+    event.phase || "輸出完整討論串",
+    attachmentsPending ? "bytes" : "則訊息"
   );
 });
 bridge.on("searchIndexProgress", (event) => {
